@@ -2,7 +2,7 @@
 """
 XAUUSD Chart Pattern Analysis Script v3
 Complete rewrite — fixes all v2 bugs + adds:
-- Ascending/Symmetrical triangle, Wedges, Double top/bottom
+- Ascending/Symmetrical triangle, Wedges, Parallel channels, Double top/bottom
 - Proper Fibonacci extensions (not random * 0.618)
 - Multi-timeframe confluence (daily trend filter)
 - Volume confirmation for breakouts
@@ -61,7 +61,7 @@ def _neutral_trend(df):
 
 def validate_dataframe(df, label, min_bars):
     if df is None or df.empty:
-        raise SystemExit(f"Error: {label} data is empty. Check network or ticker {TICKER}.")
+        raise SystemExit(f"Error: {label} data is empty. Check network or data source ({DATA_SOURCE}).")
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
     if missing:
         raise SystemExit(f"Error: {label} missing columns: {missing}")
@@ -727,9 +727,10 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
         max_rise = max_slope * window_span_est if window_span_est > 0 else 0
         
         if max_rise < est_height * 0.15:
-            # Both slopes gentle relative to channel height → treat as parallel (horizontal)
+            # Gentle slopes: parallel only if same sign (reject converging triangles)
+            same_sign = (high_slope >= 0) == (low_slope >= 0)
             slope_ratio = 1.0 if min_slope < 0.01 else min(max_slope / max(min_slope, 0.001), 1.0)
-            is_parallel = True
+            is_parallel = same_sign
         elif (high_slope > 0) != (low_slope > 0):
             # Opposite signs → diverging/converging, not parallel channel
             is_parallel = False
@@ -775,7 +776,7 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
 
         if is_flat:
             chan_type = 'Horizontal'
-            direction = 'BULLISH' if avg_spread > tol_dollars * 3 else 'NEUTRAL'
+            direction = None  # set from price position after bounds are projected
         elif high_slope > 0.02 and low_slope > 0.02:
             chan_type = 'Ascending'
             direction = 'BULLISH'
@@ -787,11 +788,11 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
         
         chan_key = chan_type.lower()
         
-        # Use linear regression to estimate current channel boundaries
-        # (intercepts already computed above for spread measurement)
-        last_idx = max(high_indices[-1], low_indices[-1])
-        upper_bound = high_intercept + high_slope * (last_idx + 1)
-        lower_bound = low_intercept + low_slope * (last_idx + 1)
+        # Project channel boundaries to current bar (not last swing)
+        last_swing_idx = max(high_indices[-1], low_indices[-1])
+        proj_idx = (len(df) - 1) if df is not None and len(df) else last_swing_idx
+        upper_bound = high_intercept + high_slope * proj_idx
+        lower_bound = low_intercept + low_slope * proj_idx
         
         # BUG 3 fix: guard against crossing regression lines
         if upper_bound <= lower_bound:
@@ -804,6 +805,19 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
         # BUG 3 fix: pattern_height must be positive
         if pattern_height <= 0:
             continue
+
+        if chan_type == 'Horizontal':
+            if df is not None and len(df):
+                cur = float(df['Close'].iloc[-1])
+                pos = (cur - lower_bound) / pattern_height
+                if pos > 0.7:
+                    direction = 'BULLISH'
+                elif pos < 0.3:
+                    direction = 'BEARISH'
+                else:
+                    direction = 'NEUTRAL'
+            else:
+                direction = 'BULLISH' if avg_spread > tol_dollars * 3 else 'NEUTRAL'
         
         # Check breakout
         recent_closes = None
@@ -875,7 +889,9 @@ def detect_all_patterns(df, points, atr=None):
     # overlap on similar support/resistance levels, drop the lower-confidence one
     # (channels and wedges can fire on the same price structure with opposite directions)
     if channels:
-        def _overlap(p1, p2, tol=15):
+        overlap_tol = max(15, (atr or 15) * 0.5)
+
+        def _overlap(p1, p2, tol=overlap_tol):
             """Check if two patterns share similar support/resistance levels."""
             s1, r1 = p1.get('support'), p1.get('resistance')
             s2, r2 = p2.get('support'), p2.get('resistance')
@@ -1224,6 +1240,8 @@ def _entry_status_bullish(already_broken, aligned, quality):
 
 def _compute_tp1(pattern, actual_entry, risk, side):
     fib_ext = None
+    if 'Channel' in pattern.get('type', '') and pattern.get('target') is not None:
+        return pattern['target'], None
     if side == 'SELL':
         if 'support' in pattern and 'highest_high' in pattern:
             fib_ext = fibonacci_extension(
@@ -1342,9 +1360,8 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
             continue
         seen_trigger_keys.add(trigger_level)
 
-        # RISK 2 fix: use pattern's broken flag if available (more precise than price check)
-        pattern_broken = pattern.get('broken', False)
-        already_broken = current_price < trigger_level or pattern_broken
+        # Breakout: price must be below trigger (ignore stale pattern.broken if recovered)
+        already_broken = current_price < trigger_level
         if current_price > trigger_level + atr * 2:
             continue
 
@@ -1427,9 +1444,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
             continue
         seen_trigger_keys.add(entry_trigger_level)
 
-        # RISK 2 fix: use pattern's broken flag if available (more precise than price check)
-        pattern_broken = pattern.get('broken', False)
-        already_broken = current_price > entry_trigger_level or pattern_broken
+        already_broken = current_price > entry_trigger_level
         if current_price < entry_trigger_level - atr * 2:
             continue
 
