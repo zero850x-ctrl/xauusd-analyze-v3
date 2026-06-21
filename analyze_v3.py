@@ -84,6 +84,56 @@ def trail_stop_text(atr):
         f"止損移 ${atr * TRAIL_STOP_ATR:.0f}"
     )
 
+
+def _breakout_status(df, direction, support=None, resistance=None, tol=0, points=None):
+    """
+    Unified breakout semantics across all pattern types:
+    - broken_now: current close beyond trigger (matches trade setup already_broken)
+    - broke_recently: any of last 5 closes beyond trigger (pattern report)
+    - broken: alias for broke_recently (backward compat)
+    """
+    cur = float(df['Close'].iloc[-1]) if df is not None and len(df) else None
+    recent_closes = df['Close'].values[-5:] if df is not None and len(df) >= 5 else None
+
+    broken_up_now = broken_down_now = False
+    broken_up_recent = broken_down_recent = False
+
+    if resistance is not None:
+        up_trigger = resistance + tol
+        broken_up_now = cur is not None and cur > up_trigger
+        if recent_closes is not None:
+            broken_up_recent = bool(np.any(recent_closes > up_trigger))
+        elif points:
+            broken_up_recent = any(
+                p['type'] == 'high' and p['price'] > up_trigger for p in points[-5:]
+            )
+
+    if support is not None:
+        down_trigger = support - tol
+        broken_down_now = cur is not None and cur < down_trigger
+        if recent_closes is not None:
+            broken_down_recent = bool(np.any(recent_closes < down_trigger))
+        elif points:
+            broken_down_recent = any(
+                p['type'] == 'low' and p['price'] < down_trigger for p in points[-8:]
+            )
+
+    if direction == 'BEARISH':
+        broken_now = broken_down_now
+        broke_recently = broken_down_recent
+    elif direction == 'BULLISH':
+        broken_now = broken_up_now
+        broke_recently = broken_up_recent
+    else:
+        broken_now = broken_up_now or broken_down_now
+        broke_recently = broken_up_recent or broken_down_recent
+
+    return {
+        'broken': broke_recently,
+        'broken_now': broken_now,
+        'broke_recently': broke_recently,
+    }
+
 # ═══════════════════════════════════════════════════════════
 # DATA
 # ═══════════════════════════════════════════════════════════
@@ -268,7 +318,7 @@ def linear_regression(x, y):
     den = sum((xi - x_mean)**2 for xi in x)
     return num / den if den != 0 else 0
 
-def detect_triangles(points, tolerance_pct=0.008):
+def detect_triangles(points, df=None, tolerance_pct=0.008):
     """
     Detect triangles from time-ordered swing points.
     Uses percentage-based checks instead of raw slopes.
@@ -339,77 +389,79 @@ def detect_triangles(points, tolerance_pct=0.008):
         
         # Classify
         if low_pairs_flat and highs_descending and 'desc_tri' not in found_types:
-            support = flat_low_level
-            highest = max(high_prices)
-            pattern_height = highest - support
-            broken = any(
-                p['type'] == 'low' and p['price'] < support - tol_dollars * 0.5
-                for p in points[-8:]
+            support = round(flat_low_level, 2)
+            highest = round(max(high_prices), 2)
+            pattern_height = round(highest - support, 2)
+            brk = _breakout_status(
+                df, 'BEARISH', support=support, tol=tol_dollars * 0.5, points=points
             )
-            
+
             triangles.append({
                 'type': '📐 Descending Triangle (下降三角形)',
                 'direction': 'BEARISH',
-                'support': round(support, 2),
-                'highest_high': round(highest, 2),
-                'pattern_height': round(pattern_height, 2),
+                'support': support,
+                'highest_high': highest,
+                'pattern_height': pattern_height,
                 'target': round(support - pattern_height, 2),
-                'broken': broken,
+                **brk,
                 'confidence': 'HIGH' if seq_lower >= 2 and pattern_height > tol_dollars*3 else 'MEDIUM',
             })
             found_types.add('desc_tri')
         
         if high_pairs_flat and lows_ascending and 'asc_tri' not in found_types:
-            resistance = flat_high_level
-            lowest = min(low_prices)
-            pattern_height = resistance - lowest
-            broken = any(
-                p['type'] == 'high' and p['price'] > resistance + tol_dollars * 0.5
-                for p in points[-5:]
+            resistance = round(flat_high_level, 2)
+            lowest = round(min(low_prices), 2)
+            pattern_height = round(resistance - lowest, 2)
+            brk = _breakout_status(
+                df, 'BULLISH', resistance=resistance, tol=tol_dollars * 0.5, points=points
             )
-            
+
             triangles.append({
                 'type': '📐 Ascending Triangle (上升三角形)',
                 'direction': 'BULLISH',
-                'resistance': round(resistance, 2),
-                'lowest_low': round(lowest, 2),
-                'pattern_height': round(pattern_height, 2),
+                'resistance': resistance,
+                'lowest_low': lowest,
+                'pattern_height': pattern_height,
                 'target': round(resistance + pattern_height, 2),
-                'broken': broken,
+                **brk,
                 'confidence': 'HIGH' if seq_higher >= 2 and pattern_height > tol_dollars*3 else 'MEDIUM',
             })
             found_types.add('asc_tri')
         
         if highs_descending and lows_ascending and 'sym_tri' not in found_types:
             apex_price = (np.mean(high_prices[-2:]) + np.mean(low_prices[-2:])) / 2
-            pattern_height = max(high_prices) - min(low_prices)
-            upper_bound = max(high_prices)
-            lower_bound = min(low_prices)
+            pattern_height = round(max(high_prices) - min(low_prices), 2)
+            upper_bound = round(max(high_prices), 2)
+            lower_bound = round(min(low_prices), 2)
 
             prior_points = [p for p in points if p['idx'] < use_highs[0]['idx']][-4:]
             prior_trend = 'BULLISH' if prior_points and prior_points[-1]['price'] > prior_points[0]['price'] else 'BEARISH'
 
-            broken_up = any(
-                p['type'] == 'high' and p['price'] > upper_bound + tol_dollars * 0.5
-                for p in points[-5:]
+            brk_up = _breakout_status(
+                df, 'BULLISH', resistance=upper_bound, tol=tol_dollars * 0.5, points=points
             )
-            broken_down = any(
-                p['type'] == 'low' and p['price'] < lower_bound - tol_dollars * 0.5
-                for p in points[-8:]
+            brk_down = _breakout_status(
+                df, 'BEARISH', support=lower_bound, tol=tol_dollars * 0.5, points=points
             )
+            broken_up = brk_up['broke_recently']
+            broken_down = brk_down['broke_recently']
             sym_broken = broken_up or broken_down
-            sym_direction = 'BULLISH' if broken_up else ('BEARISH' if broken_down else prior_trend)
+            sym_direction = 'BULLISH' if brk_up['broken_now'] else (
+                'BEARISH' if brk_down['broken_now'] else prior_trend
+            )
 
             triangles.append({
                 'type': '📐 Symmetrical Triangle (對稱三角形)',
                 'direction': sym_direction,
                 'apex': round(apex_price, 2),
-                'resistance': round(upper_bound, 2),
-                'support': round(lower_bound, 2),
-                'pattern_height': round(pattern_height, 2),
+                'resistance': upper_bound,
+                'support': lower_bound,
+                'pattern_height': pattern_height,
                 'target_up': round(apex_price + pattern_height, 2),
                 'target_down': round(apex_price - pattern_height, 2),
                 'broken': sym_broken,
+                'broken_now': brk_up['broken_now'] or brk_down['broken_now'],
+                'broke_recently': sym_broken,
                 'confidence': 'MEDIUM',
             })
             found_types.add('sym_tri')
@@ -468,16 +520,21 @@ def detect_flags(df, points, lookback=30, atr=None):
             direction = 'BULLISH' if move > 0 else 'BEARISH'
             pole_length = abs(move)
             
-            # Check breakout — cast to native bool for JSON serialization
-            last_close = close_vals[-1]
+            # Check breakout — broken_now matches setup semantics
             if direction == 'BEARISH':
                 breakout = flag_low
-                broken = bool(last_close < flag_low)
                 target = flag_low - pole_length
+                brk = _breakout_status(
+                    df, 'BEARISH', support=round(float(flag_low), 2), points=points
+                )
             else:
                 breakout = flag_high
-                broken = bool(last_close > flag_high)
                 target = flag_high + pole_length
+                brk = _breakout_status(
+                    df, 'BULLISH', resistance=round(float(flag_high), 2), points=points
+                )
+            broken = brk['broken']
+            broken_now = brk['broken_now']
             
             # Volume check
             pole_vol = np.mean(vol_vals[i:j])
@@ -492,7 +549,7 @@ def detect_flags(df, points, lookback=30, atr=None):
             retrace_pct = flag_range / pole_length
             if broken and vol_confirm:
                 conf = 'HIGH'
-            elif broken or (retrace_pct < 0.35 and vol_confirm):
+            elif broken_now or (retrace_pct < 0.35 and vol_confirm):
                 conf = 'MEDIUM'
             else:
                 conf = 'LOW'
@@ -510,6 +567,8 @@ def detect_flags(df, points, lookback=30, atr=None):
                 'breakout_level': round(float(breakout), 2),
                 'target': round(float(target), 2),
                 'broken': broken,
+                'broken_now': broken_now,
+                'broke_recently': broken,
                 'vol_confirm': vol_confirm,
                 'confidence': conf,
             })
@@ -544,13 +603,15 @@ def detect_flags(df, points, lookback=30, atr=None):
             'breakout_level': best['breakout_level'],
             'target': best['target'],
             'broken': best['broken'],
+            'broken_now': best.get('broken_now', best['broken']),
+            'broke_recently': best.get('broke_recently', best['broken']),
             'vol_confirm': best['vol_confirm'],
             'confidence': best['confidence'],
         })
     
     return flags
 
-def detect_double_top_bottom(points, tolerance_pct=0.005):
+def detect_double_top_bottom(points, df=None, tolerance_pct=0.005):
     """Detect double top or double bottom patterns."""
     if len(points) < 6:
         return []
@@ -574,13 +635,17 @@ def detect_double_top_bottom(points, tolerance_pct=0.005):
             depth = max(highs[i]['price'], highs[j]['price']) - valley
             if depth <= tol * 3:
                 continue
+            neckline = round(valley, 2)
+            depth = round(depth, 2)
+            brk = _breakout_status(df, 'BEARISH', support=neckline, points=points)
             tops.append({
                 'type': '🔻 Double Top (雙頂)',
                 'direction': 'BEARISH',
                 'top_price': round(max(highs[i]['price'], highs[j]['price']), 2),
-                'neckline': round(valley, 2),
-                'depth': round(depth, 2),
-                'target': round(valley - depth, 2),
+                'neckline': neckline,
+                'depth': depth,
+                'target': round(neckline - depth, 2),
+                **brk,
                 'confidence': 'HIGH' if depth > avg_price * 0.02 else 'MEDIUM',
                 '_recency': max(highs[i]['idx'], highs[j]['idx']),
             })
@@ -596,13 +661,17 @@ def detect_double_top_bottom(points, tolerance_pct=0.005):
             depth = peak - min(lows[i]['price'], lows[j]['price'])
             if depth <= tol * 3:
                 continue
+            neckline = round(peak, 2)
+            depth = round(depth, 2)
+            brk = _breakout_status(df, 'BULLISH', resistance=neckline, points=points)
             bottoms.append({
                 'type': '🔺 Double Bottom (雙底)',
                 'direction': 'BULLISH',
                 'bottom_price': round(min(lows[i]['price'], lows[j]['price']), 2),
-                'neckline': round(peak, 2),
-                'depth': round(depth, 2),
-                'target': round(peak + depth, 2),
+                'neckline': neckline,
+                'depth': depth,
+                'target': round(neckline + depth, 2),
+                **brk,
                 'confidence': 'HIGH' if depth > avg_price * 0.02 else 'MEDIUM',
                 '_recency': max(lows[i]['idx'], lows[j]['idx']),
             })
@@ -665,47 +734,36 @@ def detect_wedges(points, df=None, tolerance_pct=0.008):
         if not converging or not (rising_wedge or falling_wedge):
             continue
 
-        # Use recent closes to determine breakout, if df provided
-        recent_closes = None
-        if df is not None and len(df) >= 5:
-            recent_closes = df['Close'].values[-5:]
-
         if rising_wedge and 'rising_wedge' not in found_types:
-            support = low_prices[-1]
-            resistance = high_prices[-1]
-            pattern_height = resistance - support
-            if recent_closes is not None:
-                broken = bool(np.any(recent_closes < support))
-            else:
-                broken = any(p['type'] == 'low' and p['price'] < support for p in points[-5:])
+            support = round(low_prices[-1], 2)
+            resistance = round(high_prices[-1], 2)
+            pattern_height = round(resistance - support, 2)
+            brk = _breakout_status(df, 'BEARISH', support=support, points=points)
             wedges.append({
                 'type': '△ Rising Wedge (上升楔形)',
                 'direction': 'BEARISH',
-                'support': round(support, 2),
-                'resistance': round(resistance, 2),
-                'pattern_height': round(pattern_height, 2),
+                'support': support,
+                'resistance': resistance,
+                'pattern_height': pattern_height,
                 'target': round(support - pattern_height, 2),
-                'broken': broken,
+                **brk,
                 'confidence': 'MEDIUM' if pattern_height > tol_dollars * 2 else 'LOW',
             })
             found_types.add('rising_wedge')
 
         if falling_wedge and 'falling_wedge' not in found_types:
-            support = low_prices[-1]
-            resistance = high_prices[-1]
-            pattern_height = resistance - support
-            if recent_closes is not None:
-                broken = bool(np.any(recent_closes > resistance))
-            else:
-                broken = any(p['type'] == 'high' and p['price'] > resistance for p in points[-5:])
+            support = round(low_prices[-1], 2)
+            resistance = round(high_prices[-1], 2)
+            pattern_height = round(resistance - support, 2)
+            brk = _breakout_status(df, 'BULLISH', resistance=resistance, points=points)
             wedges.append({
                 'type': '▽ Falling Wedge (下降楔形)',
                 'direction': 'BULLISH',
-                'support': round(support, 2),
-                'resistance': round(resistance, 2),
-                'pattern_height': round(pattern_height, 2),
+                'support': support,
+                'resistance': resistance,
+                'pattern_height': pattern_height,
                 'target': round(resistance + pattern_height, 2),
-                'broken': broken,
+                **brk,
                 'confidence': 'MEDIUM' if pattern_height > tol_dollars * 2 else 'LOW',
             })
             found_types.add('falling_wedge')
@@ -853,9 +911,9 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
         cur_price = float(df['Close'].iloc[-1]) if df is not None and len(df) else None
         if cur_price is not None:
             pos = (cur_price - support) / pattern_height
-            if pos > 0.7:
+            if pos >= 0.7:
                 direction = 'BULLISH'
-            elif pos < 0.3:
+            elif pos <= 0.3:
                 direction = 'BEARISH'
             elif chan_type == 'Horizontal':
                 direction = 'NEUTRAL'
@@ -930,7 +988,7 @@ def detect_all_patterns(df, points, atr=None):
     all_patterns = []
     
     # Triangles
-    triangles = detect_triangles(points)
+    triangles = detect_triangles(points, df=df)
     all_patterns.extend(triangles)
     
     # Wedges
@@ -1006,7 +1064,7 @@ def detect_all_patterns(df, points, atr=None):
                 all_patterns.append(f)
     
     # Double top/bottom
-    dbl = detect_double_top_bottom(points)
+    dbl = detect_double_top_bottom(points, df=df)
     all_patterns.extend(dbl)
     
     # Sort by confidence
