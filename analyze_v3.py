@@ -2058,7 +2058,7 @@ def main():
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         output_path = os.path.join(OUTPUT_DIR, f"xauusd_v3_{today}.md")
     
-    with open(output_path, 'w') as f:
+    with open(output_path, 'w', encoding='utf-8') as f:
         f.write(report)
     
     _log(f"\n[OK] Report: {output_path}")
