@@ -2077,7 +2077,7 @@ def main():
             'setups': setups,
         }
         json_path = output_path.replace('.md', '.json')
-        with open(json_path, 'w') as f:
+        with open(json_path, 'w', encoding='utf-8') as f:
             json.dump(json_out, f, indent=2, default=str)
         _log(f"   JSON: {json_path}")
 
