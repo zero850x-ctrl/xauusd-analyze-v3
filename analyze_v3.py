@@ -747,7 +747,7 @@ def detect_wedges(points, df=None, tolerance_pct=0.008):
                 'pattern_height': pattern_height,
                 'target': round(support - pattern_height, 2),
                 **brk,
-                'confidence': 'MEDIUM' if pattern_height > tol_dollars * 2 else 'LOW',
+                'confidence': 'LOW',  # Rising wedge: backtest 43.3% win rate, lowest of all patterns
             })
             found_types.add('rising_wedge')
 
