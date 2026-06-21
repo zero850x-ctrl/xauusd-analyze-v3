@@ -36,7 +36,8 @@ OUTPUT_DIR = os.path.expanduser("~/.hermes/reports")
 TV_SYMBOL = "OANDA:XAUUSD"
 TV_EXCHANGE = "OANDA"
 YF_TICKER = "GC=F"
-DATA_SOURCE = "TradingView (OANDA:XAUUSD)"  # updated at runtime
+DATA_SOURCE = "TradingView (OANDA:XAUUSD)"  # updated at runtime (M30/H1 intraday)
+DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"  # daily bars always from futures
 REQUIRED_COLS = ['Open', 'High', 'Low', 'Close', 'Volume']
 MIN_BARS = {'m30': 50, 'h1': 30, 'day': 20}
 TRAIL_PROFIT_ATR = 2.0
@@ -89,9 +90,10 @@ def trail_stop_text(atr):
 
 def fetch_data():
     """Fetch XAUUSD data. Primary: TradingView (spot), fallback: yfinance (futures)."""
-    global DATA_SOURCE
+    global DATA_SOURCE, DAILY_DATA_SOURCE
 
     df_m30 = df_h1 = df_day = None
+    DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"
 
     # --- TradingView (spot XAUUSD) ---
     if _TV_AVAILABLE:
@@ -139,10 +141,38 @@ def fetch_data():
     if df_m30 is None:
         _log("[*] TradingView unavailable, falling back to Yahoo Finance GC=F...")
         DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"
+        DAILY_DATA_SOURCE = DATA_SOURCE
         df_m30 = yf.download(YF_TICKER, period='30d', interval='30m', progress=False)
         df_h1 = yf.download(YF_TICKER, period='60d', interval='60m', progress=False)
         for df in [df_m30, df_h1]:
             df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
+    # --- H1 fallback when M30 OK but H1 resample failed ---
+    if df_m30 is not None and (df_h1 is None or df_h1.empty):
+        _log("[*] H1 missing — trying independent fallback...")
+        try:
+            df_h1 = yf.download(YF_TICKER, period='60d', interval='60m', progress=False)
+            df_h1.columns = [c[0] if isinstance(c, tuple) else c for c in df_h1.columns]
+            if df_h1 is not None and not df_h1.empty:
+                _log(f"   YF H1 fallback: {len(df_h1)} bars")
+            else:
+                df_h1 = None
+        except Exception as e:
+            _log(f"   YF H1 fallback failed: {e}")
+            df_h1 = None
+        if df_h1 is None:
+            try:
+                df_h1 = df_m30.resample('1h', label='right', closed='right').agg({
+                    'Open': 'first', 'High': 'max', 'Low': 'min',
+                    'Close': 'last', 'Volume': 'sum',
+                }).dropna(subset=['Close'])
+                if df_h1 is not None and not df_h1.empty:
+                    _log(f"   M30→H1 retry resample: {len(df_h1)} bars")
+                else:
+                    df_h1 = None
+            except Exception as e:
+                _log(f"   H1 retry resample failed: {e}")
+                df_h1 = None
 
     # --- Daily data (always from yfinance — TV daily bars limited) ---
     _log("[*] Fetching daily (yfinance)...")
@@ -154,7 +184,10 @@ def fetch_data():
     validate_dataframe(df_h1, 'H1', MIN_BARS['h1'])
     validate_dataframe(df_day, 'Daily', MIN_BARS['day'])
 
-    _log(f"   📡 Final: M30={len(df_m30)} bars | H1={len(df_h1)} | Daily={len(df_day)} | Source: {DATA_SOURCE}")
+    intraday_src = DATA_SOURCE
+    daily_src = DAILY_DATA_SOURCE if DAILY_DATA_SOURCE != DATA_SOURCE else DATA_SOURCE
+    src_note = intraday_src if intraday_src == daily_src else f"{intraday_src} | 日線: {daily_src}"
+    _log(f"   📡 Final: M30={len(df_m30)} bars | H1={len(df_h1)} | Daily={len(df_day)} | Source: {src_note}")
     return df_m30, df_h1, df_day
 
 # ═══════════════════════════════════════════════════════════
@@ -727,10 +760,18 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
         max_rise = max_slope * window_span_est if window_span_est > 0 else 0
         
         if max_rise < est_height * 0.15:
-            # Gentle slopes: parallel only if same sign (reject converging triangles)
+            # Gentle slopes: same sign AND similar slope ratio (not just same_sign)
             same_sign = (high_slope >= 0) == (low_slope >= 0)
-            slope_ratio = 1.0 if min_slope < 0.01 else min(max_slope / max(min_slope, 0.001), 1.0)
-            is_parallel = same_sign
+            if not same_sign:
+                is_parallel = False
+                slope_ratio = 0.0
+            elif max_slope < 0.01:
+                slope_ratio = 1.0
+                is_parallel = True
+            else:
+                r = high_slope / low_slope if abs(low_slope) > 1e-9 else 0.0
+                slope_ratio = abs(r) if abs(r) <= 1 else 1.0 / abs(r)
+                is_parallel = slope_ratio > 0.6
         elif (high_slope > 0) != (low_slope > 0):
             # Opposite signs → diverging/converging, not parallel channel
             is_parallel = False
@@ -776,13 +817,13 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
 
         if is_flat:
             chan_type = 'Horizontal'
-            direction = None  # set from price position after bounds are projected
+            direction = None
         elif high_slope > 0.02 and low_slope > 0.02:
             chan_type = 'Ascending'
-            direction = 'BULLISH'
+            direction = None
         elif high_slope < -0.02 and low_slope < -0.02:
             chan_type = 'Descending'
-            direction = 'BEARISH'
+            direction = None
         else:
             continue  # not a valid channel
         
@@ -806,39 +847,52 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
         if pattern_height <= 0:
             continue
 
-        if chan_type == 'Horizontal':
-            if df is not None and len(df):
-                cur = float(df['Close'].iloc[-1])
-                pos = (cur - lower_bound) / pattern_height
-                if pos > 0.7:
-                    direction = 'BULLISH'
-                elif pos < 0.3:
-                    direction = 'BEARISH'
-                else:
-                    direction = 'NEUTRAL'
+        if pattern_height <= 0:
+            continue
+
+        cur_price = float(df['Close'].iloc[-1]) if df is not None and len(df) else None
+        if cur_price is not None:
+            pos = (cur_price - support) / pattern_height
+            if pos > 0.7:
+                direction = 'BULLISH'
+            elif pos < 0.3:
+                direction = 'BEARISH'
+            elif chan_type == 'Horizontal':
+                direction = 'NEUTRAL'
+            elif chan_type == 'Ascending':
+                direction = 'BULLISH'
             else:
-                direction = 'BULLISH' if avg_spread > tol_dollars * 3 else 'NEUTRAL'
-        
-        # Check breakout
+                direction = 'BEARISH'
+        elif chan_type == 'Horizontal':
+            direction = 'BULLISH' if avg_spread > tol_dollars * 3 else 'NEUTRAL'
+        else:
+            direction = 'BULLISH' if chan_type == 'Ascending' else 'BEARISH'
+
+        # Dual-side breakout: recent closes vs current price
         recent_closes = None
         if df is not None and len(df) >= 5:
             recent_closes = df['Close'].values[-5:]
-        
-        if direction == 'BEARISH':
-            if recent_closes is not None:
-                broken = bool(np.any(recent_closes < support))
-            else:
-                broken = any(p['type'] == 'low' and p['price'] < support for p in points[-5:])
+
+        broken_up_recent = bool(recent_closes is not None and np.any(recent_closes > resistance))
+        broken_down_recent = bool(recent_closes is not None and np.any(recent_closes < support))
+        broken_up_now = cur_price is not None and cur_price > resistance
+        broken_down_now = cur_price is not None and cur_price < support
+
+        broke_recently = broken_up_recent or broken_down_recent
+        broken_now = broken_up_now or broken_down_now
+
+        if broken_down_now:
+            target = support - pattern_height
+        elif broken_up_now:
+            target = resistance + pattern_height
+        elif direction == 'BEARISH':
             target = support - pattern_height
         elif direction == 'BULLISH':
-            if recent_closes is not None:
-                broken = bool(np.any(recent_closes > resistance))
-            else:
-                broken = any(p['type'] == 'high' and p['price'] > resistance for p in points[-5:])
             target = resistance + pattern_height
-        else:  # NEUTRAL — price inside channel, no breakout signal
-            broken = False
-            target = None  # RISK 3 fix: no target for neutral channels
+        else:
+            target = None
+
+        broken = broke_recently
         
         confidence = 'HIGH' if pattern_height > tol_dollars * 4 and slope_ratio > 0.8 else 'MEDIUM'
         
@@ -856,6 +910,8 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
             'pattern_height': pattern_height,
             'target': round(target, 2) if target is not None else None,
             'broken': broken,
+            'broken_now': broken_now,
+            'broke_recently': broke_recently,
             'confidence': confidence,
         }
         
@@ -885,39 +941,62 @@ def detect_all_patterns(df, points, atr=None):
     channels = detect_channels(points, df=df)
     all_patterns.extend(channels)
     
-    # RISK 1 fix: cross-pattern mutual exclusion — if a channel and a wedge/triangle
-    # overlap on similar support/resistance levels, drop the lower-confidence one
-    # (channels and wedges can fire on the same price structure with opposite directions)
+    # RISK 1 fix: cross-pattern mutual exclusion — drop lower-confidence overlaps
     if channels:
         overlap_tol = max(15, (atr or 15) * 0.5)
 
         def _overlap(p1, p2, tol=overlap_tol):
-            """Check if two patterns share similar support/resistance levels."""
             s1, r1 = p1.get('support'), p1.get('resistance')
             s2, r2 = p2.get('support'), p2.get('resistance')
-            if s1 is None or r1 is None or s2 is None or r2 is None:
+            if s1 is None and r1 is None:
                 return False
-            return (abs(s1 - s2) < tol and abs(r1 - r2) < tol)
-        
+            if s2 is None and r2 is None:
+                return False
+            if None not in (s1, r1, s2, r2):
+                if abs(s1 - s2) < tol and abs(r1 - r2) < tol:
+                    return True
+            h1 = p1.get('pattern_height') or (abs(r1 - s1) if s1 is not None and r1 is not None else None)
+            h2 = p2.get('pattern_height') or (abs(r2 - s2) if s2 is not None and r2 is not None else None)
+            boundary_matches = sum(
+                1 for a, b in [(s1, s2), (s1, r2), (r1, s2), (r1, r2)]
+                if a is not None and b is not None and abs(a - b) < tol
+            )
+            if boundary_matches >= 1 and h1 and h2 and abs(h1 - h2) < tol * 2:
+                return True
+            return False
+
         conf_rank_fn = lambda p: {'HIGH': 3, 'MEDIUM': 2, 'LOW': 1}.get(p.get('confidence', 'LOW'), 1)
         to_remove = set()
+
+        # Channel vs channel — keep higher-confidence overlap
+        for i, ch1 in enumerate(channels):
+            if id(ch1) in to_remove:
+                continue
+            for ch2 in channels[i + 1:]:
+                if id(ch2) in to_remove:
+                    continue
+                if _overlap(ch1, ch2):
+                    loser = ch2 if conf_rank_fn(ch1) >= conf_rank_fn(ch2) else ch1
+                    to_remove.add(id(loser))
+
         for i, ch in enumerate(channels):
+            if id(ch) in to_remove:
+                continue
             for j, other in enumerate(all_patterns):
-                if other is ch or j in to_remove:
+                if other is ch or j in to_remove or id(other) in to_remove:
                     continue
                 if 'Channel' in other.get('type', ''):
-                    continue  # don't dedup channel vs channel
+                    continue
                 if _overlap(ch, other):
-                    # Keep the higher-confidence one; if tie, keep the non-channel
                     if conf_rank_fn(ch) > conf_rank_fn(other):
                         to_remove.add(j)
                     else:
-                        to_remove.add(id(ch))  # mark channel for removal by identity
-        # Remove flagged patterns
+                        to_remove.add(id(ch))
         all_patterns = [p for i, p in enumerate(all_patterns) if i not in to_remove and id(p) not in to_remove]
-    
-    # Flags — scan multiple windows (up to full dataset for older patterns)
-    for lb in [25, 35, 45, 55, len(df)]:
+
+    # Flags — scan multiple windows (cap lookback so len(df) guard is reachable)
+    max_lb = min(max(25, len(df) - 11), 80)
+    for lb in sorted(set([25, 35, 45, 55, max_lb])):
         flags = detect_flags(df, points, lookback=lb, atr=atr)
         for f in flags:
             # Check if similar flag already added
@@ -1238,6 +1317,21 @@ def _entry_status_bullish(already_broken, aligned, quality):
     return '⚠️ 已突破 (逆勢!)'
 
 
+def _tp_method_label(pattern, tp_value, fib_tp, rr_tp):
+    """Label TP method — channels use measured move, not Fib extension."""
+    if 'Channel' in pattern.get('type', ''):
+        ch_tgt = pattern.get('target')
+        if ch_tgt is not None and abs(tp_value - ch_tgt) < 1.0:
+            return '通道量度目標'
+    if abs(tp_value - rr_tp) < 0.01:
+        return '1:1 RR'
+    if abs(tp_value - fib_tp) < 0.01:
+        return '0.618 Fib ext'
+    if 'Channel' in pattern.get('type', ''):
+        return '通道量度目標'
+    return '0.618 Fib ext'
+
+
 def _compute_tp1(pattern, actual_entry, risk, side):
     fib_ext = None
     if 'Channel' in pattern.get('type', '') and pattern.get('target') is not None:
@@ -1417,8 +1511,8 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                 if stop_level == raw_stop
                 else f"3 ATR 封頂 (前頂 ${stop_swing:.0f} 太遠)"
             ),
-            'tp1': f"${tp1:.0f} ({'1:1 RR' if abs(tp1 - rr_tp) < 0.01 else '0.618 Fib ext'}, 止賺 1/3)",
-            'tp2': f"${tp2:.0f} ({'0.618 Fib ext' if abs(tp2 - fib_tp) < 0.01 else '1:1 RR'}, 止賺 1/3)",
+            'tp1': f"${tp1:.0f} ({_tp_method_label(pattern, tp1, fib_tp, rr_tp)}, 止賺 1/3)",
+            'tp2': f"${tp2:.0f} ({_tp_method_label(pattern, tp2, fib_tp, rr_tp)}, 止賺 1/3)",
             'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
             'risk_amount': round(risk, 1),
             'rr_tp1': round(rr_tp1, 1),
@@ -1496,8 +1590,8 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                 if stop_level == raw_stop
                 else f"3 ATR 封底 (前底 ${stop_swing:.0f} 太遠)"
             ),
-            'tp1': f"${tp1:.0f} ({'1:1 RR' if abs(tp1 - rr_tp) < 0.01 else '0.618 Fib ext'}, 止賺 1/3)",
-            'tp2': f"${tp2:.0f} ({'0.618 Fib ext' if abs(tp2 - fib_tp) < 0.01 else '1:1 RR'}, 止賺 1/3)",
+            'tp1': f"${tp1:.0f} ({_tp_method_label(pattern, tp1, fib_tp, rr_tp)}, 止賺 1/3)",
+            'tp2': f"${tp2:.0f} ({_tp_method_label(pattern, tp2, fib_tp, rr_tp)}, 止賺 1/3)",
             'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
             'risk_amount': round(risk, 1),
             'rr_tp1': round(rr_tp1, 1),
@@ -1629,6 +1723,12 @@ def ascii_chart(points, current_price, width=40, height=12):
     
     return result
 
+def _data_source_label():
+    if DAILY_DATA_SOURCE != DATA_SOURCE:
+        return f"{DATA_SOURCE}（M30/H1）| 日線: {DAILY_DATA_SOURCE}"
+    return DATA_SOURCE
+
+
 def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend=None):
     """Generate comprehensive Markdown report."""
     current = float(df_m30['Close'].iloc[-1])
@@ -1656,13 +1756,20 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
         pattern_lines = []
         for i, p in enumerate(patterns, 1):
             conf = p.get('confidence', '?')
-            broken = p.get('broken', False)
-            status = ' ✅ 已突破' if broken else ''
+            broken_now = p.get('broken_now', p.get('broken', False))
+            broke_recently = p.get('broke_recently', p.get('broken', False))
+            if broken_now:
+                status = ' ✅ 已突破 (現價)'
+            elif broke_recently:
+                status = ' ⚠️ 近期曾突破'
+            else:
+                status = ''
             vol = p.get('vol_confirm', None)
             vol_str = f" | 量確認: {'✅' if vol else '⚠️ 不足'}" if vol is not None and volume_usable(df_m30) else ''
             pattern_lines.append(f"**{i}. {p['type']}** ({conf} confidence{status}){vol_str}")
             for k, v in p.items():
-                if k in ('type', 'direction', 'confidence', 'broken', 'vol_confirm', 'swing_highs', 'swing_lows',
+                if k in ('type', 'direction', 'confidence', 'broken', 'broken_now', 'broke_recently',
+                         'vol_confirm', 'swing_highs', 'swing_lows',
                          'support_trend', 'resistance_trend', 'upper_trend', 'lower_trend', 'flag_slope_correct'):
                     continue
                 if v is None:
@@ -1749,7 +1856,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 **日期:** {today}  
 **框架:** M30 (主要) / H1 / 日線  
 **當前價格:** **${current:.2f}**  
-**數據源:** {DATA_SOURCE}  
+**數據源:** {_data_source_label()}  
 **日線趨勢:** {'🔴 **BEARISH**' if daily_trend['trend'] == 'BEARISH' else '🟢 **BULLISH**' if daily_trend['trend'] == 'BULLISH' else '🟡 **NEUTRAL**'} (強度: {daily_trend['strength']}/2)
 
 ---
@@ -1783,8 +1890,8 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 📍 入場 | 形態突破 (三角形/旗形/雙頂底) |
 | 📍 加注 | 突破前底/前頂 |
 | 🛑 止損 | 前頂之上 / 前底之下 + 1 ATR |
-| 🎯 TP1 (1/3) | 1:1 RR or 0.618 Fib ext (whichever is closer) |
-| 🎯 TP2 (1/3) | 1:1 RR or 0.618 Fib ext (whichever is further) |
+| 🎯 TP1 (1/3) | 1:1 RR、0.618 Fib ext 或通道量度目標 (取較近) |
+| 🎯 TP2 (1/3) | 1:1 RR、0.618 Fib ext 或通道量度目標 (取較遠) |
 | 🎯 TP3 (1/3) | 放飛 + 追蹤止損 |
 
 {setup_text}
@@ -1830,8 +1937,8 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 
 ---
 
-> ⚠️ **免責聲明:** AI 自動分析 v3，僅供學習參考。交易有風險，入市需謹慎。
-> 📡 數據源: {DATA_SOURCE} | 形態辨識: 三角形/旗形/雙頂底/楔形
+> ⚠️ **免責聲明:** AI 自動分析 v3，僅供學習參考。交易有風險，入市需謹慎。  
+> 📡 數據源: {_data_source_label()} | 形態辨識: 三角形/旗形/雙頂底/楔形/通道
 
 *生成: {datetime.now().strftime('%Y-%m-%d %H:%M')} UTC*
 """
@@ -1902,7 +2009,9 @@ def main():
         json_out = {
             'date': today,
             'price': current,
-            'data_source': DATA_SOURCE,
+            'data_source': _data_source_label(),
+            'intraday_source': DATA_SOURCE,
+            'daily_source': DAILY_DATA_SOURCE,
             'atr_30m': round(atr, 2),
             'daily_trend': daily_trend,
             'h1_trend': h1_trend,
