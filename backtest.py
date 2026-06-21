@@ -13,8 +13,10 @@ Methodology (mirrors analyze_v3.py):
   Trend:   H1 + Daily alignment → full position (0.03); misaligned → half (0.01)
 
 Usage:
-  python3 backtest.py                    # default: 60-day backtest
-  python3 backtest.py --days 90          # custom period
+  python3 backtest.py                    # default: 60-day backtest (M30)
+  python3 backtest.py --days 90          # H1 (90d, since >60d)
+  python3 backtest.py --days 730         # H1 (2 years)
+  python3 backtest.py --days 1825        # Daily (5 years)
   python3 backtest.py --json             # JSON output
   python3 backtest.py --by-pattern       # per-pattern breakdown
   python3 backtest.py --equity-curve     # equity curve CSV
@@ -60,33 +62,58 @@ OUTPUT_DIR = os.path.expanduser("~/.hermes/reports")
 # DATA LOADING — fetch historical M30 + Daily for backtest
 # ═══════════════════════════════════════════════════════════
 
+# yfinance free-tier limits per interval
+#   30m  → max  60 days
+#   1h   → max 730 days
+#   1d   → max 20+ years
+INTERVAL_LIMITS = {'30m': 60, '60m': 730, '1d': 9999}
+
+def _pick_interval(days):
+    """Auto-select best yfinance interval for requested day range."""
+    if days <= 60:
+        return '30m'
+    elif days <= 730:
+        return '60m'
+    else:
+        return '1d'
+
+
 def fetch_backtest_data(days=60):
-    """Fetch historical M30 bars from yfinance (GC=F futures).
+    """Fetch historical bars from yfinance (GC=F futures).
 
-    yfinance free tier: max 60 days of 30m bars.
-    Returns (df_m30, df_day) with indicators applied.
+    Auto-selects interval based on requested days:
+      ≤60d  → 30m (M30)
+      ≤730d → 60m (H1)
+      >730d → 1d  (Daily)
+
+    Returns (df_bars, df_day) with indicators applied.
+    df_bars is the primary timeframe for pattern detection + simulation.
+    df_day is daily data for trend filter.
     """
-    print(f"[*] Fetching {days}d of M30 bars from yfinance (GC=F)...")
-    period = f"{min(days, 60)}d"
-    df_m30 = yf.download(YF_TICKER, period=period, interval='30m', progress=False)
-    if df_m30 is None or df_m30.empty:
-        raise SystemExit("Error: Cannot fetch M30 data from yfinance.")
-    # Flatten multi-index columns (yfinance returns tuples)
-    df_m30.columns = [c[0] if isinstance(c, tuple) else c for c in df_m30.columns]
+    interval = _pick_interval(days)
+    max_days = INTERVAL_LIMITS[interval]
+    period = f"{min(days, max_days)}d"
 
-    # Daily for trend filter
-    df_day = yf.download(YF_TICKER, period='6mo', interval='1d', progress=False)
+    print(f"[*] Fetching {days}d of {interval} bars from yfinance (GC=F)...")
+    df_bars = yf.download(YF_TICKER, period=period, interval=interval, progress=False)
+    if df_bars is None or df_bars.empty:
+        raise SystemExit(f"Error: Cannot fetch {interval} data from yfinance.")
+    df_bars.columns = [c[0] if isinstance(c, tuple) else c for c in df_bars.columns]
+
+    # Daily for trend filter — always fetch 2× the backtest period (min 6mo)
+    daily_period = f"{max(int(days * 1.5), 180)}d"
+    df_day = yf.download(YF_TICKER, period=daily_period, interval='1d', progress=False)
     if df_day is not None and not df_day.empty:
         df_day.columns = [c[0] if isinstance(c, tuple) else c for c in df_day.columns]
 
     # Add indicators
-    df_m30 = add_indicators(df_m30)
+    df_bars = add_indicators(df_bars)
     if df_day is not None:
         df_day = add_indicators(df_day)
 
-    print(f"   M30 bars: {len(df_m30)} | Daily bars: {len(df_day) if df_day is not None else 0}")
-    print(f"   Date range: {df_m30.index[0]} → {df_m30.index[-1]}")
-    return df_m30, df_day
+    print(f"   {interval} bars: {len(df_bars)} | Daily bars: {len(df_day) if df_day is not None else 0}")
+    print(f"   Date range: {df_bars.index[0]} → {df_bars.index[-1]}")
+    return df_bars, df_day
 
 
 # ═══════════════════════════════════════════════════════════
@@ -96,7 +123,7 @@ def fetch_backtest_data(days=60):
 # Warm-up: need at least 60 bars for MA50 + ATR14 + swing detection
 WARMUP_BARS = 80
 # Min bars between trades (cooldown to avoid re-entering same pattern)
-TRADE_COOLDOWN = 6  # 3 hours on M30
+TRADE_COOLDOWN = 6  # 3 hours on M30, ~6 hours on H1, 6 days on Daily
 # Position sizes (micro lots)
 POS_FULL = 0.03
 POS_HALF = 0.01
@@ -387,18 +414,19 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
 # MAIN BACKTEST LOOP
 # ═══════════════════════════════════════════════════════════
 
-def run_backtest(df_m30, df_day, verbose=False):
+def run_backtest(df_bars, df_day, verbose=False):
     """
-    Walk through df_m30 bar-by-bar. At each bar:
+    Walk through df_bars bar-by-bar. At each bar:
       1. Build a rolling window (all bars up to current)
       2. Run pattern detection on that window
       3. Generate trade setups
       4. Open new trades (if cooldown expired)
       5. Update existing open trades
 
+    Works with any interval (M30, H1, Daily) — df_bars is the primary timeframe.
     Returns list of closed Trade objects.
     """
-    total_bars = len(df_m30)
+    total_bars = len(df_bars)
     closed_trades = []
     open_trades = []
     last_trade_bar = -TRADE_COOLDOWN  # cooldown tracker
@@ -414,7 +442,7 @@ def run_backtest(df_m30, df_day, verbose=False):
 
     for i in range(WARMUP_BARS, total_bars):
         # ── Rolling window: bars 0..i (inclusive) ──
-        window = df_m30.iloc[:i+1]
+        window = df_bars.iloc[:i+1]
         current_price = float(window['Close'].iloc[-1])
         current_date = window.index[-1]
         atr = float(window['ATR'].iloc[-1])
@@ -520,8 +548,8 @@ def run_backtest(df_m30, df_day, verbose=False):
                       f"pos={best.position_size} aligned={best.daily_aligned}")
 
     # Close any remaining open trades at last bar
-    last_close = float(df_m30['Close'].iloc[-1])
-    last_atr = float(df_m30['ATR'].iloc[-1]) if not pd.isna(df_m30['ATR'].iloc[-1]) else 5.0
+    last_close = float(df_bars['Close'].iloc[-1])
+    last_atr = float(df_bars['ATR'].iloc[-1]) if not pd.isna(df_bars['ATR'].iloc[-1]) else 5.0
     for trade in open_trades:
         simulate_trade_on_bar(trade, last_close, last_close, last_close, last_atr)
         if not trade.closed:
@@ -844,7 +872,8 @@ def export_trades_csv(trades, path=None):
 
 def main():
     parser = argparse.ArgumentParser(description='XAUUSD Pattern Backtest')
-    parser.add_argument('--days', type=int, default=60, help='Backtest period in days (max 60 for M30)')
+    parser.add_argument('--days', type=int, default=60,
+                        help='Backtest period in days. ≤60d→M30, ≤730d→H1, >730d→Daily')
     parser.add_argument('--json', action='store_true', help='Output JSON instead of Markdown')
     parser.add_argument('--by-pattern', action='store_true', help='Include per-pattern breakdown')
     parser.add_argument('--equity-curve', action='store_true', help='Export equity curve CSV')
@@ -854,10 +883,10 @@ def main():
     args = parser.parse_args()
 
     # Fetch data
-    df_m30, df_day = fetch_backtest_data(args.days)
+    df_bars, df_day = fetch_backtest_data(args.days)
 
     # Run backtest
-    trades = run_backtest(df_m30, df_day, verbose=args.verbose)
+    trades = run_backtest(df_bars, df_day, verbose=args.verbose)
 
     # Compute stats
     stats = compute_stats(trades, starting_capital=args.capital)
