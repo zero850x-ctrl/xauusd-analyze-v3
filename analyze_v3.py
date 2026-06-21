@@ -688,7 +688,9 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
         return []
     
     channels = []
-    found_types = set()
+    # Track best channel per type across all windows (not just first match)
+    best_per_type = {}  # chan_type -> (confidence_rank, window_size, channel_dict)
+    conf_rank = {'HIGH': 2, 'MEDIUM': 1, 'LOW': 0}
     window_sizes = [s for s in [10, 15, 20, 25] if len(points) >= s]
     
     for window_size in window_sizes:
@@ -696,7 +698,8 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
         highs_in_window = [p for p in recent if p['type'] == 'high']
         lows_in_window = [p for p in recent if p['type'] == 'low']
         
-        if len(highs_in_window) < 2 or len(lows_in_window) < 2:
+        # RISK 5 fix: require ≥3 points per side for meaningful regression
+        if len(highs_in_window) < 3 or len(lows_in_window) < 3:
             continue
         
         use_highs = highs_in_window[-4:]
@@ -713,25 +716,49 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
         avg_price = np.mean(high_prices + low_prices)
         tol_dollars = max(avg_price * tolerance_pct, 15)
         
-        # Slope ratio — parallel means slopes are within 30% of each other
-        if max(abs(high_slope), abs(low_slope)) < 0.01:
-            slope_ratio = 1.0  # both ~flat
-        elif min(abs(high_slope), abs(low_slope)) < 0.01:
+        # Slope ratio — parallel means slopes within 30% AND same sign
+        # BUG 2 fix: check sign agreement, but allow gentle slopes (horizontal channel)
+        # Use rise relative to channel width to determine flatness, not absolute slope threshold
+        max_slope = max(abs(high_slope), abs(low_slope))
+        min_slope = min(abs(high_slope), abs(low_slope))
+        # Estimate channel height for relative slope check
+        est_height = abs(np.mean(high_prices) - np.mean(low_prices))
+        window_span_est = max(max(high_indices), max(low_indices)) - min(min(high_indices), min(low_indices))
+        max_rise = max_slope * window_span_est if window_span_est > 0 else 0
+        
+        if max_rise < est_height * 0.15:
+            # Both slopes gentle relative to channel height → treat as parallel (horizontal)
+            slope_ratio = 1.0 if min_slope < 0.01 else min(max_slope / max(min_slope, 0.001), 1.0)
+            is_parallel = True
+        elif (high_slope > 0) != (low_slope > 0):
+            # Opposite signs → diverging/converging, not parallel channel
+            is_parallel = False
+        elif min_slope < 0.01:
             slope_ratio = 0.0  # one flat, one not → not parallel
+            is_parallel = False
         else:
             r = high_slope / low_slope
             slope_ratio = r if r <= 1 else 1.0 / r
-        
-        is_parallel = slope_ratio > 0.6
+            is_parallel = slope_ratio > 0.6
         
         if not is_parallel:
             continue
         
+        # Compute regression intercepts early (needed for spread measurement)
+        high_intercept = np.mean(high_prices) - high_slope * np.mean(high_indices)
+        low_intercept = np.mean(low_prices) - low_slope * np.mean(low_indices)
+        
         # Channel spread must be stable (not converging like wedge)
+        # BUG 4 fix: time-align spread using regression lines, not position-paired prices
         spreads = []
-        for hp, hi, lp, li in zip(high_prices, high_indices, low_prices, low_indices):
-            # Use nearest opposite point for spread
-            spreads.append(abs(hp - lp))
+        for i in range(len(use_highs)):
+            h_idx = high_indices[i]
+            low_line_at_h = low_intercept + low_slope * h_idx
+            spreads.append(abs(high_prices[i] - low_line_at_h))
+        for i in range(len(use_lows)):
+            l_idx = low_indices[i]
+            high_line_at_l = high_intercept + high_slope * l_idx
+            spreads.append(abs(high_line_at_l - low_prices[i]))
         
         avg_spread = np.mean(spreads)
         spread_range = max(spreads) - min(spreads)
@@ -759,21 +786,24 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
             continue  # not a valid channel
         
         chan_key = chan_type.lower()
-        if chan_key in found_types:
-            continue
         
         # Use linear regression to estimate current channel boundaries
-        n_points = len(use_highs)
-        high_intercept = np.mean(high_prices) - high_slope * np.mean(high_indices)
-        low_intercept = np.mean(low_prices) - low_slope * np.mean(low_indices)
-        
+        # (intercepts already computed above for spread measurement)
         last_idx = max(high_indices[-1], low_indices[-1])
         upper_bound = high_intercept + high_slope * (last_idx + 1)
         lower_bound = low_intercept + low_slope * (last_idx + 1)
         
+        # BUG 3 fix: guard against crossing regression lines
+        if upper_bound <= lower_bound:
+            continue  # lines cross — not a valid channel
+        
         resistance = round(upper_bound, 2)
         support = round(lower_bound, 2)
         pattern_height = round(resistance - support, 2)
+        
+        # BUG 3 fix: pattern_height must be positive
+        if pattern_height <= 0:
+            continue
         
         # Check breakout
         recent_closes = None
@@ -794,7 +824,7 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
             target = resistance + pattern_height
         else:  # NEUTRAL — price inside channel, no breakout signal
             broken = False
-            target = resistance + pattern_height  # default, won't generate trade setup
+            target = None  # RISK 3 fix: no target for neutral channels
         
         confidence = 'HIGH' if pattern_height > tol_dollars * 4 and slope_ratio > 0.8 else 'MEDIUM'
         
@@ -804,18 +834,25 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
             'Descending': '📉 Descending Channel (下降通道)',
         }
         
-        channels.append({
+        channel_dict = {
             'type': icon_map.get(chan_type, f'📏 {chan_type} Channel'),
             'direction': direction,
             'support': support,
             'resistance': resistance,
             'pattern_height': pattern_height,
-            'target': round(target, 2),
+            'target': round(target, 2) if target is not None else None,
             'broken': broken,
             'confidence': confidence,
-        })
-        found_types.add(chan_key)
+        }
+        
+        # RISK 4 fix: keep best channel per type (largest window / highest confidence)
+        rank = conf_rank.get(confidence, 0) * 100 + window_size
+        if chan_key not in best_per_type or rank > best_per_type[chan_key][0]:
+            best_per_type[chan_key] = (rank, window_size, channel_dict)
     
+    # Collect best channels
+    for rank, wsize, ch in best_per_type.values():
+        channels.append(ch)
     return channels
 
 def detect_all_patterns(df, points, atr=None):
@@ -833,6 +870,35 @@ def detect_all_patterns(df, points, atr=None):
     # Channels
     channels = detect_channels(points, df=df)
     all_patterns.extend(channels)
+    
+    # RISK 1 fix: cross-pattern mutual exclusion — if a channel and a wedge/triangle
+    # overlap on similar support/resistance levels, drop the lower-confidence one
+    # (channels and wedges can fire on the same price structure with opposite directions)
+    if channels:
+        def _overlap(p1, p2, tol=15):
+            """Check if two patterns share similar support/resistance levels."""
+            s1, r1 = p1.get('support'), p1.get('resistance')
+            s2, r2 = p2.get('support'), p2.get('resistance')
+            if s1 is None or r1 is None or s2 is None or r2 is None:
+                return False
+            return (abs(s1 - s2) < tol and abs(r1 - r2) < tol)
+        
+        conf_rank_fn = lambda p: {'HIGH': 3, 'MEDIUM': 2, 'LOW': 1}.get(p.get('confidence', 'LOW'), 1)
+        to_remove = set()
+        for i, ch in enumerate(channels):
+            for j, other in enumerate(all_patterns):
+                if other is ch or j in to_remove:
+                    continue
+                if 'Channel' in other.get('type', ''):
+                    continue  # don't dedup channel vs channel
+                if _overlap(ch, other):
+                    # Keep the higher-confidence one; if tie, keep the non-channel
+                    if conf_rank_fn(ch) > conf_rank_fn(other):
+                        to_remove.add(j)
+                    else:
+                        to_remove.add(id(ch))  # mark channel for removal by identity
+        # Remove flagged patterns
+        all_patterns = [p for i, p in enumerate(all_patterns) if i not in to_remove and id(p) not in to_remove]
     
     # Flags — scan multiple windows (up to full dataset for older patterns)
     for lb in [25, 35, 45, 55, len(df)]:
@@ -1102,15 +1168,22 @@ def setup_priority(side, already_broken, daily_trend, h1_trend, quality):
 
 
 def pattern_stop_swing(pattern, side, nearest_high, nearest_low):
+    # BUG 6 fix: channels use regression-projected support/resistance which aren't real
+    # swing extremes — fall through to nearest_high/nearest_low for channels
+    is_channel = 'Channel' in pattern.get('type', '')
+    
     if side == 'SELL':
-        for key in ('highest_high', 'flag_high', 'top_price', 'resistance'):
-            if key in pattern:
-                return pattern[key]
+        if not is_channel:
+            for key in ('highest_high', 'flag_high', 'top_price', 'resistance'):
+                if key in pattern:
+                    return pattern[key]
+        return nearest_high['price']
     else:
-        for key in ('lowest_low', 'flag_low', 'bottom_price', 'support'):
-            if key in pattern:
-                return pattern[key]
-    return nearest_high['price'] if side == 'SELL' else nearest_low['price']
+        if not is_channel:
+            for key in ('lowest_low', 'flag_low', 'bottom_price', 'support'):
+                if key in pattern:
+                    return pattern[key]
+        return nearest_low['price']
 
 
 def pattern_add_level(pattern, side, points, trigger_level):
@@ -1176,7 +1249,7 @@ def _compute_tp1(pattern, actual_entry, risk, side):
                 {'price': pattern['support']},
                 actual_entry,
             )
-        elif 'target' in pattern:
+        elif 'target' in pattern and pattern['target'] is not None:
             return pattern['target'], None
         elif pattern.get('direction') == 'BEARISH' and 'target_down' in pattern:
             return pattern['target_down'], None
@@ -1214,7 +1287,7 @@ def _compute_tp1(pattern, actual_entry, risk, side):
             {'price': pattern['resistance']},
             actual_entry,
         )
-    elif 'target' in pattern:
+    elif 'target' in pattern and pattern['target'] is not None:
         return pattern['target'], None
     elif pattern.get('direction') == 'BULLISH' and 'target_up' in pattern:
         return pattern['target_up'], None
@@ -1269,7 +1342,9 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
             continue
         seen_trigger_keys.add(trigger_level)
 
-        already_broken = current_price < trigger_level
+        # RISK 2 fix: use pattern's broken flag if available (more precise than price check)
+        pattern_broken = pattern.get('broken', False)
+        already_broken = current_price < trigger_level or pattern_broken
         if current_price > trigger_level + atr * 2:
             continue
 
@@ -1352,7 +1427,9 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
             continue
         seen_trigger_keys.add(entry_trigger_level)
 
-        already_broken = current_price > entry_trigger_level
+        # RISK 2 fix: use pattern's broken flag if available (more precise than price check)
+        pattern_broken = pattern.get('broken', False)
+        already_broken = current_price > entry_trigger_level or pattern_broken
         if current_price < entry_trigger_level - atr * 2:
             continue
 
@@ -1573,6 +1650,8 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
                 if k in ('type', 'direction', 'confidence', 'broken', 'vol_confirm', 'swing_highs', 'swing_lows',
                          'support_trend', 'resistance_trend', 'upper_trend', 'lower_trend', 'flag_slope_correct'):
                     continue
+                if v is None:
+                    continue  # RISK 3 fix: skip None values (e.g., NEUTRAL channel target)
                 if isinstance(v, (int, float)):
                     if 'retrace_pct' in k:
                         pattern_lines.append(f"  - {k}: **{v:.0%}**")
