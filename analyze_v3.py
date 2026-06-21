@@ -818,7 +818,9 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
         max_rise = max_slope * window_span_est if window_span_est > 0 else 0
         
         if max_rise < est_height * 0.15:
-            # Gentle slopes: same sign AND similar slope ratio (not just same_sign)
+            # Gentle slopes: same sign required (reject converging triangles)
+            # slope_ratio threshold relaxed — both slopes are already confirmed
+            # gentle relative to channel height, so exact ratio matters less
             same_sign = (high_slope >= 0) == (low_slope >= 0)
             if not same_sign:
                 is_parallel = False
@@ -829,7 +831,7 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
             else:
                 r = high_slope / low_slope if abs(low_slope) > 1e-9 else 0.0
                 slope_ratio = abs(r) if abs(r) <= 1 else 1.0 / abs(r)
-                is_parallel = slope_ratio > 0.6
+                is_parallel = slope_ratio > 0.3  # relaxed: gentle slopes already filtered by max_rise
         elif (high_slope > 0) != (low_slope > 0):
             # Opposite signs → diverging/converging, not parallel channel
             is_parallel = False
