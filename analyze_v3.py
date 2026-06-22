@@ -1216,33 +1216,56 @@ def _is_bearish(o, c):
     return o > c
 
 
+def _short_term_trend(df, i, lookback=5):
+    """Simple trend over prior closes: UP / DOWN / FLAT."""
+    start = max(0, i - lookback)
+    c_now = float(df['Close'].iloc[i])
+    c_start = float(df['Close'].iloc[start])
+    if c_start == 0:
+        return 'FLAT'
+    pct = (c_now - c_start) / c_start
+    if pct > 0.002:
+        return 'UP'
+    if pct < -0.002:
+        return 'DOWN'
+    return 'FLAT'
+
+
+def _candle_strength_rank(strength):
+    return {'HIGH': 3, 'MEDIUM': 2, 'LOW': 1}.get(strength, 0)
+
+
+def _pick_best_candle(candidates):
+    """Keep one pattern per bar — highest strength wins."""
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda p: (
+            _candle_strength_rank(p['strength']),
+            p['direction'] != 'NEUTRAL',
+        ),
+    )
+
+
 def detect_candlestick_patterns(df, lookback=10):
     """
     Detect key candlestick patterns on the given DataFrame (works on any TF).
-    Returns a list of pattern dicts with: name, direction, bar_index, price, strength, description.
-    
-    Patterns detected:
-      BULLISH: Hammer, Inverted Hammer, Bullish Engulfing, Morning Star, 
-               Piercing Line, Bullish Harami, Three White Soldiers
-      BEARISH: Shooting Star, Hanging Man, Bearish Engulfing, Evening Star,
-               Dark Cloud Cover, Bearish Harami, Three Black Crows
-      NEUTRAL: Doji, Spinning Top
+    Returns one pattern per bar (deduped by strength).
     """
-    if len(df) < lookback + 5:
+    if len(df) < lookback + 2:
         return []
-    
+
     results = []
     n = len(df)
-    
-    # Work on last `lookback` bars
     start = max(0, n - lookback)
-    
+
     for i in range(start, n):
         o = float(df['Open'].iloc[i])
         h = float(df['High'].iloc[i])
         l = float(df['Low'].iloc[i])
         c = float(df['Close'].iloc[i])
-        
+
         body = _body(o, c)
         rng = _range(h, l)
         if rng == 0:
@@ -1250,30 +1273,15 @@ def detect_candlestick_patterns(df, lookback=10):
         body_ratio = body / rng
         upper = _upper_shadow(h, o, c)
         lower = _lower_shadow(l, o, c)
-        
-        # Need prior bars for multi-candle patterns
-        if i < 3:
-            continue
-        
-        o1 = float(df['Open'].iloc[i-1])
-        h1 = float(df['High'].iloc[i-1])
-        l1 = float(df['Low'].iloc[i-1])
-        c1 = float(df['Close'].iloc[i-1])
-        body1 = _body(o1, c1)
-        
-        o2 = float(df['Open'].iloc[i-2])
-        h2 = float(df['High'].iloc[i-2])
-        l2 = float(df['Low'].iloc[i-2])
-        c2 = float(df['Close'].iloc[i-2])
-        body2 = _body(o2, c2)
-        
+
         is_bull = _is_bullish(o, c)
         is_bear = _is_bearish(o, c)
-        is_bull1 = _is_bullish(o1, c1)
-        is_bear1 = _is_bearish(o1, c1)
-        
+        trend = _short_term_trend(df, i)
+
+        bar_hits = []
+
         def _add(name, direction, price, strength, desc):
-            results.append({
+            bar_hits.append({
                 'name': name,
                 'direction': direction,
                 'bar_index': i,
@@ -1282,151 +1290,145 @@ def detect_candlestick_patterns(df, lookback=10):
                 'description': desc,
                 'time': str(df.index[i]) if hasattr(df.index[i], 'strftime') else str(df.index[i]),
             })
-        
-        # ── SINGLE-CANDLE PATTERNS ──
-        
-        # Doji: body < 10% of range
-        if body_ratio < 0.1 and rng > 0:
+
+        # ── SINGLE-CANDLE PATTERNS (any bar) ──
+        if body_ratio < 0.1:
             _add('Doji', 'NEUTRAL', (h + l) / 2, 'MEDIUM',
                  f'十字星：猶豫信號，body_ratio={body_ratio:.1%}')
-        
-        # Hammer / Hanging Man: small body at top, long lower shadow (≥2x body)
         elif body > 0 and lower >= body * 2 and upper < body * 0.5:
-            if is_bull:
+            if trend == 'DOWN':
                 _add('Hammer', 'BULLISH', l, 'HIGH',
-                     f'錘子線：看漲反轉，下影線={lower:.1f} (body x{lower/body:.1f})')
+                     f'錘子線（下跌後）：看漲反轉，下影線={lower:.1f}')
+            elif trend == 'UP':
+                _add('Hanging Man', 'BEARISH', l, 'MEDIUM',
+                     f'上吊線（上漲後）：看跌信號，下影線={lower:.1f}')
+            elif is_bull:
+                _add('Hammer', 'BULLISH', l, 'HIGH',
+                     f'錘子線：看漲反轉，下影線={lower:.1f}')
             else:
                 _add('Hanging Man', 'BEARISH', l, 'MEDIUM',
                      f'上吊線：需確認，下影線={lower:.1f}')
-        
-        # Inverted Hammer (bullish, bottom of downtrend) / Shooting Star (bearish, top of uptrend)
-        # Distinguish by prior candle context, not current candle color
         elif body > 0 and upper >= body * 2 and lower < body * 0.5:
-            if is_bull1:  # After up move → Shooting Star (bearish reversal at top)
+            if trend == 'UP':
                 _add('Shooting Star', 'BEARISH', h, 'HIGH',
-                     f'射擊之星：看跌反轉，上影線={upper:.1f} (body x{upper/body:.1f})')
-            else:  # After down move → Inverted Hammer (bullish, needs confirm)
-                _add('Inverted Hammer', 'BULLISH', h, 'LOW',
+                     f'射擊之星（上漲後）：看跌反轉，上影線={upper:.1f}')
+            elif trend == 'DOWN':
+                _add('Inverted Hammer', 'BULLISH', h, 'MEDIUM',
+                     f'倒錘（下跌後）：看漲需確認，上影線={upper:.1f}')
+            elif i >= 1 and _is_bullish(float(df['Open'].iloc[i - 1]), float(df['Close'].iloc[i - 1])):
+                _add('Shooting Star', 'BEARISH', h, 'HIGH',
+                     f'射擊之星：看跌反轉，上影線={upper:.1f}')
+            else:
+                _add('Inverted Hammer', 'BULLISH', h, 'MEDIUM',
                      f'倒錘：需確認，上影線={upper:.1f}')
-        
-        # Marubozu: strong body candle (>80% of range), no or tiny shadows
-        elif body_ratio > 0.8 and rng > 0:
+        elif body_ratio > 0.8:
             if is_bull:
                 _add('Bullish Marubozu', 'BULLISH', c, 'HIGH',
                      f'陽線大燭：強烈買方力量，body_ratio={body_ratio:.1%}')
             else:
                 _add('Bearish Marubozu', 'BEARISH', c, 'HIGH',
                      f'陰線大燭：強烈賣方力量，body_ratio={body_ratio:.1%}')
-        
-        # ── TWO-CANDLE PATTERNS ──
-        
-        # Bullish Engulfing: prev bearish + current bullish body engulfs prev body
-        if is_bear1 and is_bull and o <= c1 and c >= o1 and body > body1:
-            _add('Bullish Engulfing', 'BULLISH', l, 'HIGH',
-                 f'看漲吞沒：陽線完全包住前陰線')
-        
-        # Bearish Engulfing: prev bullish + current bearish body engulfs prev body
-        if is_bull1 and is_bear and o >= c1 and c <= o1 and body > body1:
-            _add('Bearish Engulfing', 'BEARISH', h, 'HIGH',
-                 f'看跌吞沒：陰線完全包住前陽線')
-        
-        # Piercing Line: prev bearish, current opens below prev low, closes >50% into prev body
-        if is_bear1 and is_bull and body1 > 0:
-            mid_prev = (o1 + c1) / 2
-            if o < l1 and c > mid_prev and c < o1:
-                _add('Piercing Line', 'BULLISH', l, 'HIGH',
-                     f'刺穿線：陽線刺入前陰線 >50%')
-        
-        # Dark Cloud Cover: prev bullish, current opens above prev high, closes <50% into prev body
-        if is_bull1 and is_bear and body1 > 0:
-            mid_prev = (o1 + c1) / 2
-            if o > h1 and c < mid_prev and c > o1:
-                _add('Dark Cloud Cover', 'BEARISH', h, 'HIGH',
-                     f'烏雲蓋頂：陰線插入前陽線 >50%')
-        
-        # Bullish Harami: prev bearish large, current bullish small inside prev
-        if is_bear1 and is_bull and body1 > body * 1.5:
-            if o > c1 and c < o1:
-                _add('Bullish Harami', 'BULLISH', l, 'MEDIUM',
-                     f'多頭母子：小陽線喺大陰線內部')
-        
-        # Bearish Harami: prev bullish large, current bearish small inside prev
-        if is_bull1 and is_bear and body1 > body * 1.5:
-            if o < c1 and c > o1:
-                _add('Bearish Harami', 'BEARISH', h, 'MEDIUM',
-                     f'空頭母子：小陰線喺大陽線內部')
-        
-        # ── THREE-CANDLE PATTERNS ──
-        
-        # Morning Star: bearish + small gap body + bullish close >50% of first body
+
+        # ── TWO-CANDLE PATTERNS (need i >= 1) ──
+        if i >= 1:
+            o1 = float(df['Open'].iloc[i - 1])
+            h1 = float(df['High'].iloc[i - 1])
+            l1 = float(df['Low'].iloc[i - 1])
+            c1 = float(df['Close'].iloc[i - 1])
+            body1 = _body(o1, c1)
+            is_bull1 = _is_bullish(o1, c1)
+            is_bear1 = _is_bearish(o1, c1)
+
+            if is_bear1 and is_bull and o <= c1 and c >= o1 and body > body1:
+                _add('Bullish Engulfing', 'BULLISH', l, 'HIGH', '看漲吞沒：陽線完全包住前陰線')
+            if is_bull1 and is_bear and o >= c1 and c <= o1 and body > body1:
+                _add('Bearish Engulfing', 'BEARISH', h, 'HIGH', '看跌吞沒：陰線完全包住前陽線')
+            if is_bear1 and is_bull and body1 > 0:
+                mid_prev = (o1 + c1) / 2
+                if o < l1 and c > mid_prev and c < o1:
+                    _add('Piercing Line', 'BULLISH', l, 'HIGH', '刺穿線：陽線刺入前陰線 >50%')
+            if is_bull1 and is_bear and body1 > 0:
+                mid_prev = (o1 + c1) / 2
+                if o > h1 and c < mid_prev and c > o1:
+                    _add('Dark Cloud Cover', 'BEARISH', h, 'HIGH', '烏雲蓋頂：陰線插入前陽線 >50%')
+            if is_bear1 and is_bull and body1 > body * 1.5 and o > c1 and c < o1:
+                _add('Bullish Harami', 'BULLISH', l, 'MEDIUM', '多頭母子：小陽線喺大陰線內部')
+            if is_bull1 and is_bear and body1 > body * 1.5 and o < c1 and c > o1:
+                _add('Bearish Harami', 'BEARISH', h, 'MEDIUM', '空頭母子：小陰線喺大陽線內部')
+
+        # ── THREE-CANDLE PATTERNS (need i >= 2) ──
         if i >= 2:
+            o1 = float(df['Open'].iloc[i - 1])
+            c1 = float(df['Close'].iloc[i - 1])
+            body1 = _body(o1, c1)
+            o2 = float(df['Open'].iloc[i - 2])
+            c2 = float(df['Close'].iloc[i - 2])
+            body2 = _body(o2, c2)
             is_bull2 = _is_bullish(o2, c2)
             is_bear2 = _is_bearish(o2, c2)
+
             if is_bear2 and body2 > 0:
                 mid_first = (o2 + c2) / 2
-                # Second bar small body (star)
                 if body1 < body2 * 0.4 and is_bull and c > mid_first:
-                    _add('Morning Star', 'BULLISH', l, 'HIGH',
-                         f'晨星：三根K線看漲反轉，陽線收回 >50%')
-            
-            # Evening Star: bullish + small gap body + bearish close <50% of first body
+                    _add('Morning Star', 'BULLISH', l, 'HIGH', '晨星：三根K線看漲反轉')
             if is_bull2 and body2 > 0:
                 mid_first = (o2 + c2) / 2
                 if body1 < body2 * 0.4 and is_bear and c < mid_first:
-                    _add('Evening Star', 'BEARISH', h, 'HIGH',
-                         f'暮星：三根K線看跌反轉，陰線收回 <50%')
-        
-        # Three White Soldiers: 3 consecutive bullish with higher closes
-        if i >= 2:
+                    _add('Evening Star', 'BEARISH', h, 'HIGH', '暮星：三根K線看跌反轉')
+
+        # Three soldiers/crows — only on completion bar (avoid duplicate firings)
+        if i == n - 1 and i >= 2:
+            o1 = float(df['Open'].iloc[i - 1])
+            c1 = float(df['Close'].iloc[i - 1])
+            o2 = float(df['Open'].iloc[i - 2])
+            c2 = float(df['Close'].iloc[i - 2])
             if _is_bullish(o2, c2) and _is_bullish(o1, c1) and is_bull:
-                if c > c1 > c2 and o1 > o2 and o > o1:
-                    _add('Three White Soldiers', 'BULLISH', c, 'HIGH',
-                         f'三白兵：連續三根陽線，節節上升')
-        
-        # Three Black Crows: 3 consecutive bearish with lower closes
-        if i >= 2:
+                if c > c1 > c2 and o >= o1:
+                    _add('Three White Soldiers', 'BULLISH', c, 'HIGH', '三白兵：連續三根陽線')
             if _is_bearish(o2, c2) and _is_bearish(o1, c1) and is_bear:
-                if c < c1 < c2 and o1 < o2 and o < o1:
-                    _add('Three Black Crows', 'BEARISH', c, 'HIGH',
-                         f'三黑鴉：連續三根陰線，節節下跌')
-    
+                if c < c1 < c2 and o <= o1:
+                    _add('Three Black Crows', 'BEARISH', c, 'HIGH', '三黑鴉：連續三根陰線')
+
+        best = _pick_best_candle(bar_hits)
+        if best:
+            results.append(best)
+
     return results
 
 
-def candlestick_confirmation(candle_patterns, direction, lookback_bars=5):
+def candlestick_confirmation(candle_patterns, direction, lookback_bars=5, last_bar_idx=None):
     """
     Check if recent candlestick patterns confirm a trade direction.
-    Returns: (confirmed: bool, patterns: list, score: int)
-    
-    Score: +2 for HIGH strength match, +1 for MEDIUM, -2 for HIGH opposing.
-    Score >= 2 means confirmed.
+    Returns: (confirmed, confirming_patterns, score, opposing_patterns)
+
+    Score: +2 HIGH match, +1 MEDIUM, opposing subtracts same.
+    Confirmed when score >= 2 within lookback anchored to last_bar_idx.
     """
     if not candle_patterns:
-        return False, [], 0
-    
-    # Only look at the most recent patterns (last N bars)
-    max_idx = max(p['bar_index'] for p in candle_patterns)
-    recent = [p for p in candle_patterns if p['bar_index'] >= max_idx - lookback_bars]
-    
+        return False, [], 0, []
+
+    if last_bar_idx is None:
+        last_bar_idx = max(p['bar_index'] for p in candle_patterns)
+
+    recent = [p for p in candle_patterns if p['bar_index'] >= last_bar_idx - lookback_bars]
+
     score = 0
     confirming = []
     opposing = []
-    
+
     for p in recent:
         if p['direction'] == 'NEUTRAL':
             continue
-        
         strength_val = {'HIGH': 2, 'MEDIUM': 1, 'LOW': 0}.get(p['strength'], 0)
-        
         if p['direction'] == direction:
             score += strength_val
             confirming.append(p)
         else:
             score -= strength_val
             opposing.append(p)
-    
+
     confirmed = score >= 2
-    return confirmed, confirming, score
+    return confirmed, confirming, score, opposing
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2032,7 +2034,6 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
     """Generate comprehensive Markdown report."""
     candle_m30 = candle_m30 or []
     candle_day = candle_day or []
-    all_candle = candle_m30 + candle_day
 
     current = float(df_m30['Close'].iloc[-1])
     today = datetime.now().strftime('%Y-%m-%d')
@@ -2168,29 +2169,43 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
     candle_m30_text = _candle_list_text(candle_m30)
     candle_day_text = _candle_list_text(candle_day)
 
-    # Candlestick confirmation per setup direction
-    # Run M30 and Daily separately to avoid bar_index scale mismatch
+    # Candlestick confirmation per setup direction (anchored to last bar per TF)
+    last_m30 = len(df_m30) - 1
+    last_day = len(df_day) - 1
     confirm_lines = []
     if setups:
         for i, s in enumerate(setups, 1):
             direction = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
-            m30_conf, m30_pat, m30_score = candlestick_confirmation(candle_m30, direction, lookback_bars=5)
-            day_conf, day_pat, day_score = candlestick_confirmation(candle_day, direction, lookback_bars=5)
+            m30_conf, m30_pat, m30_score, m30_opp = candlestick_confirmation(
+                candle_m30, direction, lookback_bars=5, last_bar_idx=last_m30
+            )
+            day_conf, day_pat, day_score, day_opp = candlestick_confirmation(
+                candle_day, direction, lookback_bars=5, last_bar_idx=last_day
+            )
             total_score = m30_score + day_score
-            all_confirmed = m30_conf or day_conf  # either TF confirms
+            all_confirmed = total_score >= 2 and m30_score >= 0 and day_score >= 0
             all_pat = m30_pat + day_pat
+            all_opp = m30_opp + day_opp
             if all_confirmed:
                 names = ', '.join(cp['name'] for cp in all_pat)
-                src_tags = []
-                if m30_conf:
-                    src_tags.append(f"M30:{m30_score}")
-                if day_conf:
-                    src_tags.append(f"日線:{day_score}")
-                confirm_lines.append(
-                    f"- ✅ Signal {i} ({s['direction']}): **K 線確認** (total={total_score}, {' + '.join(src_tags)}) ← {names}")
+                src_tags = [f"M30:{m30_score}", f"日線:{day_score}"]
+                line = (
+                    f"- ✅ Signal {i} ({s['direction']}): **K 線確認** "
+                    f"(total={total_score}, {' + '.join(src_tags)}) ← {names}"
+                )
+                if all_opp:
+                    opp_names = ', '.join(cp['name'] for cp in all_opp)
+                    line += f" | ⚠️ 反向: {opp_names}"
+                confirm_lines.append(line)
             else:
+                opp_note = ''
+                if all_opp:
+                    opp_names = ', '.join(cp['name'] for cp in all_opp)
+                    opp_note = f" | 反向: {opp_names}"
                 confirm_lines.append(
-                    f"- ⚠️ Signal {i} ({s['direction']}): K 線未確認 (M30={m30_score}, 日線={day_score})")
+                    f"- ⚠️ Signal {i} ({s['direction']}): K 線未確認 "
+                    f"(M30={m30_score}, 日線={day_score}, total={total_score}){opp_note}"
+                )
     else:
         confirm_lines.append("- 無交易信號需要確認")
     candle_confirm_text = '\n'.join(confirm_lines)
@@ -2228,6 +2243,8 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 {fib_text}
 
 ## 🕯️ 四-B、K 線形態 (Candlestick Patterns)
+
+> ℹ️ **K 線確認僅供參考**，不影響信號排序、止損或倉位建議。
 
 ### M30 (最近 12 根)
 {candle_m30_text}
