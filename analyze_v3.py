@@ -137,9 +137,8 @@ def _breakout_status(df, direction, support=None, resistance=None, tol=0, points
 
 def _retest_confirm(df, direction, support=None, resistance=None, tol=0, lookback=5):
     """
-    Check if price has retested the breakout level after breaking through.
-    Returns True if a retest occurred (price returned to the broken level
-    and bounced off it), False otherwise.
+    Check if price retested a breakout level: prior break beyond level,
+    pullback touch, then bounce in breakout direction.
     """
     if df is None or len(df) < lookback + 2:
         return False
@@ -150,22 +149,53 @@ def _retest_confirm(df, direction, support=None, resistance=None, tol=0, lookbac
 
     if direction == 'BULLISH' and resistance is not None:
         level = resistance
-        # Price broke above, then pulled back near level, then bounced up
-        for i in range(n - lookback, n - 1):
-            if i < 0:
+        for i in range(1, n - 1):
+            prior_broke = bool(np.any(closes[max(0, i - lookback):i] > level + tol))
+            if not prior_broke:
                 continue
-            # Did price come back to retest the level from above?
-            if lows[i] <= level + tol and closes[i + 1] > level:
+            if lows[i] <= level + tol and closes[i] >= level and closes[i + 1] > level:
                 return True
     elif direction == 'BEARISH' and support is not None:
         level = support
-        # Price broke below, then pulled back near level, then dropped
-        for i in range(n - lookback, n - 1):
-            if i < 0:
+        for i in range(1, n - 1):
+            prior_broke = bool(np.any(closes[max(0, i - lookback):i] < level - tol))
+            if not prior_broke:
                 continue
-            if highs[i] >= level - tol and closes[i + 1] < level:
+            if highs[i] >= level - tol and closes[i] <= level and closes[i + 1] < level:
                 return True
     return False
+
+
+def _pattern_retest_levels(pattern, direction):
+    """Map support/resistance for retest — flags use breakout_level."""
+    support = pattern.get('support')
+    resistance = pattern.get('resistance')
+    if 'Flag' in pattern.get('type', ''):
+        level = pattern.get('breakout_level')
+        if direction == 'BULLISH' and resistance is None:
+            resistance = level
+        elif direction == 'BEARISH' and support is None:
+            support = level
+    return support, resistance
+
+
+def _directional_broke_recently(pattern, direction):
+    """Channel dual-side break: only count breakout on setup direction."""
+    if direction == 'BULLISH' and 'broke_recently_up' in pattern:
+        return pattern['broke_recently_up']
+    if direction == 'BEARISH' and 'broke_recently_down' in pattern:
+        return pattern['broke_recently_down']
+    return pattern.get('broke_recently', pattern.get('broken', False))
+
+
+def _breakout_volume_confirmed(pattern, df):
+    """Volume spike, or flag pole/flag vol_confirm when SMA volume unavailable."""
+    vol_spike = _volume_spike(df)
+    if vol_spike is True:
+        return True
+    if vol_spike is False:
+        return False
+    return pattern.get('vol_confirm') is True
 
 
 def _volume_spike(df, idx=None, window=5, multiplier=1.3):
@@ -1057,6 +1087,8 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
             'broken': broken,
             'broken_now': broken_now,
             'broke_recently': broke_recently,
+            'broke_recently_up': broken_up_recent,
+            'broke_recently_down': broken_down_recent,
             'confidence': confidence,
         }
         
@@ -1158,38 +1190,38 @@ def detect_all_patterns(df, points, atr=None):
     conf_order = {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}
     all_patterns.sort(key=lambda p: conf_order.get(p.get('confidence', 'LOW'), 2))
 
-    # Breakout + retest / volume spike confirmation for Channels/Wedges/Flags
-    # Patterns that broke recently but lack retest or volume confirmation
-    # get confidence downgraded to filter false breakouts
+    # Breakout + retest / volume confirmation for Channels/Wedges/Flags
     _false_breakout_types = {'Channel', 'Wedge', 'Flag'}
     for p in all_patterns:
         p_type = p.get('type', '')
         if not any(ft in p_type for ft in _false_breakout_types):
             continue
-        brk = p.get('breakout', {})
-        if not brk.get('broke_recently', False):
-            continue  # only evaluate broken patterns
 
         direction = p.get('direction', '')
-        support = p.get('support')
-        resistance = p.get('resistance')
+        if not _directional_broke_recently(p, direction):
+            continue
+
+        support, resistance = _pattern_retest_levels(p, direction)
         tol = max(1.0, (atr or 15) * 0.1)
 
         retest = _retest_confirm(df, direction, support=support,
                                  resistance=resistance, tol=tol)
+        vol_confirmed = _breakout_volume_confirmed(p, df)
         vol_spike = _volume_spike(df)
 
         p['retest_confirmed'] = retest
         p['vol_spike'] = vol_spike
+        p['vol_breakout_confirmed'] = vol_confirmed
 
-        # Downgrade confidence if no retest AND no volume spike
-        if not retest and (vol_spike is None or not vol_spike):
+        if not retest and not vol_confirmed:
             if p.get('confidence') == 'HIGH':
                 p['confidence'] = 'MEDIUM'
                 p['confidence_reason'] = '突破未經回測/量能確認，降級'
             elif p.get('confidence') == 'MEDIUM':
                 p['confidence'] = 'LOW'
                 p['confidence_reason'] = '突破未經回測/量能確認，降級'
+
+    all_patterns.sort(key=lambda p: conf_order.get(p.get('confidence', 'LOW'), 2))
 
     return all_patterns
 
@@ -1335,13 +1367,15 @@ def _is_bearish(o, c):
 
 
 def _short_term_trend(df, i, lookback=5):
-    """Simple trend over prior closes: UP / DOWN / FLAT."""
+    """Trend over prior closes (excludes current bar i)."""
+    if i < 1:
+        return 'FLAT'
     start = max(0, i - lookback)
-    c_now = float(df['Close'].iloc[i])
+    c_end = float(df['Close'].iloc[i - 1])
     c_start = float(df['Close'].iloc[start])
     if c_start == 0:
         return 'FLAT'
-    pct = (c_now - c_start) / c_start
+    pct = (c_end - c_start) / c_start
     if pct > 0.002:
         return 'UP'
     if pct < -0.002:
@@ -1667,15 +1701,11 @@ def aligned_with_trends(side, daily_trend, h1_trend):
 
 def setup_priority(side, already_broken, daily_trend, h1_trend, quality):
     aligned = aligned_with_trends(side, daily_trend, h1_trend)
-    if side == 'BEARISH':
-        if already_broken and aligned and quality == 'OK':
-            return 1
-        if already_broken and quality == 'OK':
-            return 2
-        return 3 if not aligned else 2
     if already_broken and aligned and quality == 'OK':
-        return 2
+        return 1
     if already_broken and quality == 'OK':
+        return 2
+    if aligned:
         return 3
     return 4
 
@@ -2088,7 +2118,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                                 'daily_alignment': '✅ 順日線',
                             })
 
-    setups.sort(key=lambda s: s['priority'])
+    setups.sort(key=lambda s: (s['priority'], -s.get('rr_tp1', 0)))
     return setups
 
 
@@ -2191,6 +2221,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
             pattern_lines.append(f"**{i}. {p['type']}** ({conf} confidence{status}){vol_str}")
             for k, v in p.items():
                 if k in ('type', 'direction', 'confidence', 'broken', 'broken_now', 'broke_recently',
+                         'broke_recently_up', 'broke_recently_down', 'vol_breakout_confirmed',
                          'vol_confirm', 'swing_highs', 'swing_lows',
                          'support_trend', 'resistance_trend', 'upper_trend', 'lower_trend', 'flag_slope_correct'):
                     continue
@@ -2331,7 +2362,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
     # Priority setup — top of report
     priority_text = ""
     if setups:
-        best = setups[0]  # already sorted by confidence in generate_trade_setups
+        best = setups[0]  # sorted by priority asc, then R:R desc
         conf_icon = {'HIGH': '🟢', 'MEDIUM': '🟡', 'LOW': '🔴'}.get(best.get('confidence', 'LOW'), '🔴')
         priority_text = f"""\
 ## ⭐ 當前最優先 Setup
