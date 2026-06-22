@@ -40,8 +40,8 @@ DATA_SOURCE = "TradingView (OANDA:XAUUSD)"  # updated at runtime (M30/H1 intrada
 DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"  # daily bars always from futures
 REQUIRED_COLS = ['Open', 'High', 'Low', 'Close', 'Volume']
 MIN_BARS = {'m30': 50, 'h1': 30, 'day': 20}
-TRAIL_PROFIT_ATR = 2.0
-TRAIL_STOP_ATR = 1.5
+TRAIL_PROFIT_ATR = float(os.environ.get('TRAIL_PROFIT_ATR', '2.0'))
+TRAIL_STOP_ATR = float(os.environ.get('TRAIL_STOP_ATR', '1.5'))
 
 
 def _log(msg):
@@ -133,6 +133,58 @@ def _breakout_status(df, direction, support=None, resistance=None, tol=0, points
         'broken_now': broken_now,
         'broke_recently': broke_recently,
     }
+
+
+def _retest_confirm(df, direction, support=None, resistance=None, tol=0, lookback=5):
+    """
+    Check if price has retested the breakout level after breaking through.
+    Returns True if a retest occurred (price returned to the broken level
+    and bounced off it), False otherwise.
+    """
+    if df is None or len(df) < lookback + 2:
+        return False
+    closes = df['Close'].values
+    highs = df['High'].values
+    lows = df['Low'].values
+    n = len(closes)
+
+    if direction == 'BULLISH' and resistance is not None:
+        level = resistance
+        # Price broke above, then pulled back near level, then bounced up
+        for i in range(n - lookback, n - 1):
+            if i < 0:
+                continue
+            # Did price come back to retest the level from above?
+            if lows[i] <= level + tol and closes[i + 1] > level:
+                return True
+    elif direction == 'BEARISH' and support is not None:
+        level = support
+        # Price broke below, then pulled back near level, then dropped
+        for i in range(n - lookback, n - 1):
+            if i < 0:
+                continue
+            if highs[i] >= level - tol and closes[i + 1] < level:
+                return True
+    return False
+
+
+def _volume_spike(df, idx=None, window=5, multiplier=1.3):
+    """
+    Check if volume at idx (or last `window` bars) is significantly above
+    the 20-bar SMA. Returns True/False/None (None = no volume data).
+    """
+    if not volume_usable(df) or len(df) < window + 5:
+        return None
+    vol = df['Volume'].values
+    vol_sma = pd.Series(vol).rolling(window=20, min_periods=1).mean().values
+    check_idx = idx if idx is not None else len(vol) - 1
+    if check_idx < 0 or check_idx >= len(vol):
+        return None
+    recent_vol = np.mean(vol[max(0, check_idx - window + 1):check_idx + 1])
+    baseline = vol_sma[check_idx]
+    if baseline <= 0 or np.isnan(baseline):
+        return None
+    return bool(recent_vol > baseline * multiplier)
 
 # ═══════════════════════════════════════════════════════════
 # DATA
@@ -257,25 +309,58 @@ def add_indicators(df):
 # SWING POINTS (time-ordered, with sequence info)
 # ═══════════════════════════════════════════════════════════
 
-def find_swings_ordered(high, low, lookback=3):
+def find_swings_ordered(high, low, lookback=3, atr=None, close=None):
     """
     Find swing points in time order, alternating high/low.
     Returns list of {'type':'high'|'low', 'idx':int, 'price':float}
+
+    ATR adaptive mode: when atr + close are provided, lookback scales with
+    recent volatility relative to ATR. High volatility → larger lookback
+    (fewer, more significant swings); low volatility → smaller lookback
+    (catch genuine swings in tight ranges). Floor=2, cap=6.
     """
+    n = len(high)
     points = []
-    for i in range(lookback, len(high) - lookback):
+
+    # Precompute adaptive lookback per bar if ATR + close given
+    adaptive_lb = None
+    if atr is not None and close is not None and n == len(close):
+        atr_arr = np.atleast_1d(atr)
+        close_arr = np.atleast_1d(close)
+        if len(atr_arr) == n:
+            adaptive_lb = np.full(n, lookback, dtype=int)
+            for i in range(n):
+                if atr_arr[i] > 0 and not np.isnan(atr_arr[i]):
+                    ratio = atr_arr[i] / close_arr[i] if close_arr[i] > 0 else 0
+                    # Map ATR/close ratio to lookback: typical 0.3%-1.5% for M30 gold
+                    # ratio < 0.4% → lb=2, 0.4-0.7% → 3, 0.7-1.0% → 4, 1.0-1.5% → 5, >1.5% → 6
+                    if ratio < 0.004:
+                        adaptive_lb[i] = 2
+                    elif ratio < 0.007:
+                        adaptive_lb[i] = 3
+                    elif ratio < 0.010:
+                        adaptive_lb[i] = 4
+                    elif ratio < 0.015:
+                        adaptive_lb[i] = 5
+                    else:
+                        adaptive_lb[i] = 6
+
+    for i in range(2, n - 2):
+        lb = int(adaptive_lb[i]) if adaptive_lb is not None else lookback
+        if i < lb or i >= n - lb:
+            continue
         h = float(high[i])
         l = float(low[i])
-        
-        is_swing_high = all(h >= float(high[i-j]) for j in range(1, lookback+1)) and \
-                        all(h >= float(high[i+j]) for j in range(1, lookback+1))
-        is_swing_low = all(l <= float(low[i-j]) for j in range(1, lookback+1)) and \
-                       all(l <= float(low[i+j]) for j in range(1, lookback+1))
-        
+
+        is_swing_high = all(h >= float(high[i-j]) for j in range(1, lb+1)) and \
+                        all(h >= float(high[i+j]) for j in range(1, lb+1))
+        is_swing_low = all(l <= float(low[i-j]) for j in range(1, lb+1)) and \
+                       all(l <= float(low[i+j]) for j in range(1, lb+1))
+
         if is_swing_high and is_swing_low:
             # Both true (rare) — pick the stronger one
-            h_dev = h - min(float(high[i-j]) for j in range(-lookback, lookback+1) if j != 0)
-            l_dev = max(float(low[i-j]) for j in range(-lookback, lookback+1) if j != 0) - l
+            h_dev = h - min(float(high[i-j]) for j in range(-lb, lb+1) if j != 0)
+            l_dev = max(float(low[i-j]) for j in range(-lb, lb+1) if j != 0) - l
             if h_dev >= l_dev:
                 points.append({'type': 'high', 'idx': i, 'price': round(h, 2)})
             else:
@@ -1072,7 +1157,40 @@ def detect_all_patterns(df, points, atr=None):
     # Sort by confidence
     conf_order = {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}
     all_patterns.sort(key=lambda p: conf_order.get(p.get('confidence', 'LOW'), 2))
-    
+
+    # Breakout + retest / volume spike confirmation for Channels/Wedges/Flags
+    # Patterns that broke recently but lack retest or volume confirmation
+    # get confidence downgraded to filter false breakouts
+    _false_breakout_types = {'Channel', 'Wedge', 'Flag'}
+    for p in all_patterns:
+        p_type = p.get('type', '')
+        if not any(ft in p_type for ft in _false_breakout_types):
+            continue
+        brk = p.get('breakout', {})
+        if not brk.get('broke_recently', False):
+            continue  # only evaluate broken patterns
+
+        direction = p.get('direction', '')
+        support = p.get('support')
+        resistance = p.get('resistance')
+        tol = max(1.0, (atr or 15) * 0.1)
+
+        retest = _retest_confirm(df, direction, support=support,
+                                 resistance=resistance, tol=tol)
+        vol_spike = _volume_spike(df)
+
+        p['retest_confirmed'] = retest
+        p['vol_spike'] = vol_spike
+
+        # Downgrade confidence if no retest AND no volume spike
+        if not retest and (vol_spike is None or not vol_spike):
+            if p.get('confidence') == 'HIGH':
+                p['confidence'] = 'MEDIUM'
+                p['confidence_reason'] = '突破未經回測/量能確認，降級'
+            elif p.get('confidence') == 'MEDIUM':
+                p['confidence'] = 'LOW'
+                p['confidence_reason'] = '突破未經回測/量能確認，降級'
+
     return all_patterns
 
 def volume_confirm(df, idx, direction='breakout', window=5):
@@ -2210,6 +2328,28 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
         confirm_lines.append("- 無交易信號需要確認")
     candle_confirm_text = '\n'.join(confirm_lines)
 
+    # Priority setup — top of report
+    priority_text = ""
+    if setups:
+        best = setups[0]  # already sorted by confidence in generate_trade_setups
+        conf_icon = {'HIGH': '🟢', 'MEDIUM': '🟡', 'LOW': '🔴'}.get(best.get('confidence', 'LOW'), '🔴')
+        priority_text = f"""\
+## ⭐ 當前最優先 Setup
+
+| 項目 | 詳情 |
+|------|------|
+| 信號 | {best['direction']} — {best['pattern']} |
+| 確定性 | {conf_icon} {best['confidence']} |
+| 觸發狀態 | {best['entry_status']} |
+| 入場區間 | {best['entry_zone']} |
+| 🛑 止損 | {best['stop_loss']} |
+| 🎯 TP1 | {best['tp1']} (R:R {best['rr_tp1']}:1) |
+| 日線配合 | {best['daily_alignment']} |
+
+"""
+    else:
+        priority_text = "## ⭐ 當前最優先 Setup\n\n⚠️ 無有效交易信號 — 等待形態形成\n\n"
+
     report = f"""# 🔥 XAUUSD 圖表形態深度分析 v3
 
 **日期:** {today}  
@@ -2220,6 +2360,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 
 ---
 
+{priority_text}
 ## 📊 一、市場狀態
 
 | 指標 | M30 | H1 | 日線 |
@@ -2324,7 +2465,18 @@ def main():
     parser = argparse.ArgumentParser(description='XAUUSD Pattern Analysis v3')
     parser.add_argument('--output', '-o', help='Output report path')
     parser.add_argument('--json', action='store_true', help='Also output JSON')
+    parser.add_argument('--trail-profit', type=float, default=None,
+                        help='Trailing stop profit threshold in ATR multiples (default: 2.0, env: TRAIL_PROFIT_ATR)')
+    parser.add_argument('--trail-stop', type=float, default=None,
+                        help='Trailing stop distance in ATR multiples (default: 1.5, env: TRAIL_STOP_ATR)')
     args = parser.parse_args()
+
+    # Override trail params if specified via CLI
+    global TRAIL_PROFIT_ATR, TRAIL_STOP_ATR
+    if args.trail_profit is not None:
+        TRAIL_PROFIT_ATR = args.trail_profit
+    if args.trail_stop is not None:
+        TRAIL_STOP_ATR = args.trail_stop
     
     # 1. Fetch data
     df_m30, df_h1, df_day = fetch_data()
@@ -2335,7 +2487,8 @@ def main():
     df_day = add_indicators(df_day)
     
     # 3. Find swing points
-    points = find_swings_ordered(df_m30['High'].values, df_m30['Low'].values, lookback=3)
+    points = find_swings_ordered(df_m30['High'].values, df_m30['Low'].values,
+                                 atr=df_m30['ATR'].values, close=df_m30['Close'].values)
     _log(f"[*] Swing points: {len(points)} (highs: {sum(1 for p in points if p['type']=='high')}, lows: {sum(1 for p in points if p['type']=='low')})")
     
     # 4. Current price & ATR (needed for pattern detection)
