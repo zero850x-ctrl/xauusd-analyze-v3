@@ -139,6 +139,7 @@ def _retest_confirm(df, direction, support=None, resistance=None, tol=0, lookbac
     """
     Check if price retested a breakout level: prior break beyond level,
     pullback touch, then bounce in breakout direction.
+    Only scans a recent window so ancient breaks cannot confirm current setups.
     """
     if df is None or len(df) < lookback + 2:
         return False
@@ -146,19 +147,23 @@ def _retest_confirm(df, direction, support=None, resistance=None, tol=0, lookbac
     highs = df['High'].values
     lows = df['Low'].values
     n = len(closes)
+    scan_window = lookback * 2 + 3
+    scan_start = max(1, n - scan_window)
 
     if direction == 'BULLISH' and resistance is not None:
         level = resistance
-        for i in range(1, n - 1):
-            prior_broke = bool(np.any(closes[max(0, i - lookback):i] > level + tol))
+        for i in range(scan_start, n - 1):
+            prior_from = max(scan_start, i - lookback)
+            prior_broke = bool(np.any(closes[prior_from:i] > level + tol))
             if not prior_broke:
                 continue
             if lows[i] <= level + tol and closes[i] >= level and closes[i + 1] > level:
                 return True
     elif direction == 'BEARISH' and support is not None:
         level = support
-        for i in range(1, n - 1):
-            prior_broke = bool(np.any(closes[max(0, i - lookback):i] < level - tol))
+        for i in range(scan_start, n - 1):
+            prior_from = max(scan_start, i - lookback)
+            prior_broke = bool(np.any(closes[prior_from:i] < level - tol))
             if not prior_broke:
                 continue
             if highs[i] >= level - tol and closes[i] <= level and closes[i + 1] < level:
@@ -196,6 +201,16 @@ def _breakout_volume_confirmed(pattern, df):
     if vol_spike is False:
         return False
     return pattern.get('vol_confirm') is True
+
+
+def _pattern_breakout_confirmed(pattern):
+    """True when retest/volume gate passed; N/A patterns default to confirmed."""
+    p_type = pattern.get('type', '')
+    if not any(ft in p_type for ft in ('Channel', 'Wedge', 'Flag')):
+        return True
+    if 'retest_confirmed' not in pattern and 'vol_breakout_confirmed' not in pattern:
+        return True
+    return bool(pattern.get('retest_confirmed') or pattern.get('vol_breakout_confirmed'))
 
 
 def _volume_spike(df, idx=None, window=5, multiplier=1.3):
@@ -1692,6 +1707,12 @@ def _pattern_confidence_order(pattern):
     return {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}.get(pattern.get('confidence', 'LOW'), 2)
 
 
+def _pattern_setup_order(pattern):
+    """Prefer confirmed breakouts, then higher confidence."""
+    unconfirmed = 0 if _pattern_breakout_confirmed(pattern) else 1
+    return (unconfirmed, _pattern_confidence_order(pattern))
+
+
 def aligned_with_trends(side, daily_trend, h1_trend):
     h1 = (h1_trend or {}).get('trend', 'NEUTRAL')
     if side == 'BEARISH':
@@ -1701,6 +1722,8 @@ def aligned_with_trends(side, daily_trend, h1_trend):
 
 def setup_priority(side, already_broken, daily_trend, h1_trend, quality):
     aligned = aligned_with_trends(side, daily_trend, h1_trend)
+    if quality == 'UNCONFIRMED':
+        return 5
     if already_broken and aligned and quality == 'OK':
         return 1
     if already_broken and quality == 'OK':
@@ -1744,6 +1767,8 @@ def pattern_add_level(pattern, side, points, trigger_level):
 
 
 def _entry_status_bearish(already_broken, aligned, quality):
+    if already_broken and quality == 'UNCONFIRMED':
+        return '⚠️ 已觸發 (未確認突破)'
     if already_broken and aligned and quality == 'OK':
         return '✅ 已觸發 (順勢)'
     if already_broken and quality == 'POOR_RR':
@@ -1758,6 +1783,8 @@ def _entry_status_bearish(already_broken, aligned, quality):
 def _entry_status_bullish(already_broken, aligned, quality):
     if not already_broken:
         return '⏳ 等待突破 (逆勢⚠️)' if not aligned else '⏳ 等待突破'
+    if quality == 'UNCONFIRMED':
+        return '⚠️ 已突破 (未確認)'
     if quality == 'OK' and aligned:
         return '✅ 已突破 (順勢)'
     if quality == 'POOR_RR':
@@ -1878,11 +1905,11 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
 
     bearish_p = sorted(
         [p for p in patterns if p['direction'] == 'BEARISH'],
-        key=_pattern_confidence_order,
+        key=_pattern_setup_order,
     )[:2]
     bullish_p = sorted(
         [p for p in patterns if p['direction'] == 'BULLISH'],
-        key=_pattern_confidence_order,
+        key=_pattern_setup_order,
     )[:2]
 
     seen_trigger_keys = set()
@@ -1937,6 +1964,8 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         quality = 'OK'
         if already_broken and rr_tp1 < 1.0:
             quality = 'POOR_RR'
+        elif already_broken and not _pattern_breakout_confirmed(pattern):
+            quality = 'UNCONFIRMED'
 
         add_level = pattern_add_level(pattern, 'SELL', points, trigger_level)
 
@@ -2016,6 +2045,8 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         quality = 'OK'
         if already_broken and rr_tp1 < 1.0:
             quality = 'POOR_RR'
+        elif already_broken and not _pattern_breakout_confirmed(pattern):
+            quality = 'UNCONFIRMED'
 
         add_level = pattern_add_level(pattern, 'BUY', points, entry_trigger_level)
 
