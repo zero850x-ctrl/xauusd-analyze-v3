@@ -1722,13 +1722,15 @@ def aligned_with_trends(side, daily_trend, h1_trend):
 
 def setup_priority(side, already_broken, daily_trend, h1_trend, quality):
     aligned = aligned_with_trends(side, daily_trend, h1_trend)
-    if quality == 'UNCONFIRMED':
+    if quality == 'UNCONFIRMED' or quality == 'POOR_RR':
         return 5
-    if already_broken and aligned and quality == 'OK':
+    if already_broken and aligned and quality != 'POOR_RR':
+        return 1
+    if already_broken and quality == 'GOOD':
         return 1
     if already_broken and quality == 'OK':
         return 2
-    if aligned:
+    if aligned and quality != 'POOR_RR':
         return 3
     return 4
 
@@ -1962,9 +1964,12 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         rr_tp2 = abs(actual_entry - tp2) / risk
 
         quality = 'OK'
-        if already_broken and rr_tp1 < 1.0:
+        if rr_tp1 < 1.5:
             quality = 'POOR_RR'
-        elif already_broken and not _pattern_breakout_confirmed(pattern):
+        elif rr_tp1 >= 2.0:
+            quality = 'GOOD'
+        # UNCONFIRMED: breakout triggered but not confirmed by retest/volume
+        if quality in ('OK', 'GOOD') and already_broken and not _pattern_breakout_confirmed(pattern):
             quality = 'UNCONFIRMED'
 
         add_level = pattern_add_level(pattern, 'SELL', points, trigger_level)
@@ -2043,9 +2048,12 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         rr_tp2 = abs(tp2 - actual_entry) / risk
 
         quality = 'OK'
-        if already_broken and rr_tp1 < 1.0:
+        if rr_tp1 < 1.5:
             quality = 'POOR_RR'
-        elif already_broken and not _pattern_breakout_confirmed(pattern):
+        elif rr_tp1 >= 2.0:
+            quality = 'GOOD'
+        # UNCONFIRMED: breakout triggered but not confirmed by retest/volume
+        if quality in ('OK', 'GOOD') and already_broken and not _pattern_breakout_confirmed(pattern):
             quality = 'UNCONFIRMED'
 
         add_level = pattern_add_level(pattern, 'BUY', points, entry_trigger_level)
@@ -2294,7 +2302,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 參數 | 詳情 |
 |------|------|
 | 信號確定性 | {s['confidence']} |
-| 質素 | {'✅ OK' if s.get('quality') == 'OK' else '⚠️ ' + s.get('quality', '?')} |
+| 質素 | {'🌟 GOOD' if s.get('quality') == 'GOOD' else ('✅ OK' if s.get('quality') == 'OK' else '⚠️ POOR_RR (R:R < 1.5)')} |
 | 日線配合 | {s['daily_alignment']} |
 | 觸發狀態 | **{s['entry_status']}** |
 | 入場區間 | {s['entry_zone']} |
