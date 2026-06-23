@@ -1724,13 +1724,13 @@ def setup_priority(side, already_broken, daily_trend, h1_trend, quality):
     aligned = aligned_with_trends(side, daily_trend, h1_trend)
     if quality == 'UNCONFIRMED' or quality == 'POOR_RR':
         return 5
-    if already_broken and aligned and quality != 'POOR_RR':
+    if already_broken and aligned and quality == 'GOOD':
         return 1
-    if already_broken and quality == 'GOOD':
-        return 1
-    if already_broken and quality == 'OK':
+    if already_broken and aligned and quality == 'OK':
         return 2
-    if aligned and quality != 'POOR_RR':
+    if already_broken and quality in ('GOOD', 'OK'):
+        return 2
+    if aligned:
         return 3
     return 4
 
@@ -1771,6 +1771,8 @@ def pattern_add_level(pattern, side, points, trigger_level):
 def _entry_status_bearish(already_broken, aligned, quality):
     if already_broken and quality == 'UNCONFIRMED':
         return '⚠️ 已觸發 (未確認突破)'
+    if already_broken and aligned and quality == 'GOOD':
+        return '🌟 已觸發 (順勢, R:R佳)'
     if already_broken and aligned and quality == 'OK':
         return '✅ 已觸發 (順勢)'
     if already_broken and quality == 'POOR_RR':
@@ -1787,6 +1789,8 @@ def _entry_status_bullish(already_broken, aligned, quality):
         return '⏳ 等待突破 (逆勢⚠️)' if not aligned else '⏳ 等待突破'
     if quality == 'UNCONFIRMED':
         return '⚠️ 已突破 (未確認)'
+    if quality == 'GOOD' and aligned:
+        return '🌟 已突破 (順勢, R:R佳)'
     if quality == 'OK' and aligned:
         return '✅ 已突破 (順勢)'
     if quality == 'POOR_RR':
@@ -2216,6 +2220,16 @@ def _data_source_label():
     return DATA_SOURCE
 
 
+def _quality_report_label(quality):
+    labels = {
+        'GOOD': '🌟 GOOD',
+        'OK': '✅ OK',
+        'POOR_RR': '⚠️ POOR_RR (R:R < 1.5)',
+        'UNCONFIRMED': '⚠️ 未確認突破',
+    }
+    return labels.get(quality, f'⚠️ {quality}')
+
+
 def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend=None,
                     candle_m30=None, candle_day=None):
     """Generate comprehensive Markdown report."""
@@ -2302,7 +2316,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 參數 | 詳情 |
 |------|------|
 | 信號確定性 | {s['confidence']} |
-| 質素 | {'🌟 GOOD' if s.get('quality') == 'GOOD' else ('✅ OK' if s.get('quality') == 'OK' else '⚠️ POOR_RR (R:R < 1.5)')} |
+| 質素 | {_quality_report_label(s.get('quality', '?'))} |
 | 日線配合 | {s['daily_alignment']} |
 | 觸發狀態 | **{s['entry_status']}** |
 | 入場區間 | {s['entry_zone']} |
