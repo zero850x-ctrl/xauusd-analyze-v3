@@ -39,7 +39,7 @@ YF_TICKER = "GC=F"
 DATA_SOURCE = "TradingView (OANDA:XAUUSD)"  # updated at runtime (M30/H1 intraday)
 DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"  # daily bars always from futures
 REQUIRED_COLS = ['Open', 'High', 'Low', 'Close', 'Volume']
-MIN_BARS = {'m30': 50, 'h1': 30, 'day': 20}
+MIN_BARS = {'m30': 50, 'h1': 30, 'm15': 30, 'day': 20}
 TRAIL_PROFIT_ATR = float(os.environ.get('TRAIL_PROFIT_ATR', '2.0'))
 TRAIL_STOP_ATR = float(os.environ.get('TRAIL_STOP_ATR', '1.5'))
 
@@ -334,8 +334,50 @@ def fetch_data():
     intraday_src = DATA_SOURCE
     daily_src = DAILY_DATA_SOURCE if DAILY_DATA_SOURCE != DATA_SOURCE else DATA_SOURCE
     src_note = intraday_src if intraday_src == daily_src else f"{intraday_src} | 日線: {daily_src}"
-    _log(f"   📡 Final: M30={len(df_m30)} bars | H1={len(df_h1)} | Daily={len(df_day)} | Source: {src_note}")
-    return df_m30, df_h1, df_day
+
+    # --- M15: native fetch (TV or yfinance); do not upsample M30 ---
+    df_m15 = None
+    if _TV_AVAILABLE:
+        try:
+            df_m15 = _tv.get_hist(TV_SYMBOL, TV_EXCHANGE, interval=TVInterval.in_15_minute, n_bars=500)
+            if df_m15 is not None and not df_m15.empty:
+                col_map = {
+                    'open': 'Open', 'high': 'High', 'low': 'Low',
+                    'close': 'Close', 'volume': 'Volume'
+                }
+                df_m15 = df_m15.rename(columns=col_map)
+                for c in ['symbol', 'symbol.1']:
+                    if c in df_m15.columns:
+                        df_m15 = df_m15.drop(columns=[c])
+                for col in REQUIRED_COLS:
+                    if col not in df_m15.columns:
+                        df_m15[col] = np.nan
+                _log(f"   TV M15: {len(df_m15)} bars")
+            else:
+                df_m15 = None
+        except Exception as e:
+            _log(f"   TV M15 failed: {e}")
+            df_m15 = None
+
+    if df_m15 is None:
+        try:
+            _log("[*] M15 fallback: Yahoo Finance 15m...")
+            df_m15 = yf.download(YF_TICKER, period='5d', interval='15m', progress=False)
+            df_m15.columns = [c[0] if isinstance(c, tuple) else c for c in df_m15.columns]
+            if df_m15 is not None and not df_m15.empty:
+                _log(f"   YF M15: {len(df_m15)} bars")
+            else:
+                df_m15 = None
+        except Exception as e:
+            _log(f"   YF M15 failed: {e}")
+            df_m15 = None
+
+    if df_m15 is not None and (df_m15.empty or len(df_m15) < MIN_BARS['m15']):
+        _log(f"   M15 insufficient ({0 if df_m15 is None else len(df_m15)} bars) — M15 timing disabled")
+        df_m15 = None
+
+    _log(f"   📡 Final: M30={len(df_m30)} bars | H1={len(df_h1)} | M15={len(df_m15) if df_m15 is not None else 0} | Daily={len(df_day)} | Source: {src_note}")
+    return df_m30, df_h1, df_m15, df_day
 
 # ═══════════════════════════════════════════════════════════
 # INDICATORS (lightweight — just what we need)
@@ -1357,6 +1399,153 @@ def analyze_h1_trend(df_h1):
     }
 
 # ═══════════════════════════════════════════════════════════
+# M15 ENTRY TIMING
+# ═══════════════════════════════════════════════════════════
+
+def analyze_m15_entry_timing(df_m15, patterns, points, current_price, atr):
+    """
+    Analyze M15 timeframe for refined entry timing.
+    Returns dict with m15_trend, m15_rsi, m15_swings, and per-pattern entry_suggestions.
+    """
+    if df_m15 is None or df_m15.empty or len(df_m15) < 20:
+        return {
+            'm15_trend': 'N/A (數據不足)',
+            'm15_rsi': None,
+            'm15_swings': None,
+            'entry_suggestions': [],
+        }
+
+    close = df_m15['Close'].values
+    high = df_m15['High'].values
+    low = df_m15['Low'].values
+    n = len(close)
+
+    # --- M15 short-term trend from last 20 bars ---
+    lookback = min(20, n)
+    recent = close[-lookback:]
+    ma10 = np.mean(recent[-min(10, lookback):])
+    if len(recent) >= 20:
+        first_half = np.mean(recent[:10])
+        second_half = np.mean(recent[10:])
+        if second_half > first_half * 1.001:
+            m15_trend = '🟢 BULLISH'
+        elif second_half < first_half * 0.999:
+            m15_trend = '🔴 BEARISH'
+        else:
+            m15_trend = '🟡 NEUTRAL'
+    else:
+        if close[-1] > ma10:
+            m15_trend = '🟢 BULLISH'
+        elif close[-1] < ma10:
+            m15_trend = '🔴 BEARISH'
+        else:
+            m15_trend = '🟡 NEUTRAL'
+
+    # --- M15 RSI ---
+    m15_rsi = None
+    try:
+        if 'RSI' in df_m15.columns:
+            rsi_val = float(df_m15['RSI'].iloc[-1])
+            if not np.isnan(rsi_val):
+                m15_rsi = round(rsi_val, 1)
+    except Exception:
+        pass
+    if m15_rsi is None:
+        try:
+            rsi_series = ta.momentum.RSIIndicator(close, window=14).rsi()
+            m15_rsi = round(float(rsi_series[-1]), 1) if not pd.isna(rsi_series[-1]) else None
+        except Exception:
+            pass
+
+    # --- M15 swing points: simple swing detection on last ~40 bars ---
+    swing_lookback = min(40, n - 4)
+    m15_swings = {'highs': [], 'lows': []}
+    for i in range(n - swing_lookback + 2, n - 2):
+        lb = 3
+        if i < lb or i >= n - lb:
+            continue
+        h = float(high[i])
+        l = float(low[i])
+        is_high = all(h >= float(high[i - j]) for j in range(1, lb + 1)) and \
+                  all(h >= float(high[i + j]) for j in range(1, lb + 1))
+        is_low = all(l <= float(low[i - j]) for j in range(1, lb + 1)) and \
+                 all(l <= float(low[i + j]) for j in range(1, lb + 1))
+        if is_high:
+            m15_swings['highs'].append(round(h, 2))
+        elif is_low:
+            m15_swings['lows'].append(round(l, 2))
+
+    # Nearest swing high/low relative to current price
+    nearest_high = None
+    nearest_low = None
+    if m15_swings['highs']:
+        above = [h for h in m15_swings['highs'] if h > current_price]
+        if above:
+            nearest_high = min(above)
+        else:
+            nearest_high = max(m15_swings['highs'])  # all below — use highest
+    if m15_swings['lows']:
+        below = [l for l in m15_swings['lows'] if l < current_price]
+        if below:
+            nearest_low = max(below)
+        else:
+            nearest_low = min(m15_swings['lows'])  # all above — use lowest
+
+    # --- Per-pattern entry suggestions ---
+    entry_suggestions = []
+    m15_atr = None
+    try:
+        if 'ATR' in df_m15.columns:
+            val = float(df_m15['ATR'].iloc[-1])
+            if not np.isnan(val):
+                m15_atr = val
+    except Exception:
+        pass
+    if m15_atr is None:
+        # Estimate M15 ATR as roughly half of M30 ATR
+        m15_atr = atr * 0.7
+
+    for p in patterns:
+        direction = p.get('direction', 'NEUTRAL')
+        ptype = p.get('type', 'Unknown')
+
+        # Tighter entry zone: use M15 ATR for refinement
+        if 'BULL' in direction.upper() or 'LONG' in direction.upper():
+            # For longs: entry zone near recent M15 low + buffer
+            entry_low = round(current_price - m15_atr * 0.5, 2)
+            entry_high = round(current_price + m15_atr * 0.3, 2)
+            sl = round(current_price - m15_atr * 1.5, 2) if nearest_low is None else round(min(current_price - m15_atr * 1.5, nearest_low - m15_atr * 0.3), 2)
+        elif 'BEAR' in direction.upper() or 'SHORT' in direction.upper():
+            entry_low = round(current_price - m15_atr * 0.3, 2)
+            entry_high = round(current_price + m15_atr * 0.5, 2)
+            sl = round(current_price + m15_atr * 1.5, 2) if nearest_high is None else round(max(current_price + m15_atr * 1.5, nearest_high + m15_atr * 0.3), 2)
+        else:
+            entry_low = round(current_price - m15_atr * 0.5, 2)
+            entry_high = round(current_price + m15_atr * 0.5, 2)
+            sl = round(current_price - m15_atr * 1.5, 2)
+
+        entry_suggestions.append({
+            'pattern_type': ptype,
+            'direction': direction,
+            'm15_entry_zone': f'${entry_low:.0f} – ${entry_high:.0f}',
+            'm15_sl': f'${sl:.0f}',
+            'm15_atr': round(m15_atr, 2),
+        })
+
+    return {
+        'm15_trend': m15_trend,
+        'm15_rsi': m15_rsi,
+        'm15_swings': {
+            'nearest_high': nearest_high,
+            'nearest_low': nearest_low,
+            'highs': m15_swings['highs'][-5:],
+            'lows': m15_swings['lows'][-5:],
+        },
+        'entry_suggestions': entry_suggestions,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
 # CANDLESTICK PATTERN DETECTION
 # ═══════════════════════════════════════════════════════════
 
@@ -1754,6 +1943,36 @@ def pattern_stop_swing(pattern, side, nearest_high, nearest_low):
         return nearest_low['price']
 
 
+def pattern_structure_stop(pattern, side, atr):
+    """Return (structure_stop, has_structure) for flags and wedges.
+    
+    Bear flag SELL:   flag_high + atr * 0.5
+    Bull flag BUY:    flag_low  - atr * 0.5
+    Rising wedge SELL:  resistance + atr * 0.5
+    Falling wedge BUY:  support    - atr * 0.5
+    Other patterns: has_structure=False
+    """
+    ptype = pattern.get('type', '')
+    is_flag = 'Flag' in ptype
+    is_wedge = 'Wedge' in ptype or '\u6954\u5f62' in ptype
+
+    if not is_flag and not is_wedge:
+        return None, False
+
+    if side == 'SELL':
+        if is_flag and 'flag_high' in pattern:
+            return pattern['flag_high'] + atr * 0.5, True
+        if is_wedge and 'resistance' in pattern:
+            return pattern['resistance'] + atr * 0.5, True
+    else:
+        if is_flag and 'flag_low' in pattern:
+            return pattern['flag_low'] - atr * 0.5, True
+        if is_wedge and 'support' in pattern:
+            return pattern['support'] - atr * 0.5, True
+
+    return None, False
+
+
 def pattern_add_level(pattern, side, points, trigger_level):
     highs = [p for p in points if p['type'] == 'high']
     lows = [p for p in points if p['type'] == 'low']
@@ -1768,7 +1987,9 @@ def pattern_add_level(pattern, side, points, trigger_level):
     return pattern.get('resistance', trigger_level)
 
 
-def _entry_status_bearish(already_broken, aligned, quality):
+def _entry_status_bearish(already_broken, aligned, quality, entry_mode='breakout'):
+    if entry_mode == 'pullback':
+        return '🎯 反彈入場 (待突破)'
     if already_broken and quality == 'UNCONFIRMED':
         return '⚠️ 已觸發 (未確認突破)'
     if already_broken and aligned and quality == 'GOOD':
@@ -1784,7 +2005,9 @@ def _entry_status_bearish(already_broken, aligned, quality):
     return '⏳ 等待跌穿'
 
 
-def _entry_status_bullish(already_broken, aligned, quality):
+def _entry_status_bullish(already_broken, aligned, quality, entry_mode='breakout'):
+    if entry_mode == 'pullback':
+        return '🎯 反彈入場 (待突破)'
     if not already_broken:
         return '⏳ 等待突破 (逆勢⚠️)' if not aligned else '⏳ 等待突破'
     if quality == 'UNCONFIRMED':
@@ -1796,6 +2019,40 @@ def _entry_status_bullish(already_broken, aligned, quality):
     if quality == 'POOR_RR':
         return '⚠️ 已突破 (R:R低)'
     return '⚠️ 已突破 (逆勢!)'
+
+
+def daily_alignment_str(expected_trend, daily_trend, h1_trend=None):
+    """Format daily/H1 alignment — H1 NEUTRAL matches aligned_with_trends()."""
+    chk = '\u2705'
+    wrn = '\u26a0\ufe0f'
+    d_ok = daily_trend['trend'] == expected_trend
+    h1 = (h1_trend or {}).get('trend', 'NEUTRAL')
+    if expected_trend == 'BEARISH':
+        h_ok = h1 in ('BEARISH', 'NEUTRAL')
+    else:
+        h_ok = h1 in ('BULLISH', 'NEUTRAL')
+    return f"\u65e5\u7dda{chk if d_ok else wrn} H1{chk if h_ok else wrn}"
+
+
+def _quality_from_rr(rr_tp1):
+    """R:R quality tiers shared by breakout and pullback setups."""
+    if rr_tp1 < 1.5:
+        return 'POOR_RR'
+    if rr_tp1 >= 2.0:
+        return 'GOOD'
+    return 'OK'
+
+
+def _pullback_consolidation_ok(pattern, atr, is_flag, is_wedge):
+    """Flag: retrace_pct + flag_range. Wedge: pattern_height (no flag fields)."""
+    if is_flag:
+        retrace_pct = pattern.get('retrace_pct', 0)
+        flag_range = pattern.get('flag_range', 0)
+        return 0.15 <= retrace_pct <= 0.55 and flag_range >= atr * 0.5
+    if is_wedge:
+        height = pattern.get('pattern_height', 0)
+        return height >= atr * 0.5
+    return False
 
 
 def _tp_method_label(pattern, tp_value, fib_tp, rr_tp):
@@ -1950,10 +2207,18 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
             entry_low = trigger_level - atr * 0.5
             entry_high = trigger_level
 
+        # --- SL calculation: structure stop priority for flags/wedges ---
+        struct_stop, has_struct = pattern_structure_stop(pattern, 'SELL', atr)
         stop_swing = pattern_stop_swing(pattern, 'SELL', nearest_high, nearest_low)
-        raw_stop = stop_swing + atr
-        max_stop = current_price + atr * 3
-        stop_level = min(raw_stop, max_stop)
+        if has_struct:
+            # Use structure stop as primary, cap at 2*ATR above current price
+            stop_level = min(struct_stop, current_price + atr * 2)
+            stop_used_struct = True
+        else:
+            raw_stop = stop_swing + atr
+            max_stop = current_price + atr * 3
+            stop_level = min(raw_stop, max_stop)
+            stop_used_struct = False
         risk = stop_level - actual_entry
         if risk <= 0:
             continue
@@ -1967,48 +2232,119 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         rr_tp1 = abs(actual_entry - tp1) / risk
         rr_tp2 = abs(actual_entry - tp2) / risk
 
-        quality = 'OK'
-        if rr_tp1 < 1.5:
-            quality = 'POOR_RR'
-        elif rr_tp1 >= 2.0:
-            quality = 'GOOD'
+        quality = _quality_from_rr(rr_tp1)
         # UNCONFIRMED: breakout triggered but not confirmed by retest/volume
         if quality in ('OK', 'GOOD') and already_broken and not _pattern_breakout_confirmed(pattern):
             quality = 'UNCONFIRMED'
 
         add_level = pattern_add_level(pattern, 'SELL', points, trigger_level)
 
+        # --- Build stop rationale ---
+        if stop_used_struct:
+            flag_high = pattern.get('flag_high', 0)
+            if 'resistance' in pattern and ('Wedge' in pattern.get('type', '') or '\u6954\u5f62' in pattern.get('type', '')):
+                flag_high = pattern['resistance']
+                stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (resistance ${flag_high:.0f} + 0.5 ATR)"
+            else:
+                stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (flag_high ${flag_high:.0f} + 0.5 ATR)"
+        else:
+            stop_rationale = (
+                f"\u524d\u9802 ${stop_swing:.0f} + 1 ATR (${atr:.0f})"
+                if stop_level == stop_swing + atr
+                else f"3 ATR \u5c01\u9802 (\u524d\u9802 ${stop_swing:.0f} \u592a\u9060)"
+            )
+
+        # --- Generate breakout setup ---
         setups.append({
-            'direction': '🔴 SELL',
+            'direction': '\U0001f534 SELL',
             'priority': setup_priority('BEARISH', already_broken, daily_trend, h1_trend, quality),
             'pattern': pattern['type'],
             'confidence': pattern.get('confidence', 'MEDIUM'),
             'quality': quality,
-            'entry_status': _entry_status_bearish(already_broken, aligned, quality),
+            'entry_mode': 'breakout',
+            'entry_status': _entry_status_bearish(already_broken, aligned, quality, 'breakout'),
             'entry_zone': f"${entry_low:.0f} - ${entry_high:.0f}",
             'entry_trigger': (
-                f"跌穿 ${trigger_level:.0f} 入場" if not already_broken
-                else f"已跌穿 ${trigger_level:.0f}，現價 ${current_price:.0f} 入場"
+                f"\u8dcc\u7a7f ${trigger_level:.0f} \u5165\u5834" if not already_broken
+                else f"\u5df2\u8dcc\u7a7f ${trigger_level:.0f}\uff0c\u73fe\u50f9 ${current_price:.0f} \u5165\u5834"
             ),
-            'add_position': f"跌穿 ${add_level:.0f} 加注 0.02",
+            'add_position': f"\u8dcc\u7a7f ${add_level:.0f} \u52a0\u6ce8 0.02",
             'stop_loss': f"${stop_level:.0f}",
-            'stop_rationale': (
-                f"前頂 ${stop_swing:.0f} + 1 ATR (${atr:.0f})"
-                if stop_level == raw_stop
-                else f"3 ATR 封頂 (前頂 ${stop_swing:.0f} 太遠)"
-            ),
-            'tp1': f"${tp1:.0f} ({_tp_method_label(pattern, tp1, fib_tp, rr_tp)}, 止賺 1/3)",
-            'tp2': f"${tp2:.0f} ({_tp_method_label(pattern, tp2, fib_tp, rr_tp)}, 止賺 1/3)",
-            'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+            'stop_rationale': stop_rationale,
+            'tp1': f"${tp1:.0f} ({_tp_method_label(pattern, tp1, fib_tp, rr_tp)}, \u6b62\u8cfa 1/3)",
+            'tp2': f"${tp2:.0f} ({_tp_method_label(pattern, tp2, fib_tp, rr_tp)}, \u6b62\u8cfa 1/3)",
+            'tp3': f"\u653e\u98db + {tp3_trail} (\u5c3e\u5009 1/3)",
             'risk_amount': round(risk, 1),
             'rr_tp1': round(rr_tp1, 1),
             'rr_tp2': round(rr_tp2, 1),
             'daily_alignment': (
-                f"日線{'✅' if daily_trend['trend'] == 'BEARISH' else '⚠️'} "
-                f"H1{'✅' if (h1_trend or {}).get('trend') == 'BEARISH' else '⚠️'}"
+                daily_alignment_str('BEARISH', daily_trend, h1_trend)
             ),
             'note': '' if aligned else '⚠️ 逆勢交易，只用半倉 (0.01)',
         })
+
+        # --- Pullback entry for flags/wedges (not broken, decent consolidation quality) ---
+        ptype = pattern.get('type', '')
+        is_flag = 'Flag' in ptype
+        is_wedge = 'Wedge' in ptype or '\u6954\u5f62' in ptype
+        if (is_flag or is_wedge) and not already_broken:
+            if _pullback_consolidation_ok(pattern, atr, is_flag, is_wedge):
+                # Pullback entry: current price within the flag/wedge zone (within 0.3 ATR of flag_high)
+                flag_high = pattern.get('flag_high')
+                if flag_high is None and 'resistance' in pattern:
+                    flag_high = pattern['resistance']
+                flag_low = pattern.get('flag_low')
+                if flag_low is None and 'support' in pattern:
+                    flag_low = pattern['support']
+
+                if flag_high is not None:
+                    # Current price must be inside or near the consolidation zone
+                    near_high = abs(current_price - flag_high) <= atr * 0.3
+                    in_zone = (flag_low is not None and flag_low <= current_price <= flag_high + atr * 0.3)
+                    if near_high or in_zone:
+                        pb_entry = current_price
+                        pb_stop, _ = pattern_structure_stop(pattern, 'SELL', atr)
+                        if pb_stop is None:
+                            pb_stop = flag_high + atr * 0.5
+                        pb_stop = min(pb_stop, current_price + atr * 2)
+                        pb_risk = pb_stop - pb_entry
+                        if pb_risk > 0:
+                            pb_fib_tp, _ = _compute_tp1(pattern, pb_entry, pb_risk, 'SELL')
+                            pb_rr_tp = pb_entry - pb_risk
+                            pb_tp1 = max(pb_fib_tp, pb_rr_tp)
+                            pb_tp2 = min(pb_fib_tp, pb_rr_tp)
+                            pb_rr1 = abs(pb_entry - pb_tp1) / pb_risk
+                            pb_rr2 = abs(pb_entry - pb_tp2) / pb_risk
+                            pb_quality = _quality_from_rr(pb_rr1)
+
+                            pb_stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (flag_high ${flag_high:.1f} + 0.5 ATR)"
+                            if 'resistance' in pattern and is_wedge:
+                                pb_stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (resistance ${pattern['resistance']:.1f} + 0.5 ATR)"
+
+                            setups.append({
+                                'direction': '\U0001f534 SELL',
+                                'priority': setup_priority('BEARISH', False, daily_trend, h1_trend, pb_quality),
+                                'pattern': pattern['type'],
+                                'confidence': pattern.get('confidence', 'MEDIUM'),
+                                'quality': pb_quality,
+                                'entry_mode': 'pullback',
+                                'entry_status': _entry_status_bearish(False, aligned, pb_quality, 'pullback'),
+                                'entry_zone': f"${pb_entry - atr * 0.3:.0f} - ${pb_entry + atr * 0.3:.0f}",
+                                'entry_trigger': f"\u65d7\u9762\u53cd\u5f48\u5165\u5834 @ ${pb_entry:.0f}",
+                                'add_position': f"\u8dcc\u7a7f ${add_level:.0f} \u52a0\u6ce8 0.02",
+                                'stop_loss': f"${pb_stop:.0f}",
+                                'stop_rationale': pb_stop_rationale,
+                                'tp1': f"${pb_tp1:.0f} ({_tp_method_label(pattern, pb_tp1, pb_fib_tp, pb_rr_tp)}, \u6b62\u8cfa 1/3)",
+                                'tp2': f"${pb_tp2:.0f} ({_tp_method_label(pattern, pb_tp2, pb_fib_tp, pb_rr_tp)}, \u6b62\u8cfa 1/3)",
+                                'tp3': f"\u653e\u98db + {tp3_trail} (\u5c3e\u5009 1/3)",
+                                'risk_amount': round(pb_risk, 1),
+                                'rr_tp1': round(pb_rr1, 1),
+                                'rr_tp2': round(pb_rr2, 1),
+                                'daily_alignment': (
+                                    daily_alignment_str('BEARISH', daily_trend, h1_trend)
+                                ),
+                                'note': '🎯 反彈入場 — 旗面內縮倉，待突破追加' if aligned else '⚠️ 逆勢反彈，半倉 (0.01)',
+                            })
 
     for pattern in bullish_p:
         if 'resistance' in pattern:
@@ -2034,10 +2370,18 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         entry_low = entry_trigger_level
         entry_high = entry_trigger_level + atr * 0.5
 
+        # --- SL calculation: structure stop priority for flags/wedges ---
+        struct_stop, has_struct = pattern_structure_stop(pattern, 'BUY', atr)
         stop_swing = pattern_stop_swing(pattern, 'BUY', nearest_high, nearest_low)
-        raw_stop = stop_swing - atr
-        min_stop = current_price - atr * 3
-        stop_level = max(raw_stop, min_stop)
+        if has_struct:
+            # Use structure stop as primary, cap at 2*ATR below current price
+            stop_level = max(struct_stop, current_price - atr * 2)
+            stop_used_struct = True
+        else:
+            raw_stop = stop_swing - atr
+            min_stop = current_price - atr * 3
+            stop_level = max(raw_stop, min_stop)
+            stop_used_struct = False
         risk = actual_entry - stop_level
         if risk <= 0:
             continue
@@ -2051,48 +2395,115 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         rr_tp1 = abs(tp1 - actual_entry) / risk
         rr_tp2 = abs(tp2 - actual_entry) / risk
 
-        quality = 'OK'
-        if rr_tp1 < 1.5:
-            quality = 'POOR_RR'
-        elif rr_tp1 >= 2.0:
-            quality = 'GOOD'
+        quality = _quality_from_rr(rr_tp1)
         # UNCONFIRMED: breakout triggered but not confirmed by retest/volume
         if quality in ('OK', 'GOOD') and already_broken and not _pattern_breakout_confirmed(pattern):
             quality = 'UNCONFIRMED'
 
         add_level = pattern_add_level(pattern, 'BUY', points, entry_trigger_level)
 
+        # --- Build stop rationale ---
+        if stop_used_struct:
+            flag_low = pattern.get('flag_low', 0)
+            if 'support' in pattern and ('Wedge' in pattern.get('type', '') or '\u6954\u5f62' in pattern.get('type', '')):
+                flag_low = pattern['support']
+                stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (support ${flag_low:.0f} - 0.5 ATR)"
+            else:
+                stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (flag_low ${flag_low:.0f} - 0.5 ATR)"
+        else:
+            stop_rationale = (
+                f"\u524d\u5e95 ${stop_swing:.0f} - 1 ATR (${atr:.0f})"
+                if stop_level == stop_swing - atr
+                else f"3 ATR \u5c01\u5e95 (\u524d\u5e95 ${stop_swing:.0f} \u592a\u9060)"
+            )
+
+        # --- Generate breakout setup ---
         setups.append({
-            'direction': '🟢 BUY',
+            'direction': '\U0001f7e2 BUY',
             'priority': setup_priority('BULLISH', already_broken, daily_trend, h1_trend, quality),
             'pattern': pattern['type'],
             'confidence': pattern.get('confidence', 'MEDIUM'),
             'quality': quality,
-            'entry_status': _entry_status_bullish(already_broken, aligned, quality),
+            'entry_mode': 'breakout',
+            'entry_status': _entry_status_bullish(already_broken, aligned, quality, 'breakout'),
             'entry_zone': f"${entry_low:.0f} - ${entry_high:.0f}",
             'entry_trigger': (
-                f"突破 ${entry_trigger_level:.0f}" if not already_broken
-                else f"已突破 ${entry_trigger_level:.0f}"
+                f"\u7a81\u7834 ${entry_trigger_level:.0f}" if not already_broken
+                else f"\u5df2\u7a81\u7834 ${entry_trigger_level:.0f}"
             ),
-            'add_position': f"突破 ${add_level:.0f} 加注 {'0.02' if aligned else '0.01'}",
+            'add_position': f"\u7a81\u7834 ${add_level:.0f} \u52a0\u6ce8 {'0.02' if aligned else '0.01'}",
             'stop_loss': f"${stop_level:.0f}",
-            'stop_rationale': (
-                f"前底 ${stop_swing:.0f} - 1 ATR (${atr:.0f})"
-                if stop_level == raw_stop
-                else f"3 ATR 封底 (前底 ${stop_swing:.0f} 太遠)"
-            ),
-            'tp1': f"${tp1:.0f} ({_tp_method_label(pattern, tp1, fib_tp, rr_tp)}, 止賺 1/3)",
-            'tp2': f"${tp2:.0f} ({_tp_method_label(pattern, tp2, fib_tp, rr_tp)}, 止賺 1/3)",
-            'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+            'stop_rationale': stop_rationale,
+            'tp1': f"${tp1:.0f} ({_tp_method_label(pattern, tp1, fib_tp, rr_tp)}, \u6b62\u8cfa 1/3)",
+            'tp2': f"${tp2:.0f} ({_tp_method_label(pattern, tp2, fib_tp, rr_tp)}, \u6b62\u8cfa 1/3)",
+            'tp3': f"\u653e\u98db + {tp3_trail} (\u5c3e\u5009 1/3)",
             'risk_amount': round(risk, 1),
             'rr_tp1': round(rr_tp1, 1),
             'rr_tp2': round(rr_tp2, 1),
-            'daily_alignment': (
-                f"日線{'✅' if daily_trend['trend'] == 'BULLISH' else '⚠️'} "
-                f"H1{'✅' if (h1_trend or {}).get('trend') == 'BULLISH' else '⚠️'}"
-            ),
-            'note': '' if aligned else '⚠️ 逆勢交易，只用半倉 (0.01)',
+            'daily_alignment': daily_alignment_str('BULLISH', daily_trend, h1_trend),
+            'note': '' if aligned else '\u26a0\ufe0f \u9006\u52e2\u4ea4\u6613\uff0c\u53ea\u7528\u534a\u5009 (0.01)',
         })
+
+        # --- Pullback entry for flags/wedges (not broken, decent consolidation quality) ---
+        ptype = pattern.get('type', '')
+        is_flag = 'Flag' in ptype
+        is_wedge = 'Wedge' in ptype or '\u6954\u5f62' in ptype
+        if (is_flag or is_wedge) and not already_broken:
+            if _pullback_consolidation_ok(pattern, atr, is_flag, is_wedge):
+                # Pullback entry: current price within the flag/wedge zone (within 0.3 ATR of flag_low)
+                flag_low = pattern.get('flag_low')
+                if flag_low is None and 'support' in pattern:
+                    flag_low = pattern['support']
+                flag_high = pattern.get('flag_high')
+                if flag_high is None and 'resistance' in pattern:
+                    flag_high = pattern['resistance']
+
+                if flag_low is not None:
+                    # Current price must be inside or near the consolidation zone
+                    near_low = abs(current_price - flag_low) <= atr * 0.3
+                    in_zone = (flag_high is not None and flag_low - atr * 0.3 <= current_price <= flag_high)
+                    if near_low or in_zone:
+                        pb_entry = current_price
+                        pb_stop, _ = pattern_structure_stop(pattern, 'BUY', atr)
+                        if pb_stop is None:
+                            pb_stop = flag_low - atr * 0.5
+                        pb_stop = max(pb_stop, current_price - atr * 2)
+                        pb_risk = pb_entry - pb_stop
+                        if pb_risk > 0:
+                            pb_fib_tp, _ = _compute_tp1(pattern, pb_entry, pb_risk, 'BUY')
+                            pb_rr_tp = pb_entry + pb_risk
+                            pb_tp1 = min(pb_fib_tp, pb_rr_tp)
+                            pb_tp2 = max(pb_fib_tp, pb_rr_tp)
+                            pb_rr1 = abs(pb_tp1 - pb_entry) / pb_risk
+                            pb_rr2 = abs(pb_tp2 - pb_entry) / pb_risk
+                            pb_quality = _quality_from_rr(pb_rr1)
+
+                            pb_stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (flag_low ${flag_low:.1f} - 0.5 ATR)"
+                            if 'support' in pattern and is_wedge:
+                                pb_stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (support ${pattern['support']:.1f} - 0.5 ATR)"
+
+                            setups.append({
+                                'direction': '\U0001f7e2 BUY',
+                                'priority': setup_priority('BULLISH', False, daily_trend, h1_trend, pb_quality),
+                                'pattern': pattern['type'],
+                                'confidence': pattern.get('confidence', 'MEDIUM'),
+                                'quality': pb_quality,
+                                'entry_mode': 'pullback',
+                                'entry_status': _entry_status_bullish(False, aligned, pb_quality, 'pullback'),
+                                'entry_zone': f"${pb_entry - atr * 0.3:.0f} - ${pb_entry + atr * 0.3:.0f}",
+                                'entry_trigger': f"\u65d7\u9762\u53cd\u5f48\u5165\u5834 @ ${pb_entry:.0f}",
+                                'add_position': f"\u7a81\u7834 ${add_level:.0f} \u52a0\u6ce8 {'0.02' if aligned else '0.01'}",
+                                'stop_loss': f"${pb_stop:.0f}",
+                                'stop_rationale': pb_stop_rationale,
+                                'tp1': f"${pb_tp1:.0f} ({_tp_method_label(pattern, pb_tp1, pb_fib_tp, pb_rr_tp)}, \u6b62\u8cfa 1/3)",
+                                'tp2': f"${pb_tp2:.0f} ({_tp_method_label(pattern, pb_tp2, pb_fib_tp, pb_rr_tp)}, \u6b62\u8cfa 1/3)",
+                                'tp3': f"\u653e\u98db + {tp3_trail} (\u5c3e\u5009 1/3)",
+                                'risk_amount': round(pb_risk, 1),
+                                'rr_tp1': round(pb_rr1, 1),
+                                'rr_tp2': round(pb_rr2, 1),
+                                'daily_alignment': daily_alignment_str('BULLISH', daily_trend, h1_trend),
+                                'note': '\U0001f3af \u53cd\u5f48\u5165\u5834 \u2014 \u65d7\u9762\u5167\u7e2e\u5009\uff0c\u5f85\u7a81\u7834\u8ffd\u52a0' if aligned else '\u26a0\ufe0f \u9006\u52e2\u53cd\u5f48\uff0c\u534a\u5009 (0.01)',
+                            })
 
     if not setups:
         trend_dir = daily_trend['trend']
@@ -2231,7 +2642,7 @@ def _quality_report_label(quality):
 
 
 def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend=None,
-                    candle_m30=None, candle_day=None):
+                    candle_m30=None, candle_day=None, m15_result=None):
     """Generate comprehensive Markdown report."""
     candle_m30 = candle_m30 or []
     candle_day = candle_day or []
@@ -2334,6 +2745,40 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 """
     else:
         setup_text = "\n⚠️ 無有效交易信號 — 等待形態形成\n"
+    
+    # --- M15 entry timing section ---
+    m15_text = ""
+    if m15_result and m15_result.get('m15_trend', 'N/A') != 'N/A (數據不足)':
+        m15_rsi_str = f"{m15_result['m15_rsi']:.1f}" if m15_result.get('m15_rsi') is not None else '-'
+        swings = m15_result.get('m15_swings') or {}
+        nearest_high = swings.get('nearest_high')
+        nearest_low = swings.get('nearest_low')
+        nh = f'${nearest_high:.0f}' if nearest_high else '-'
+        nl = f'${nearest_low:.0f}' if nearest_low else '-'
+
+        m15_text = f"""
+## 🕒 五-B、M15 進場時機
+
+| 指標 | M15 |
+|------|-----|
+| 短線趨勢 | {m15_result['m15_trend']} |
+| RSI(14) | {m15_rsi_str} |
+| 最近阻力 (swing high) | {nh} |
+| 最近支持 (swing low) | {nl} |
+
+"""
+        suggestions = m15_result.get('entry_suggestions', [])
+        if suggestions:
+            m15_text += "### M15 微調建議\n\n"
+            m15_text += "| 信號 | 方向 | M15 入場區間 | M15 止損 | M15 ATR |\n"
+            m15_text += "|------|------|-------------|---------|--------|\n"
+            for i, sug in enumerate(suggestions, 1):
+                m15_text += f"| Signal {i} ({sug['pattern_type']}) | {sug['direction']} | {sug['m15_entry_zone']} | {sug['m15_sl']} | ${sug['m15_atr']:.1f} |\n"
+            m15_text += "\n> ℹ️ M15 入場區間較 M30 更窄，適合以更精確的價格進場。M15 止損以 M15 ATR + 最近擺動點為基準。\n"
+        else:
+            m15_text += "\n⚠️ 無 M15 微調建議\n"
+    else:
+        m15_text = "\n## 🕒 五-B、M15 進場時機\n\n⚠️ M15 數據不足或不可用 — 無法提供短線進場時機\n"
     
     # Support/Resistance - include raw price extremes as fallback
     raw_recent_low = float(df_m30['Low'].min())
@@ -2492,7 +2937,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 🎯 TP3 (1/3) | 放飛 + 追蹤止損 |
 
 {setup_text}
-
+{m15_text}
 ## 📊 六、關鍵價位
 
 ### 阻力位
@@ -2563,12 +3008,14 @@ def main():
         TRAIL_STOP_ATR = args.trail_stop
     
     # 1. Fetch data
-    df_m30, df_h1, df_day = fetch_data()
+    df_m30, df_h1, df_m15, df_day = fetch_data()
     
     # 2. Add indicators
     df_m30 = add_indicators(df_m30)
     df_h1 = add_indicators(df_h1)
     df_day = add_indicators(df_day)
+    if df_m15 is not None and not df_m15.empty:
+        df_m15 = add_indicators(df_m15)
     
     # 3. Find swing points
     points = find_swings_ordered(df_m30['High'].values, df_m30['Low'].values,
@@ -2594,6 +3041,10 @@ def main():
     for cp in all_candle:
         _log(f"   {cp['name']} ({cp['direction']}, {cp['strength']}) @ {cp['price']}")
 
+    # 5c. M15 entry timing analysis
+    m15_result = analyze_m15_entry_timing(df_m15, patterns, points, current, atr)
+    _log(f"[*] M15 trend: {m15_result['m15_trend']} | RSI: {m15_result['m15_rsi']} | Suggestions: {len(m15_result['entry_suggestions'])}")
+
     # 6. Multi-timeframe analysis (Daily + H1)
     daily_trend = analyze_daily_trend(df_day)
     h1_trend = analyze_h1_trend(df_h1)
@@ -2608,7 +3059,8 @@ def main():
     
     # 8. Generate report
     report = generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend,
-                             candle_m30=candle_m30, candle_day=candle_day)
+                             candle_m30=candle_m30, candle_day=candle_day,
+                             m15_result=m15_result)
     
     # 9. Save
     today = datetime.now().strftime('%Y-%m-%d')
@@ -2644,4 +3096,22 @@ def main():
         _log(f"   JSON: {json_path}")
 
 if __name__ == '__main__':
-    main()
+    import sys
+    import time
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            main()
+            break
+        except (BrokenPipeError, IOError, RuntimeError) as e:
+            print(f"[ERROR] Attempt {attempt}/{max_retries}: {e}", file=sys.stderr)
+            if attempt < max_retries:
+                wait = attempt * 10
+                print(f"[INFO] Retrying in {wait}s...", file=sys.stderr)
+                time.sleep(wait)
+            else:
+                print(f"[FATAL] All {max_retries} attempts failed: {e}", file=sys.stderr)
+                sys.exit(1)
+        except Exception as e:
+            print(f"[FATAL] Unrecoverable error: {e}", file=sys.stderr)
+            sys.exit(1)
