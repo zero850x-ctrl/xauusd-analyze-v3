@@ -3058,4 +3058,22 @@ def main():
         _log(f"   JSON: {json_path}")
 
 if __name__ == '__main__':
-    main()
+    import sys
+    import time
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            main()
+            break
+        except (BrokenPipeError, IOError, RuntimeError) as e:
+            print(f"[ERROR] Attempt {attempt}/{max_retries}: {e}", file=sys.stderr)
+            if attempt < max_retries:
+                wait = attempt * 10
+                print(f"[INFO] Retrying in {wait}s...", file=sys.stderr)
+                time.sleep(wait)
+            else:
+                print(f"[FATAL] All {max_retries} attempts failed: {e}", file=sys.stderr)
+                sys.exit(1)
+        except Exception as e:
+            print(f"[FATAL] Unrecoverable error: {e}", file=sys.stderr)
+            sys.exit(1)
