@@ -39,7 +39,7 @@ YF_TICKER = "GC=F"
 DATA_SOURCE = "TradingView (OANDA:XAUUSD)"  # updated at runtime (M30/H1 intraday)
 DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"  # daily bars always from futures
 REQUIRED_COLS = ['Open', 'High', 'Low', 'Close', 'Volume']
-MIN_BARS = {'m30': 50, 'h1': 30, 'day': 20}
+MIN_BARS = {'m30': 50, 'h1': 30, 'm15': 30, 'day': 20}
 TRAIL_PROFIT_ATR = float(os.environ.get('TRAIL_PROFIT_ATR', '2.0'))
 TRAIL_STOP_ATR = float(os.environ.get('TRAIL_STOP_ATR', '1.5'))
 
@@ -335,21 +335,46 @@ def fetch_data():
     daily_src = DAILY_DATA_SOURCE if DAILY_DATA_SOURCE != DATA_SOURCE else DATA_SOURCE
     src_note = intraday_src if intraday_src == daily_src else f"{intraday_src} | 日線: {daily_src}"
 
-    # --- M15: resample from M30 ---
+    # --- M15: native fetch (TV or yfinance); do not upsample M30 ---
     df_m15 = None
-    if df_m30 is not None and not df_m30.empty:
+    if _TV_AVAILABLE:
         try:
-            df_m15 = df_m30.resample('15min').agg({
-                'Open': 'first',
-                'High': 'max',
-                'Low': 'min',
-                'Close': 'last',
-                'Volume': 'sum'
-            }).dropna()
-            _log(f"   M15 (resampled from M30): {len(df_m15)} bars")
+            df_m15 = _tv.get_hist(TV_SYMBOL, TV_EXCHANGE, interval=TVInterval.in_15_minute, n_bars=500)
+            if df_m15 is not None and not df_m15.empty:
+                col_map = {
+                    'open': 'Open', 'high': 'High', 'low': 'Low',
+                    'close': 'Close', 'volume': 'Volume'
+                }
+                df_m15 = df_m15.rename(columns=col_map)
+                for c in ['symbol', 'symbol.1']:
+                    if c in df_m15.columns:
+                        df_m15 = df_m15.drop(columns=[c])
+                for col in REQUIRED_COLS:
+                    if col not in df_m15.columns:
+                        df_m15[col] = np.nan
+                _log(f"   TV M15: {len(df_m15)} bars")
+            else:
+                df_m15 = None
         except Exception as e:
-            _log(f"   M15 resample failed: {e}")
+            _log(f"   TV M15 failed: {e}")
             df_m15 = None
+
+    if df_m15 is None:
+        try:
+            _log("[*] M15 fallback: Yahoo Finance 15m...")
+            df_m15 = yf.download(YF_TICKER, period='5d', interval='15m', progress=False)
+            df_m15.columns = [c[0] if isinstance(c, tuple) else c for c in df_m15.columns]
+            if df_m15 is not None and not df_m15.empty:
+                _log(f"   YF M15: {len(df_m15)} bars")
+            else:
+                df_m15 = None
+        except Exception as e:
+            _log(f"   YF M15 failed: {e}")
+            df_m15 = None
+
+    if df_m15 is not None and (df_m15.empty or len(df_m15) < MIN_BARS['m15']):
+        _log(f"   M15 insufficient ({0 if df_m15 is None else len(df_m15)} bars) — M15 timing disabled")
+        df_m15 = None
 
     _log(f"   📡 Final: M30={len(df_m30)} bars | H1={len(df_h1)} | M15={len(df_m15) if df_m15 is not None else 0} | Daily={len(df_day)} | Source: {src_note}")
     return df_m30, df_h1, df_m15, df_day
@@ -1997,12 +2022,37 @@ def _entry_status_bullish(already_broken, aligned, quality, entry_mode='breakout
 
 
 def daily_alignment_str(expected_trend, daily_trend, h1_trend=None):
-    """Format daily/H1 alignment string."""
+    """Format daily/H1 alignment — H1 NEUTRAL matches aligned_with_trends()."""
     chk = '\u2705'
     wrn = '\u26a0\ufe0f'
     d_ok = daily_trend['trend'] == expected_trend
-    h_ok = (h1_trend or {}).get('trend') == expected_trend
+    h1 = (h1_trend or {}).get('trend', 'NEUTRAL')
+    if expected_trend == 'BEARISH':
+        h_ok = h1 in ('BEARISH', 'NEUTRAL')
+    else:
+        h_ok = h1 in ('BULLISH', 'NEUTRAL')
     return f"\u65e5\u7dda{chk if d_ok else wrn} H1{chk if h_ok else wrn}"
+
+
+def _quality_from_rr(rr_tp1):
+    """R:R quality tiers shared by breakout and pullback setups."""
+    if rr_tp1 < 1.5:
+        return 'POOR_RR'
+    if rr_tp1 >= 2.0:
+        return 'GOOD'
+    return 'OK'
+
+
+def _pullback_consolidation_ok(pattern, atr, is_flag, is_wedge):
+    """Flag: retrace_pct + flag_range. Wedge: pattern_height (no flag fields)."""
+    if is_flag:
+        retrace_pct = pattern.get('retrace_pct', 0)
+        flag_range = pattern.get('flag_range', 0)
+        return 0.15 <= retrace_pct <= 0.55 and flag_range >= atr * 0.5
+    if is_wedge:
+        height = pattern.get('pattern_height', 0)
+        return height >= atr * 0.5
+    return False
 
 
 def _tp_method_label(pattern, tp_value, fib_tp, rr_tp):
@@ -2182,11 +2232,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         rr_tp1 = abs(actual_entry - tp1) / risk
         rr_tp2 = abs(actual_entry - tp2) / risk
 
-        quality = 'OK'
-        if rr_tp1 < 1.5:
-            quality = 'POOR_RR'
-        elif rr_tp1 >= 2.0:
-            quality = 'GOOD'
+        quality = _quality_from_rr(rr_tp1)
         # UNCONFIRMED: breakout triggered but not confirmed by retest/volume
         if quality in ('OK', 'GOOD') and already_broken and not _pattern_breakout_confirmed(pattern):
             quality = 'UNCONFIRMED'
@@ -2242,10 +2288,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         is_flag = 'Flag' in ptype
         is_wedge = 'Wedge' in ptype or '\u6954\u5f62' in ptype
         if (is_flag or is_wedge) and not already_broken:
-            retrace_pct = pattern.get('retrace_pct', 0)
-            flag_range = pattern.get('flag_range', 0)
-            # Check consolidation quality
-            if 0.15 <= retrace_pct <= 0.55 and flag_range >= atr * 0.5:
+            if _pullback_consolidation_ok(pattern, atr, is_flag, is_wedge):
                 # Pullback entry: current price within the flag/wedge zone (within 0.3 ATR of flag_high)
                 flag_high = pattern.get('flag_high')
                 if flag_high is None and 'resistance' in pattern:
@@ -2272,6 +2315,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                             pb_tp2 = min(pb_fib_tp, pb_rr_tp)
                             pb_rr1 = abs(pb_entry - pb_tp1) / pb_risk
                             pb_rr2 = abs(pb_entry - pb_tp2) / pb_risk
+                            pb_quality = _quality_from_rr(pb_rr1)
 
                             pb_stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (flag_high ${flag_high:.1f} + 0.5 ATR)"
                             if 'resistance' in pattern and is_wedge:
@@ -2279,12 +2323,12 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
 
                             setups.append({
                                 'direction': '\U0001f534 SELL',
-                                'priority': setup_priority('BEARISH', False, daily_trend, h1_trend, 'OK'),
+                                'priority': setup_priority('BEARISH', False, daily_trend, h1_trend, pb_quality),
                                 'pattern': pattern['type'],
                                 'confidence': pattern.get('confidence', 'MEDIUM'),
-                                'quality': 'OK',
+                                'quality': pb_quality,
                                 'entry_mode': 'pullback',
-                                'entry_status': _entry_status_bearish(False, aligned, 'OK', 'pullback'),
+                                'entry_status': _entry_status_bearish(False, aligned, pb_quality, 'pullback'),
                                 'entry_zone': f"${pb_entry - atr * 0.3:.0f} - ${pb_entry + atr * 0.3:.0f}",
                                 'entry_trigger': f"\u65d7\u9762\u53cd\u5f48\u5165\u5834 @ ${pb_entry:.0f}",
                                 'add_position': f"\u8dcc\u7a7f ${add_level:.0f} \u52a0\u6ce8 0.02",
@@ -2351,11 +2395,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         rr_tp1 = abs(tp1 - actual_entry) / risk
         rr_tp2 = abs(tp2 - actual_entry) / risk
 
-        quality = 'OK'
-        if rr_tp1 < 1.5:
-            quality = 'POOR_RR'
-        elif rr_tp1 >= 2.0:
-            quality = 'GOOD'
+        quality = _quality_from_rr(rr_tp1)
         # UNCONFIRMED: breakout triggered but not confirmed by retest/volume
         if quality in ('OK', 'GOOD') and already_broken and not _pattern_breakout_confirmed(pattern):
             quality = 'UNCONFIRMED'
@@ -2409,10 +2449,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         is_flag = 'Flag' in ptype
         is_wedge = 'Wedge' in ptype or '\u6954\u5f62' in ptype
         if (is_flag or is_wedge) and not already_broken:
-            retrace_pct = pattern.get('retrace_pct', 0)
-            flag_range = pattern.get('flag_range', 0)
-            # Check consolidation quality
-            if 0.15 <= retrace_pct <= 0.55 and flag_range >= atr * 0.5:
+            if _pullback_consolidation_ok(pattern, atr, is_flag, is_wedge):
                 # Pullback entry: current price within the flag/wedge zone (within 0.3 ATR of flag_low)
                 flag_low = pattern.get('flag_low')
                 if flag_low is None and 'support' in pattern:
@@ -2439,6 +2476,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                             pb_tp2 = max(pb_fib_tp, pb_rr_tp)
                             pb_rr1 = abs(pb_tp1 - pb_entry) / pb_risk
                             pb_rr2 = abs(pb_tp2 - pb_entry) / pb_risk
+                            pb_quality = _quality_from_rr(pb_rr1)
 
                             pb_stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (flag_low ${flag_low:.1f} - 0.5 ATR)"
                             if 'support' in pattern and is_wedge:
@@ -2446,12 +2484,12 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
 
                             setups.append({
                                 'direction': '\U0001f7e2 BUY',
-                                'priority': setup_priority('BULLISH', False, daily_trend, h1_trend, 'OK'),
+                                'priority': setup_priority('BULLISH', False, daily_trend, h1_trend, pb_quality),
                                 'pattern': pattern['type'],
                                 'confidence': pattern.get('confidence', 'MEDIUM'),
-                                'quality': 'OK',
+                                'quality': pb_quality,
                                 'entry_mode': 'pullback',
-                                'entry_status': _entry_status_bullish(False, aligned, 'OK', 'pullback'),
+                                'entry_status': _entry_status_bullish(False, aligned, pb_quality, 'pullback'),
                                 'entry_zone': f"${pb_entry - atr * 0.3:.0f} - ${pb_entry + atr * 0.3:.0f}",
                                 'entry_trigger': f"\u65d7\u9762\u53cd\u5f48\u5165\u5834 @ ${pb_entry:.0f}",
                                 'add_position': f"\u7a81\u7834 ${add_level:.0f} \u52a0\u6ce8 {'0.02' if aligned else '0.01'}",
