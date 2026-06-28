@@ -2876,22 +2876,35 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
     candle_day_text = _candle_list_text(candle_day)
 
     # Candlestick confirmation per setup direction (anchored to last bar per TF)
+    # Prefer pre-computed scores from main() injection; recompute only if missing
     last_m30 = len(df_m30) - 1
     last_day = len(df_day) - 1
     confirm_lines = []
     if setups:
         for i, s in enumerate(setups, 1):
-            direction = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
-            m30_conf, m30_pat, m30_score, m30_opp = candlestick_confirmation(
-                candle_m30, direction, lookback_bars=5, last_bar_idx=last_m30
-            )
-            day_conf, day_pat, day_score, day_opp = candlestick_confirmation(
-                candle_day, direction, lookback_bars=5, last_bar_idx=last_day
-            )
-            total_score = m30_score + day_score
+            # Use pre-computed K-line scores if available (from main() step 7b)
+            m30_score = s.get('kline_m30_score')
+            day_score = s.get('kline_daily_score')
+            total_score = s.get('kline_total_score')
+            if m30_score is None or day_score is None:
+                # Fallback recompute
+                direction = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
+                m30_conf, m30_pat, m30_score, m30_opp = candlestick_confirmation(
+                    candle_m30, direction, lookback_bars=5, last_bar_idx=last_m30
+                )
+                day_conf, day_pat, day_score, day_opp = candlestick_confirmation(
+                    candle_day, direction, lookback_bars=5, last_bar_idx=last_day
+                )
+                total_score = m30_score + day_score
+                all_pat = m30_pat + day_pat
+                all_opp = m30_opp + day_opp
+            else:
+                total_score = total_score or m30_score + day_score
+                all_pat_names = s.get('kline_m30_patterns', []) + s.get('kline_daily_patterns', [])
+                all_opp_names = s.get('kline_opposing', [])
+                all_pat = [{'name': n} for n in all_pat_names]
+                all_opp = [{'name': n} for n in all_opp_names]
             all_confirmed = total_score >= 2 and m30_score >= 0 and day_score >= 0
-            all_pat = m30_pat + day_pat
-            all_opp = m30_opp + day_opp
             if all_confirmed:
                 names = ', '.join(cp['name'] for cp in all_pat)
                 src_tags = [f"M30:{m30_score}", f"日線:{day_score}"]
@@ -3115,6 +3128,26 @@ def main():
     _log(f"[*] Trade setups: {len(setups)}")
     for s in setups:
         _log(f"   {s['direction']}: {s['pattern']} [{s['entry_status']}]")
+
+    # 7b. Inject K-line confirmation scores into setups (used by paper_trade + cron filtering)
+    last_m30_idx = len(df_m30) - 1
+    last_day_idx = len(df_day) - 1
+    for s in setups:
+        direction = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
+        m30_conf, m30_pat, m30_score, m30_opp = candlestick_confirmation(
+            candle_m30, direction, lookback_bars=5, last_bar_idx=last_m30_idx
+        )
+        day_conf, day_pat, day_score, day_opp = candlestick_confirmation(
+            candle_day, direction, lookback_bars=5, last_bar_idx=last_day_idx
+        )
+        total = m30_score + day_score
+        s['kline_m30_score'] = m30_score
+        s['kline_daily_score'] = day_score
+        s['kline_total_score'] = total
+        s['kline_confirmed'] = total >= 2 and m30_score >= 0 and day_score >= 0
+        s['kline_m30_patterns'] = [cp['name'] for cp in m30_pat]
+        s['kline_daily_patterns'] = [cp['name'] for cp in day_pat]
+        s['kline_opposing'] = [cp['name'] for cp in (m30_opp + day_opp)]
     
     # 8. Generate report
     report = generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend,
