@@ -17,15 +17,14 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - ATR(14) — base unit for stops, entry zones, trailing
   - RSI(14) — overbought/oversold
   - MA20, MA50 — trend anchors
-  - MACD — momentum
+  - Vol_SMA20 — volume baseline for breakout checks
 
-🔍 CHART PATTERNS (11+ types, detect_all_patterns)
+🔍 CHART PATTERNS (detect_all_patterns)
   - Flags (bull/bear): pole + consolidation, detect_flags()
   - Triangles (ascending/descending/symmetrical): detect_triangles()
   - Wedges (rising/falling): detect_wedges()
   - Double Top/Bottom: detect_double_top_bottom()
   - Channels (parallel): detect_channels()
-  - Head & Shoulders, Triple Top/Bottom (via extended swing detection)
   - Fibonacci retracement/extension for targets
 
 🕯️ CANDLESTICK CONFIRMATION (16 patterns, detect_candlestick_patterns)
@@ -39,7 +38,8 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - _volume_spike()   → volume > 1.3× recent average
   - _pattern_breakout_confirmed() → either retest OR volume spike = confirmed
   - _pullback_consolidation_ok()  → flag/wedge pullback quality gate
-    (retrace 0.15-0.55, flag_range ≥ 0.5 ATR)
+    Flags: retrace 0.15-0.55 + flag_range ≥ 0.5 ATR
+    Wedges: pattern_height ≥ 0.5 ATR
 
 🎯 STOP LOSS SYSTEM
   - pattern_structure_stop() → tight SL at flag/wedge boundary + 0.5 ATR
@@ -55,7 +55,9 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
 
 ⚖️ QUALITY / PRIORITY
   - R:R quality tiers: ≥2.0 → GOOD, ≥1.5 → OK, <1.5 → POOR_RR
-  - Priority 1-7: multi-TF alignment + already broken + quality
+  - Priority 1-5 (1=best): broken+aligned+GOOD=1, broken+aligned+OK=2,
+    broken+counter-trend=2, aligned waiting=3, not aligned=4,
+    POOR_RR/UNCONFIRMED=5
   - UNCONFIRMED downgrade: broken but no retest/volume confirmation
 
 🚪 ENTRY MODES
@@ -72,7 +74,7 @@ Data sources: TradingView (OANDA:XAUUSD M30/H1/M15) + Yahoo Finance (GC=F daily)
 
 Architecture: fetch_data → add_indicators → find_swings → detect patterns
 → detect candlesticks → volume confirm → generate setups (breakout + pullback)
-→ candlestick confirmation → generate report
+→ inject kline scores (step 7b) → generate report (reuses kline_* fields)
 """
 
 import os, json, argparse
@@ -2899,7 +2901,8 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
                 all_pat = m30_pat + day_pat
                 all_opp = m30_opp + day_opp
             else:
-                total_score = total_score or m30_score + day_score
+                if total_score is None:
+                    total_score = m30_score + day_score
                 all_pat_names = s.get('kline_m30_patterns', []) + s.get('kline_daily_patterns', [])
                 all_opp_names = s.get('kline_opposing', [])
                 all_pat = [{'name': n} for n in all_pat_names]
