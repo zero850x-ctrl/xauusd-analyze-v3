@@ -1,19 +1,80 @@
 #!/usr/bin/env python3
 """
-XAUUSD Chart Pattern Analysis Script v3
-Complete rewrite — fixes all v2 bugs + adds:
-- Ascending/Symmetrical triangle, Wedges, Parallel channels, Double top/bottom
-- Proper Fibonacci extensions (not random * 0.618)
-- Multi-timeframe confluence (daily trend filter)
-- Volume confirmation for breakouts
-- Trailing stop logic for runner
-- Trend strength scoring
+XAUUSD Technical Analysis Engine v3 — Full-Stack Summary
+=========================================================
 
-User's Methodology:
-  入場: 形態突破（三角形/旗形/雙頂底）
-  加注: 突破前底/前頂
-  止損: 前頂之上 / 前底之下 + 1 ATR
-  止賺: 0.618 Fib 1/3 + 1:1 RR 1/3 + 尾倉放飛(追蹤止損)
+Multi-timeframe pattern-detection + trade-setup engine for XAUUSD.
+Designed to match senior mentor's methodology: structure-first,
+flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
+
+📊 TREND ANALYSIS (3 TF)
+  - Daily:   MA20/MA50 + RSI(14) → trend direction + strength
+  - H1:      MA20/MA50 + RSI(14) → intermediate trend
+  - M15:     micro entry timing (trend, RSI, swing points, per-pattern suggestions)
+  - Multi-TF alignment check: aligned_with_trends()
+
+📈 INDICATORS (add_indicators)
+  - ATR(14) — base unit for stops, entry zones, trailing
+  - RSI(14) — overbought/oversold
+  - MA20, MA50 — trend anchors
+  - Vol_SMA20 — volume baseline for breakout checks
+
+🔍 CHART PATTERNS (detect_all_patterns)
+  - Flags (bull/bear): pole + consolidation, detect_flags()
+  - Triangles (ascending/descending/symmetrical): detect_triangles()
+  - Wedges (rising/falling): detect_wedges()
+  - Double Top/Bottom: detect_double_top_bottom()
+  - Channels (parallel): detect_channels()
+  - Fibonacci retracement/extension for targets
+
+🕯️ CANDLESTICK CONFIRMATION (16 patterns, detect_candlestick_patterns)
+  - Engulfing, Morning/Evening Star, Hammer/Shooting Star, Harami,
+    Three White Soldiers / Three Black Crows, etc.
+  - Scoring: +2 HIGH, +1 MEDIUM, opposing subtracts
+  - K-line confirmation: M30 score + Daily score ≥ 2 → confirmed
+
+🛡️ ENTRY FILTERS (3-layer)
+  - _retest_confirm() → post-breakout retest of support/resistance
+  - _volume_spike()   → volume > 1.3× recent average
+  - _pattern_breakout_confirmed() → either retest OR volume spike = confirmed
+  - _pullback_consolidation_ok()  → flag/wedge pullback quality gate
+    Flags: retrace 0.15-0.55 + flag_range ≥ 0.5 ATR
+    Wedges: pattern_height ≥ 0.5 ATR
+
+🎯 STOP LOSS SYSTEM
+  - pattern_structure_stop() → tight SL at flag/wedge boundary + 0.5 ATR
+    (structure priority for flags/wedges)
+  - Fallback: swing point ± 1 ATR, capped at 3 ATR
+  - Pullback entries get even tighter structure stops
+
+💰 TAKE PROFIT (3-tier)
+  - TP1 (1/3): closer of 1:1 RR or Fibonacci extension → take profit first
+  - TP2 (1/3): further of 1:1 RR or Fibonacci extension
+  - TP3 (1/3): runner with trailing stop (TRAIL_PROFIT_ATR activate,
+    TRAIL_STOP_ATR trail)
+
+⚖️ QUALITY / PRIORITY
+  - R:R quality tiers: ≥2.0 → GOOD, ≥1.5 → OK, <1.5 → POOR_RR
+  - Priority 1-5 (1=best): broken+aligned+GOOD=1, broken+aligned+OK=2,
+    broken+counter-trend=2, aligned waiting=3, not aligned=4,
+    POOR_RR/UNCONFIRMED=5
+  - UNCONFIRMED downgrade: broken but no retest/volume confirmation
+
+🚪 ENTRY MODES
+  - breakout: wait for price to cross trigger level
+  - pullback: enter NOW at current price inside flag/wedge consolidation
+    (tighter SL, better R:R, requires consolidation quality gate)
+
+📡 OUTPUT
+  - --json → ~/.hermes/reports/xauusd_v3_<date>.json (setups, patterns, candles)
+  - default → ~/.hermes/reports/xauusd_v3_<date>.md (full report with M15 section)
+  - Designed to feed paper_trade.py for simulated execution
+
+Data sources: TradingView (OANDA:XAUUSD M30/H1/M15) + Yahoo Finance (GC=F daily)
+
+Architecture: fetch_data → add_indicators → find_swings → detect patterns
+→ detect candlesticks → volume confirm → generate setups (breakout + pullback)
+→ inject kline scores (step 7b) → generate report (reuses kline_* fields)
 """
 
 import os, json, argparse
@@ -2817,22 +2878,36 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
     candle_day_text = _candle_list_text(candle_day)
 
     # Candlestick confirmation per setup direction (anchored to last bar per TF)
+    # Prefer pre-computed scores from main() injection; recompute only if missing
     last_m30 = len(df_m30) - 1
     last_day = len(df_day) - 1
     confirm_lines = []
     if setups:
         for i, s in enumerate(setups, 1):
-            direction = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
-            m30_conf, m30_pat, m30_score, m30_opp = candlestick_confirmation(
-                candle_m30, direction, lookback_bars=5, last_bar_idx=last_m30
-            )
-            day_conf, day_pat, day_score, day_opp = candlestick_confirmation(
-                candle_day, direction, lookback_bars=5, last_bar_idx=last_day
-            )
-            total_score = m30_score + day_score
+            # Use pre-computed K-line scores if available (from main() step 7b)
+            m30_score = s.get('kline_m30_score')
+            day_score = s.get('kline_daily_score')
+            total_score = s.get('kline_total_score')
+            if m30_score is None or day_score is None:
+                # Fallback recompute
+                direction = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
+                m30_conf, m30_pat, m30_score, m30_opp = candlestick_confirmation(
+                    candle_m30, direction, lookback_bars=5, last_bar_idx=last_m30
+                )
+                day_conf, day_pat, day_score, day_opp = candlestick_confirmation(
+                    candle_day, direction, lookback_bars=5, last_bar_idx=last_day
+                )
+                total_score = m30_score + day_score
+                all_pat = m30_pat + day_pat
+                all_opp = m30_opp + day_opp
+            else:
+                if total_score is None:
+                    total_score = m30_score + day_score
+                all_pat_names = s.get('kline_m30_patterns', []) + s.get('kline_daily_patterns', [])
+                all_opp_names = s.get('kline_opposing', [])
+                all_pat = [{'name': n} for n in all_pat_names]
+                all_opp = [{'name': n} for n in all_opp_names]
             all_confirmed = total_score >= 2 and m30_score >= 0 and day_score >= 0
-            all_pat = m30_pat + day_pat
-            all_opp = m30_opp + day_opp
             if all_confirmed:
                 names = ', '.join(cp['name'] for cp in all_pat)
                 src_tags = [f"M30:{m30_score}", f"日線:{day_score}"]
@@ -3056,6 +3131,26 @@ def main():
     _log(f"[*] Trade setups: {len(setups)}")
     for s in setups:
         _log(f"   {s['direction']}: {s['pattern']} [{s['entry_status']}]")
+
+    # 7b. Inject K-line confirmation scores into setups (used by paper_trade + cron filtering)
+    last_m30_idx = len(df_m30) - 1
+    last_day_idx = len(df_day) - 1
+    for s in setups:
+        direction = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
+        m30_conf, m30_pat, m30_score, m30_opp = candlestick_confirmation(
+            candle_m30, direction, lookback_bars=5, last_bar_idx=last_m30_idx
+        )
+        day_conf, day_pat, day_score, day_opp = candlestick_confirmation(
+            candle_day, direction, lookback_bars=5, last_bar_idx=last_day_idx
+        )
+        total = m30_score + day_score
+        s['kline_m30_score'] = m30_score
+        s['kline_daily_score'] = day_score
+        s['kline_total_score'] = total
+        s['kline_confirmed'] = total >= 2 and m30_score >= 0 and day_score >= 0
+        s['kline_m30_patterns'] = [cp['name'] for cp in m30_pat]
+        s['kline_daily_patterns'] = [cp['name'] for cp in day_pat]
+        s['kline_opposing'] = [cp['name'] for cp in (m30_opp + day_opp)]
     
     # 8. Generate report
     report = generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend,
