@@ -1,19 +1,78 @@
 #!/usr/bin/env python3
 """
-XAUUSD Chart Pattern Analysis Script v3
-Complete rewrite — fixes all v2 bugs + adds:
-- Ascending/Symmetrical triangle, Wedges, Parallel channels, Double top/bottom
-- Proper Fibonacci extensions (not random * 0.618)
-- Multi-timeframe confluence (daily trend filter)
-- Volume confirmation for breakouts
-- Trailing stop logic for runner
-- Trend strength scoring
+XAUUSD Technical Analysis Engine v3 — Full-Stack Summary
+=========================================================
 
-User's Methodology:
-  入場: 形態突破（三角形/旗形/雙頂底）
-  加注: 突破前底/前頂
-  止損: 前頂之上 / 前底之下 + 1 ATR
-  止賺: 0.618 Fib 1/3 + 1:1 RR 1/3 + 尾倉放飛(追蹤止損)
+Multi-timeframe pattern-detection + trade-setup engine for XAUUSD.
+Designed to match senior mentor's methodology: structure-first,
+flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
+
+📊 TREND ANALYSIS (3 TF)
+  - Daily:   MA20/MA50 + RSI(14) → trend direction + strength
+  - H1:      MA20/MA50 + RSI(14) → intermediate trend
+  - M15:     micro entry timing (trend, RSI, swing points, per-pattern suggestions)
+  - Multi-TF alignment check: aligned_with_trends()
+
+📈 INDICATORS (add_indicators)
+  - ATR(14) — base unit for stops, entry zones, trailing
+  - RSI(14) — overbought/oversold
+  - MA20, MA50 — trend anchors
+  - MACD — momentum
+
+🔍 CHART PATTERNS (11+ types, detect_all_patterns)
+  - Flags (bull/bear): pole + consolidation, detect_flags()
+  - Triangles (ascending/descending/symmetrical): detect_triangles()
+  - Wedges (rising/falling): detect_wedges()
+  - Double Top/Bottom: detect_double_top_bottom()
+  - Channels (parallel): detect_channels()
+  - Head & Shoulders, Triple Top/Bottom (via extended swing detection)
+  - Fibonacci retracement/extension for targets
+
+🕯️ CANDLESTICK CONFIRMATION (16 patterns, detect_candlestick_patterns)
+  - Engulfing, Morning/Evening Star, Hammer/Shooting Star, Harami,
+    Three White Soldiers / Three Black Crows, etc.
+  - Scoring: +2 HIGH, +1 MEDIUM, opposing subtracts
+  - K-line confirmation: M30 score + Daily score ≥ 2 → confirmed
+
+🛡️ ENTRY FILTERS (3-layer)
+  - _retest_confirm() → post-breakout retest of support/resistance
+  - _volume_spike()   → volume > 1.3× recent average
+  - _pattern_breakout_confirmed() → either retest OR volume spike = confirmed
+  - _pullback_consolidation_ok()  → flag/wedge pullback quality gate
+    (retrace 0.15-0.55, flag_range ≥ 0.5 ATR)
+
+🎯 STOP LOSS SYSTEM
+  - pattern_structure_stop() → tight SL at flag/wedge boundary + 0.5 ATR
+    (structure priority for flags/wedges)
+  - Fallback: swing point ± 1 ATR, capped at 3 ATR
+  - Pullback entries get even tighter structure stops
+
+💰 TAKE PROFIT (3-tier)
+  - TP1 (1/3): closer of 1:1 RR or Fibonacci extension → take profit first
+  - TP2 (1/3): further of 1:1 RR or Fibonacci extension
+  - TP3 (1/3): runner with trailing stop (TRAIL_PROFIT_ATR activate,
+    TRAIL_STOP_ATR trail)
+
+⚖️ QUALITY / PRIORITY
+  - R:R quality tiers: ≥2.0 → GOOD, ≥1.5 → OK, <1.5 → POOR_RR
+  - Priority 1-7: multi-TF alignment + already broken + quality
+  - UNCONFIRMED downgrade: broken but no retest/volume confirmation
+
+🚪 ENTRY MODES
+  - breakout: wait for price to cross trigger level
+  - pullback: enter NOW at current price inside flag/wedge consolidation
+    (tighter SL, better R:R, requires consolidation quality gate)
+
+📡 OUTPUT
+  - --json → ~/.hermes/reports/xauusd_v3_<date>.json (setups, patterns, candles)
+  - default → ~/.hermes/reports/xauusd_v3_<date>.md (full report with M15 section)
+  - Designed to feed paper_trade.py for simulated execution
+
+Data sources: TradingView (OANDA:XAUUSD M30/H1/M15) + Yahoo Finance (GC=F daily)
+
+Architecture: fetch_data → add_indicators → find_swings → detect patterns
+→ detect candlesticks → volume confirm → generate setups (breakout + pullback)
+→ candlestick confirmation → generate report
 """
 
 import os, json, argparse
