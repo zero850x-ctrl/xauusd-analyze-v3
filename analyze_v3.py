@@ -54,7 +54,7 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
     TRAIL_STOP_ATR trail)
 
 ⚖️ QUALITY / PRIORITY
-  - R:R quality tiers: ≥2.0 → GOOD, ≥1.5 → OK, <1.5 → POOR_RR
+  - R:R quality tiers: ≥2.0 → GOOD, ≥1.0 → OK, <1.0 → POOR_RR
   - Priority 1-5 (1=best): broken+aligned+GOOD=1, broken+aligned+OK=2,
     broken+counter-trend=2, aligned waiting=3, not aligned=4,
     POOR_RR/UNCONFIRMED=5
@@ -2122,8 +2122,9 @@ def daily_alignment_str(expected_trend, daily_trend, h1_trend=None):
 
 
 def _quality_from_rr(rr_tp1):
-    """R:R quality tiers shared by breakout and pullback setups."""
-    if rr_tp1 < 1.5:
+    """R:R quality tiers shared by breakout and pullback setups.
+    ≥2.0 → GOOD, ≥1.0 → OK, <1.0 → POOR_RR"""
+    if rr_tp1 < 1.0:
         return 'POOR_RR'
     if rr_tp1 >= 2.0:
         return 'GOOD'
@@ -2866,7 +2867,7 @@ def _quality_report_label(quality):
     labels = {
         'GOOD': '🌟 GOOD',
         'OK': '✅ OK',
-        'POOR_RR': '⚠️ POOR_RR (R:R < 1.5)',
+        'POOR_RR': '⚠️ POOR_RR (R:R < 1.0)',
         'UNCONFIRMED': '⚠️ 未確認突破',
     }
     return labels.get(quality, f'⚠️ {quality}')
