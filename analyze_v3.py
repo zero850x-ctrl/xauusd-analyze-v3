@@ -2051,6 +2051,8 @@ def pattern_add_level(pattern, side, points, trigger_level):
 def _entry_status_bearish(already_broken, aligned, quality, entry_mode='breakout'):
     if entry_mode == 'pullback':
         return '🎯 反彈入場 (待突破)'
+    if entry_mode == 'boundary':
+        return '📍 邊界沽出 (HIGH conf, 限價入場)'
     if already_broken and quality == 'UNCONFIRMED':
         return '⚠️ 已觸發 (未確認突破)'
     if already_broken and aligned and quality == 'GOOD':
@@ -2069,6 +2071,8 @@ def _entry_status_bearish(already_broken, aligned, quality, entry_mode='breakout
 def _entry_status_bullish(already_broken, aligned, quality, entry_mode='breakout'):
     if entry_mode == 'pullback':
         return '🎯 反彈入場 (待突破)'
+    if entry_mode == 'boundary':
+        return '📍 邊界買入 (HIGH conf, 限價入場)'
     if not already_broken:
         return '⏳ 等待突破 (逆勢⚠️)' if not aligned else '⏳ 等待突破'
     if quality == 'UNCONFIRMED':
@@ -2102,6 +2106,41 @@ def _quality_from_rr(rr_tp1):
     if rr_tp1 >= 2.0:
         return 'GOOD'
     return 'OK'
+
+
+def _is_boundary_reversal(pattern):
+    """True if pattern is a reversal type (Double Top/Bottom, Wedge) with HIGH confidence.
+    These patterns benefit from boundary/limit entry before the breakout occurs."""
+    ptype = pattern.get('type', '')
+    confidence = pattern.get('confidence', '').upper()
+    if confidence != 'HIGH':
+        return False
+    is_double = 'Double Top' in ptype or 'Double Bottom' in ptype or '雙頂' in ptype or '雙底' in ptype
+    is_wedge = 'Wedge' in ptype or '楔形' in ptype
+    return is_double or is_wedge
+
+
+def _boundary_entry_sl(pattern, direction, atr, current_price):
+    """SL for boundary entry: just outside the pattern boundary + 0.5 ATR.
+    Not relative to current price — this is a limit order; SL is based on where
+    you'll be filled at the boundary, not where the market is now."""
+    if direction == 'SELL':
+        top = pattern.get('top_price') or pattern.get('resistance')
+        if top:
+            return top + atr * 0.5
+        return current_price + atr * 2
+    else:
+        bottom = pattern.get('bottom_price') or pattern.get('support')
+        if bottom:
+            return bottom - atr * 0.5
+        return current_price - atr * 2
+
+
+def _boundary_entry_level(pattern, direction):
+    """Entry level for boundary trade: the pattern boundary (top/support)."""
+    if direction == 'SELL':
+        return pattern.get('top_price') or pattern.get('resistance') or pattern.get('flag_high')
+    return pattern.get('bottom_price') or pattern.get('support') or pattern.get('flag_low')
 
 
 def _pullback_consolidation_ok(pattern, atr, is_flag, is_wedge):
@@ -2252,6 +2291,51 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         if any(abs(trigger_level - tk) < atr * 0.5 for tk in seen_trigger_keys):
             continue
         seen_trigger_keys.add(trigger_level)
+
+        # --- Boundary entry for HIGH-conf reversal patterns (check BEFORE continue) ---
+        already_broken = current_price < trigger_level
+        aligned = aligned_with_trends('BEARISH', daily_trend, h1_trend)
+        if not already_broken and _is_boundary_reversal(pattern):
+            bd_entry = _boundary_entry_level(pattern, 'SELL')
+            if bd_entry and bd_entry > current_price + atr * 0.3:
+                bd_stop = _boundary_entry_sl(pattern, 'SELL', atr, current_price)
+                bd_risk = bd_stop - bd_entry
+                if bd_risk > 0 and bd_risk <= current_price * 0.05:
+                    bd_fib_tp, _ = _compute_tp1(pattern, bd_entry, bd_risk, 'SELL')
+                    bd_rr_tp = bd_entry - bd_risk
+                    bd_tp1 = max(bd_fib_tp, bd_rr_tp)
+                    bd_tp2 = min(bd_fib_tp, bd_rr_tp)
+                    bd_rr1 = abs(bd_entry - bd_tp1) / bd_risk
+                    bd_rr2 = abs(bd_entry - bd_tp2) / bd_risk
+                    bd_quality = _quality_from_rr(bd_rr1)
+                    if 'Double' in pattern.get('type', ''):
+                        bd_sl_rationale = f"雙頂頂部 ${bd_entry:.0f} + 0.5 ATR"
+                    elif 'Wedge' in pattern.get('type', ''):
+                        bd_sl_rationale = f"楔形阻力 ${bd_entry:.0f} + 0.5 ATR"
+                    else:
+                        bd_sl_rationale = f"形態邊界 ${bd_entry:.0f} + 0.5 ATR"
+                    setups.append({
+                        'direction': '🔴 SELL',
+                        'priority': setup_priority('BEARISH', False, daily_trend, h1_trend, bd_quality),
+                        'pattern': pattern['type'],
+                        'confidence': pattern.get('confidence', 'MEDIUM'),
+                        'quality': bd_quality,
+                        'entry_mode': 'boundary',
+                        'entry_status': _entry_status_bearish(False, aligned, bd_quality, 'boundary'),
+                        'entry_zone': f"${bd_entry - atr * 0.3:.0f} - ${bd_entry + atr * 0.3:.0f}",
+                        'entry_trigger': f"限價沽出 @ ${bd_entry:.0f}（形態邊界入場）",
+                        'add_position': f"跌穿 ${pattern.get('neckline', bd_entry - bd_risk):.0f} 加注 0.02",
+                        'stop_loss': f"${bd_stop:.0f}",
+                        'stop_rationale': bd_sl_rationale,
+                        'tp1': f"${bd_tp1:.0f} ({_tp_method_label(pattern, bd_tp1, bd_fib_tp, bd_rr_tp)}, 止賺 1/3)",
+                        'tp2': f"${bd_tp2:.0f} ({_tp_method_label(pattern, bd_tp2, bd_fib_tp, bd_rr_tp)}, 止賺 1/3)",
+                        'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+                        'risk_amount': round(bd_risk, 1),
+                        'rr_tp1': round(bd_rr1, 1),
+                        'rr_tp2': round(bd_rr2, 1),
+                        'daily_alignment': daily_alignment_str('BEARISH', daily_trend, h1_trend),
+                        'note': '📍 形態邊界入場 — 不等待跌穿，較佳R:R' if aligned else '⚠️ 逆勢邊界沽，半倉 (0.01)',
+                    })
 
         # Breakout: price must be below trigger (ignore stale pattern.broken if recovered)
         already_broken = current_price < trigger_level
@@ -2422,11 +2506,57 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         seen_trigger_keys.add(entry_trigger_level)
 
         already_broken = current_price > entry_trigger_level
+        aligned = aligned_with_trends('BULLISH', daily_trend, h1_trend)
+
+        # --- Boundary entry for HIGH-conf reversal patterns (check BEFORE continue) ---
+        if not already_broken and _is_boundary_reversal(pattern):
+            bd_entry = _boundary_entry_level(pattern, 'BUY')
+            if bd_entry and bd_entry < current_price - atr * 0.3:
+                bd_stop = _boundary_entry_sl(pattern, 'BUY', atr, current_price)
+                bd_risk = bd_entry - bd_stop
+                if bd_risk > 0 and bd_risk <= current_price * 0.05:
+                    bd_fib_tp, _ = _compute_tp1(pattern, bd_entry, bd_risk, 'BUY')
+                    bd_rr_tp = bd_entry + bd_risk
+                    bd_tp1 = min(bd_fib_tp, bd_rr_tp)
+                    bd_tp2 = max(bd_fib_tp, bd_rr_tp)
+                    bd_rr1 = abs(bd_tp1 - bd_entry) / bd_risk
+                    bd_rr2 = abs(bd_tp2 - bd_entry) / bd_risk
+                    bd_quality = _quality_from_rr(bd_rr1)
+
+                    if 'Double' in pattern.get('type', ''):
+                        bd_sl_rationale = f"雙底底部 ${bd_entry:.0f} - 0.5 ATR"
+                    elif 'Wedge' in pattern.get('type', ''):
+                        bd_sl_rationale = f"楔形支持 ${bd_entry:.0f} - 0.5 ATR"
+                    else:
+                        bd_sl_rationale = f"形態邊界 ${bd_entry:.0f} - 0.5 ATR"
+
+                    setups.append({
+                        'direction': '🟢 BUY',
+                        'priority': setup_priority('BULLISH', False, daily_trend, h1_trend, bd_quality),
+                        'pattern': pattern['type'],
+                        'confidence': pattern.get('confidence', 'MEDIUM'),
+                        'quality': bd_quality,
+                        'entry_mode': 'boundary',
+                        'entry_status': _entry_status_bullish(False, aligned, bd_quality, 'boundary'),
+                        'entry_zone': f"${bd_entry - atr * 0.3:.0f} - ${bd_entry + atr * 0.3:.0f}",
+                        'entry_trigger': f"限價買入 @ ${bd_entry:.0f}（形態邊界入場）",
+                        'add_position': f"突破 ${pattern.get('neckline', bd_entry + bd_risk):.0f} 加注 {'0.02' if aligned else '0.01'}",
+                        'stop_loss': f"${bd_stop:.0f}",
+                        'stop_rationale': bd_sl_rationale,
+                        'tp1': f"${bd_tp1:.0f} ({_tp_method_label(pattern, bd_tp1, bd_fib_tp, bd_rr_tp)}, 止賺 1/3)",
+                        'tp2': f"${bd_tp2:.0f} ({_tp_method_label(pattern, bd_tp2, bd_fib_tp, bd_rr_tp)}, 止賺 1/3)",
+                        'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+                        'risk_amount': round(bd_risk, 1),
+                        'rr_tp1': round(bd_rr1, 1),
+                        'rr_tp2': round(bd_rr2, 1),
+                        'daily_alignment': daily_alignment_str('BULLISH', daily_trend, h1_trend),
+                        'note': '📍 形態邊界入場 — 不等待突破，較佳R:R' if aligned else '⚠️ 逆勢邊界買，半倉 (0.01)',
+                    })
+
         if current_price < entry_trigger_level - atr * 2:
             continue
 
         actual_entry = current_price if already_broken else entry_trigger_level
-        aligned = aligned_with_trends('BULLISH', daily_trend, h1_trend)
 
         entry_low = entry_trigger_level
         entry_high = entry_trigger_level + atr * 0.5
@@ -2563,7 +2693,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                                 'rr_tp1': round(pb_rr1, 1),
                                 'rr_tp2': round(pb_rr2, 1),
                                 'daily_alignment': daily_alignment_str('BULLISH', daily_trend, h1_trend),
-                                'note': '\U0001f3af \u53cd\u5f48\u5165\u5834 \u2014 \u65d7\u9762\u5167\u7e2e\u5009\uff0c\u5f85\u7a81\u7834\u8ffd\u52a0' if aligned else '\u26a0\ufe0f \u9006\u52e2\u53cd\u5f48\uff0c\u534a\u5009 (0.01)',
+                                'note': '🎯 反彈入場 — 旗面內縮倉，待突破追加' if aligned else '⚠️ 逆勢反彈，半倉 (0.01)',
                             })
 
     if not setups:
