@@ -27,7 +27,7 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - Channels (parallel): detect_channels()
   - Fibonacci retracement/extension for targets
 
-🕯️ CANDLESTICK CONFIRMATION (16 patterns, detect_candlestick_patterns)
+🕯️ CANDLESTICK CONFIRMATION (17 named patterns, detect_candlestick_patterns)
   - Engulfing, Morning/Evening Star, Hammer/Shooting Star, Harami,
     Three White Soldiers / Three Black Crows, etc.
   - Scoring: +2 HIGH, +1 MEDIUM, opposing subtracts
@@ -62,8 +62,10 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
 
 🚪 ENTRY MODES
   - breakout: wait for price to cross trigger level
-  - pullback: enter NOW at current price inside flag/wedge consolidation
-    (tighter SL, better R:R, requires consolidation quality gate)
+  - pullback: enter at current price inside flag/wedge consolidation
+    (tighter SL, requires consolidation quality gate)
+  - boundary: limit order at double top/bottom or wedge boundary
+    (double: HIGH confidence; wedge: MEDIUM+; skip duplicate breakout-wait setup)
 
 📡 OUTPUT
   - --json → ~/.hermes/reports/xauusd_v3_<date>.json (setups, patterns, candles)
@@ -1848,6 +1850,26 @@ def candlestick_confirmation(candle_patterns, direction, lookback_bars=5, last_b
     return confirmed, confirming, score, opposing
 
 
+def _inject_kline_scores(setups, candle_m30, candle_day, last_m30_idx, last_day_idx):
+    """Attach K-line confirmation fields to each setup for JSON and report reuse."""
+    for s in setups:
+        direction = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
+        _, m30_pat, m30_score, m30_opp = candlestick_confirmation(
+            candle_m30, direction, lookback_bars=5, last_bar_idx=last_m30_idx
+        )
+        _, day_pat, day_score, day_opp = candlestick_confirmation(
+            candle_day, direction, lookback_bars=5, last_bar_idx=last_day_idx
+        )
+        total = m30_score + day_score
+        s['kline_m30_score'] = m30_score
+        s['kline_daily_score'] = day_score
+        s['kline_total_score'] = total
+        s['kline_confirmed'] = total >= 2 and m30_score >= 0 and day_score >= 0
+        s['kline_m30_patterns'] = [cp['name'] for cp in m30_pat]
+        s['kline_daily_patterns'] = [cp['name'] for cp in day_pat]
+        s['kline_opposing'] = [cp['name'] for cp in (m30_opp + day_opp)]
+
+
 # ═══════════════════════════════════════════════════════════
 # FIBONACCI (proper extension calculation)
 # ═══════════════════════════════════════════════════════════
@@ -2052,7 +2074,7 @@ def _entry_status_bearish(already_broken, aligned, quality, entry_mode='breakout
     if entry_mode == 'pullback':
         return '🎯 反彈入場 (待突破)'
     if entry_mode == 'boundary':
-        return '📍 邊界沽出 (HIGH conf, 限價入場)'
+        return '📍 邊界沽出 (限價入場)'
     if already_broken and quality == 'UNCONFIRMED':
         return '⚠️ 已觸發 (未確認突破)'
     if already_broken and aligned and quality == 'GOOD':
@@ -2070,9 +2092,9 @@ def _entry_status_bearish(already_broken, aligned, quality, entry_mode='breakout
 
 def _entry_status_bullish(already_broken, aligned, quality, entry_mode='breakout'):
     if entry_mode == 'pullback':
-        return '🎯 反彈入場 (待突破)'
+        return '🎯 回撤入場 (待突破)'
     if entry_mode == 'boundary':
-        return '📍 邊界買入 (HIGH conf, 限價入場)'
+        return '📍 邊界買入 (限價入場)'
     if not already_broken:
         return '⏳ 等待突破 (逆勢⚠️)' if not aligned else '⏳ 等待突破'
     if quality == 'UNCONFIRMED':
@@ -2109,15 +2131,21 @@ def _quality_from_rr(rr_tp1):
 
 
 def _is_boundary_reversal(pattern):
-    """True if pattern is a reversal type (Double Top/Bottom, Wedge) with HIGH confidence.
-    These patterns benefit from boundary/limit entry before the breakout occurs."""
+    """Double top/bottom: HIGH confidence. Wedges: MEDIUM+ (detector caps wedges at MEDIUM)."""
     ptype = pattern.get('type', '')
     confidence = pattern.get('confidence', '').upper()
-    if confidence != 'HIGH':
-        return False
     is_double = 'Double Top' in ptype or 'Double Bottom' in ptype or '雙頂' in ptype or '雙底' in ptype
     is_wedge = 'Wedge' in ptype or '楔形' in ptype
-    return is_double or is_wedge
+    if is_double:
+        return confidence == 'HIGH'
+    if is_wedge:
+        return confidence in ('HIGH', 'MEDIUM')
+    return False
+
+
+def _max_boundary_risk(atr, current_price):
+    """Cap boundary-entry risk in ATR terms (gold M30 scale)."""
+    return max(atr * 6, current_price * 0.02)
 
 
 def _boundary_entry_sl(pattern, direction, atr, current_price):
@@ -2292,15 +2320,17 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
             continue
         seen_trigger_keys.add(trigger_level)
 
-        # --- Boundary entry for HIGH-conf reversal patterns (check BEFORE continue) ---
+        # --- Boundary entry for reversal patterns (check BEFORE continue) ---
         already_broken = current_price < trigger_level
         aligned = aligned_with_trends('BEARISH', daily_trend, h1_trend)
+        boundary_emitted = False
         if not already_broken and _is_boundary_reversal(pattern):
             bd_entry = _boundary_entry_level(pattern, 'SELL')
-            if bd_entry and bd_entry > current_price + atr * 0.3:
+            if bd_entry and bd_entry > current_price:
                 bd_stop = _boundary_entry_sl(pattern, 'SELL', atr, current_price)
                 bd_risk = bd_stop - bd_entry
-                if bd_risk > 0 and bd_risk <= current_price * 0.05:
+                max_risk = _max_boundary_risk(atr, current_price)
+                if bd_risk > 0 and bd_risk <= max_risk:
                     bd_fib_tp, _ = _compute_tp1(pattern, bd_entry, bd_risk, 'SELL')
                     bd_rr_tp = bd_entry - bd_risk
                     bd_tp1 = max(bd_fib_tp, bd_rr_tp)
@@ -2336,6 +2366,10 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         'daily_alignment': daily_alignment_str('BEARISH', daily_trend, h1_trend),
                         'note': '📍 形態邊界入場 — 不等待跌穿，較佳R:R' if aligned else '⚠️ 逆勢邊界沽，半倉 (0.01)',
                     })
+                    boundary_emitted = True
+
+        if boundary_emitted and not already_broken:
+            continue
 
         # Breakout: price must be below trigger (ignore stale pattern.broken if recovered)
         already_broken = current_price < trigger_level
@@ -2508,13 +2542,15 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         already_broken = current_price > entry_trigger_level
         aligned = aligned_with_trends('BULLISH', daily_trend, h1_trend)
 
-        # --- Boundary entry for HIGH-conf reversal patterns (check BEFORE continue) ---
+        # --- Boundary entry for reversal patterns (check BEFORE continue) ---
+        boundary_emitted = False
         if not already_broken and _is_boundary_reversal(pattern):
             bd_entry = _boundary_entry_level(pattern, 'BUY')
-            if bd_entry and bd_entry < current_price - atr * 0.3:
+            if bd_entry and bd_entry < current_price:
                 bd_stop = _boundary_entry_sl(pattern, 'BUY', atr, current_price)
                 bd_risk = bd_entry - bd_stop
-                if bd_risk > 0 and bd_risk <= current_price * 0.05:
+                max_risk = _max_boundary_risk(atr, current_price)
+                if bd_risk > 0 and bd_risk <= max_risk:
                     bd_fib_tp, _ = _compute_tp1(pattern, bd_entry, bd_risk, 'BUY')
                     bd_rr_tp = bd_entry + bd_risk
                     bd_tp1 = min(bd_fib_tp, bd_rr_tp)
@@ -2552,6 +2588,10 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         'daily_alignment': daily_alignment_str('BULLISH', daily_trend, h1_trend),
                         'note': '📍 形態邊界入場 — 不等待突破，較佳R:R' if aligned else '⚠️ 逆勢邊界買，半倉 (0.01)',
                     })
+                    boundary_emitted = True
+
+        if boundary_emitted and not already_broken:
+            continue
 
         if current_price < entry_trigger_level - atr * 2:
             continue
@@ -2832,6 +2872,15 @@ def _quality_report_label(quality):
     return labels.get(quality, f'⚠️ {quality}')
 
 
+def _entry_mode_report_label(mode):
+    labels = {
+        'breakout': '突破入場',
+        'pullback': '回撤/反彈入場',
+        'boundary': '邊界限價入場',
+    }
+    return labels.get(mode, mode or '突破入場')
+
+
 def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend=None,
                     candle_m30=None, candle_day=None, m15_result=None):
     """Generate comprehensive Markdown report."""
@@ -2918,6 +2967,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 參數 | 詳情 |
 |------|------|
 | 信號確定性 | {s['confidence']} |
+| 入場模式 | {_entry_mode_report_label(s.get('entry_mode', 'breakout'))} |
 | 質素 | {_quality_report_label(s.get('quality', '?'))} |
 | 日線配合 | {s['daily_alignment']} |
 | 觸發狀態 | **{s['entry_status']}** |
@@ -3134,8 +3184,8 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 
 | 法則 | 執行 |
 |------|------|
-| 📍 入場 | 形態突破 (三角形/旗形/雙頂底) |
-| 📍 加注 | 突破前底/前頂 |
+| 📍 入場 | 突破 / 邊界限價 / 旗楔形回撤 |
+| 📍 加注 | 突破前底/前頂（或跌穿 neckline） |
 | 🛑 止損 | 前頂之上 / 前底之下 + 1 ATR |
 | 🎯 TP1 (1/3) | 1:1 RR、0.618 Fib ext 或通道量度目標 (取較近) |
 | 🎯 TP2 (1/3) | 1:1 RR、0.618 Fib ext 或通道量度目標 (取較遠) |
@@ -3263,24 +3313,7 @@ def main():
         _log(f"   {s['direction']}: {s['pattern']} [{s['entry_status']}]")
 
     # 7b. Inject K-line confirmation scores into setups (used by paper_trade + cron filtering)
-    last_m30_idx = len(df_m30) - 1
-    last_day_idx = len(df_day) - 1
-    for s in setups:
-        direction = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
-        m30_conf, m30_pat, m30_score, m30_opp = candlestick_confirmation(
-            candle_m30, direction, lookback_bars=5, last_bar_idx=last_m30_idx
-        )
-        day_conf, day_pat, day_score, day_opp = candlestick_confirmation(
-            candle_day, direction, lookback_bars=5, last_bar_idx=last_day_idx
-        )
-        total = m30_score + day_score
-        s['kline_m30_score'] = m30_score
-        s['kline_daily_score'] = day_score
-        s['kline_total_score'] = total
-        s['kline_confirmed'] = total >= 2 and m30_score >= 0 and day_score >= 0
-        s['kline_m30_patterns'] = [cp['name'] for cp in m30_pat]
-        s['kline_daily_patterns'] = [cp['name'] for cp in day_pat]
-        s['kline_opposing'] = [cp['name'] for cp in (m30_opp + day_opp)]
+    _inject_kline_scores(setups, candle_m30, candle_day, len(df_m30) - 1, len(df_day) - 1)
     
     # 8. Generate report
     report = generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend,
