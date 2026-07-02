@@ -115,7 +115,10 @@ def _log(msg):
 
 
 def _neutral_trend(df):
-    close = float(df['Close'].iloc[-1]) if len(df) else 0.0
+    close = float(df['Close'].iloc[-1]) if df is not None and len(df) else 0.0
+    # P1 FIX: guard against close=0 causing downstream division-by-zero
+    if close <= 0:
+        close = 1.0  # fallback to avoid div-by-zero in R:R calculations
     return {
         'trend': 'NEUTRAL', 'strength': 0,
         'close': round(close, 2), 'ma20': round(close, 2),
@@ -178,7 +181,7 @@ def _breakout_status(df, direction, support=None, resistance=None, tol=0, points
             broken_down_recent = bool(np.any(recent_closes < down_trigger))
         elif points:
             broken_down_recent = any(
-                p['type'] == 'low' and p['price'] < down_trigger for p in points[-8:]
+                p['type'] == 'low' and p['price'] < down_trigger for p in points[-5:]
             )
 
     if direction == 'BEARISH':
@@ -1139,9 +1142,6 @@ def detect_channels(points, df=None, tolerance_pct=0.008):
         pattern_height = round(resistance - support, 2)
         
         # BUG 3 fix: pattern_height must be positive
-        if pattern_height <= 0:
-            continue
-
         if pattern_height <= 0:
             continue
 
