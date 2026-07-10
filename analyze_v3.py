@@ -1992,10 +1992,47 @@ def aligned_with_trends(side, daily_trend, h1_trend):
     return daily_trend['trend'] == 'BULLISH' and h1 in ('BULLISH', 'NEUTRAL')
 
 
+def counter_trend_severity(side, daily_trend, h1_trend):
+    """Classify counter-trend severity: 'ALIGNED', 'MILD', 'SEVERE'.
+    SEVERE = daily AND h1 both opposite → strong discouragement.
+    MILD = only one TF opposite, other neutral → caution.
+    ALIGNED = both TFs aligned or neutral."""
+    h1 = (h1_trend or {}).get('trend', 'NEUTRAL')
+    if side == 'BEARISH':
+        daily_ok = daily_trend['trend'] == 'BEARISH'
+        h1_ok = h1 in ('BEARISH', 'NEUTRAL')
+        daily_opp = daily_trend['trend'] == 'BULLISH'
+        h1_opp = h1 == 'BULLISH'
+    else:
+        daily_ok = daily_trend['trend'] == 'BULLISH'
+        h1_ok = h1 in ('BULLISH', 'NEUTRAL')
+        daily_opp = daily_trend['trend'] == 'BEARISH'
+        h1_opp = h1 == 'BEARISH'
+    if daily_ok and h1_ok:
+        return 'ALIGNED'
+    if daily_opp and h1_opp:
+        return 'SEVERE'
+    return 'MILD'
+
+
+def _counter_trend_note(side, daily_trend, h1_trend, prefix=''):
+    """Generate graded counter-trend warning based on severity.
+    SEVERE (both daily+H1 against): 🚫 強烈不建議, 1/4 倉
+    MILD (one TF against): ⚠️ 逆勢, 半倉"""
+    severity = counter_trend_severity(side, daily_trend, h1_trend)
+    label = f'{prefix} ' if prefix else ''
+    if severity == 'SEVERE':
+        return f'🚫 逆勢{label}— 日線+H1 均相反，強烈不建議！最多 1/4 倉 (0.005)'
+    return f'⚠️ 逆勢{label}— 半倉 (0.01)'
+
+
 def setup_priority(side, already_broken, daily_trend, h1_trend, quality):
     aligned = aligned_with_trends(side, daily_trend, h1_trend)
+    severity = counter_trend_severity(side, daily_trend, h1_trend)
     if quality == 'UNCONFIRMED' or quality == 'POOR_RR':
         return 5
+    if severity == 'SEVERE':
+        return 6  # Both daily + H1 against → lowest priority, strong discouragement
     if already_broken and aligned and quality == 'GOOD':
         return 1
     if already_broken and aligned and quality == 'OK':
@@ -2070,7 +2107,7 @@ def pattern_add_level(pattern, side, points, trigger_level):
     return pattern.get('resistance', trigger_level)
 
 
-def _entry_status_bearish(already_broken, aligned, quality, entry_mode='breakout'):
+def _entry_status_bearish(already_broken, aligned, quality, entry_mode='breakout', severity='ALIGNED'):
     if entry_mode == 'pullback':
         return '🎯 反彈入場 (待突破)'
     if entry_mode == 'boundary':
@@ -2084,19 +2121,19 @@ def _entry_status_bearish(already_broken, aligned, quality, entry_mode='breakout
     if already_broken and quality == 'POOR_RR':
         return '⚠️ 已觸發 (R:R低)'
     if already_broken:
-        return '⚠️ 已觸發 (逆勢!)'
+        return '🚫 已觸發 (日線+H1逆勢!)' if severity == 'SEVERE' else '⚠️ 已觸發 (逆勢!)'
     if not aligned:
-        return '⏳ 等待跌穿 (逆勢⚠️)'
+        return '🚫 等待跌穿 (日線+H1逆勢!)' if severity == 'SEVERE' else '⏳ 等待跌穿 (逆勢⚠️)'
     return '⏳ 等待跌穿'
 
 
-def _entry_status_bullish(already_broken, aligned, quality, entry_mode='breakout'):
+def _entry_status_bullish(already_broken, aligned, quality, entry_mode='breakout', severity='ALIGNED'):
     if entry_mode == 'pullback':
         return '🎯 回撤入場 (待突破)'
     if entry_mode == 'boundary':
         return '📍 邊界買入 (限價入場)'
     if not already_broken:
-        return '⏳ 等待突破 (逆勢⚠️)' if not aligned else '⏳ 等待突破'
+        return '🚫 等待突破 (日線+H1逆勢!)' if severity == 'SEVERE' else ('⏳ 等待突破 (逆勢⚠️)' if not aligned else '⏳ 等待突破')
     if quality == 'UNCONFIRMED':
         return '⚠️ 已突破 (未確認)'
     if quality == 'GOOD' and aligned:
@@ -2105,7 +2142,7 @@ def _entry_status_bullish(already_broken, aligned, quality, entry_mode='breakout
         return '✅ 已突破 (順勢)'
     if quality == 'POOR_RR':
         return '⚠️ 已突破 (R:R低)'
-    return '⚠️ 已突破 (逆勢!)'
+    return '🚫 已突破 (日線+H1逆勢!)' if severity == 'SEVERE' else '⚠️ 已突破 (逆勢!)'
 
 
 def daily_alignment_str(expected_trend, daily_trend, h1_trend=None):
@@ -2352,7 +2389,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         'confidence': pattern.get('confidence', 'MEDIUM'),
                         'quality': bd_quality,
                         'entry_mode': 'boundary',
-                        'entry_status': _entry_status_bearish(False, aligned, bd_quality, 'boundary'),
+                        'entry_status': _entry_status_bearish(False, aligned, bd_quality, 'boundary', counter_trend_severity('BEARISH', daily_trend, h1_trend)),
                         'entry_zone': f"${bd_entry - atr * 0.3:.0f} - ${bd_entry + atr * 0.3:.0f}",
                         'entry_trigger': f"限價沽出 @ ${bd_entry:.0f}（形態邊界入場）",
                         'add_position': f"跌穿 ${pattern.get('neckline', bd_entry - bd_risk):.0f} 加注 0.02",
@@ -2365,7 +2402,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         'rr_tp1': round(bd_rr1, 1),
                         'rr_tp2': round(bd_rr2, 1),
                         'daily_alignment': daily_alignment_str('BEARISH', daily_trend, h1_trend),
-                        'note': '📍 形態邊界入場 — 不等待跌穿，較佳R:R' if aligned else '⚠️ 逆勢邊界沽，半倉 (0.01)',
+                        'note': '📍 形態邊界入場 — 不等待跌穿，較佳R:R' if aligned else _counter_trend_note('BEARISH', daily_trend, h1_trend, prefix='邊界沽'),
                     })
                     boundary_emitted = True
 
@@ -2442,7 +2479,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
             'confidence': pattern.get('confidence', 'MEDIUM'),
             'quality': quality,
             'entry_mode': 'breakout',
-            'entry_status': _entry_status_bearish(already_broken, aligned, quality, 'breakout'),
+            'entry_status': _entry_status_bearish(already_broken, aligned, quality, 'breakout', counter_trend_severity('BEARISH', daily_trend, h1_trend)),
             'entry_zone': f"${entry_low:.0f} - ${entry_high:.0f}",
             'entry_trigger': (
                 f"\u8dcc\u7a7f ${trigger_level:.0f} \u5165\u5834" if not already_broken
@@ -2460,7 +2497,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
             'daily_alignment': (
                 daily_alignment_str('BEARISH', daily_trend, h1_trend)
             ),
-            'note': '' if aligned else '⚠️ 逆勢交易，只用半倉 (0.01)',
+            'note': '' if aligned else _counter_trend_note('BEARISH', daily_trend, h1_trend),
         })
 
         # --- Pullback entry for flags/wedges (not broken, decent consolidation quality) ---
@@ -2508,7 +2545,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                                 'confidence': pattern.get('confidence', 'MEDIUM'),
                                 'quality': pb_quality,
                                 'entry_mode': 'pullback',
-                                'entry_status': _entry_status_bearish(False, aligned, pb_quality, 'pullback'),
+                                'entry_status': _entry_status_bearish(False, aligned, pb_quality, 'pullback', counter_trend_severity('BEARISH', daily_trend, h1_trend)),
                                 'entry_zone': f"${pb_entry - atr * 0.3:.0f} - ${pb_entry + atr * 0.3:.0f}",
                                 'entry_trigger': f"\u65d7\u9762\u53cd\u5f48\u5165\u5834 @ ${pb_entry:.0f}",
                                 'add_position': f"\u8dcc\u7a7f ${add_level:.0f} \u52a0\u6ce8 0.02",
@@ -2523,7 +2560,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                                 'daily_alignment': (
                                     daily_alignment_str('BEARISH', daily_trend, h1_trend)
                                 ),
-                                'note': '🎯 反彈入場 — 旗面內縮倉，待突破追加' if aligned else '⚠️ 逆勢反彈，半倉 (0.01)',
+                                'note': '🎯 反彈入場 — 旗面內縮倉，待突破追加' if aligned else _counter_trend_note('BEARISH', daily_trend, h1_trend, prefix='反彈'),
                             })
 
     for pattern in bullish_p:
@@ -2574,7 +2611,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         'confidence': pattern.get('confidence', 'MEDIUM'),
                         'quality': bd_quality,
                         'entry_mode': 'boundary',
-                        'entry_status': _entry_status_bullish(False, aligned, bd_quality, 'boundary'),
+                        'entry_status': _entry_status_bullish(False, aligned, bd_quality, 'boundary', counter_trend_severity('BULLISH', daily_trend, h1_trend)),
                         'entry_zone': f"${bd_entry - atr * 0.3:.0f} - ${bd_entry + atr * 0.3:.0f}",
                         'entry_trigger': f"限價買入 @ ${bd_entry:.0f}（形態邊界入場）",
                         'add_position': f"突破 ${pattern.get('neckline', bd_entry + bd_risk):.0f} 加注 {'0.02' if aligned else '0.01'}",
@@ -2587,7 +2624,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         'rr_tp1': round(bd_rr1, 1),
                         'rr_tp2': round(bd_rr2, 1),
                         'daily_alignment': daily_alignment_str('BULLISH', daily_trend, h1_trend),
-                        'note': '📍 形態邊界入場 — 不等待突破，較佳R:R' if aligned else '⚠️ 逆勢邊界買，半倉 (0.01)',
+                        'note': '📍 形態邊界入場 — 不等待突破，較佳R:R' if aligned else _counter_trend_note('BULLISH', daily_trend, h1_trend, prefix='邊界買'),
                     })
                     boundary_emitted = True
 
@@ -2657,7 +2694,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
             'confidence': pattern.get('confidence', 'MEDIUM'),
             'quality': quality,
             'entry_mode': 'breakout',
-            'entry_status': _entry_status_bullish(already_broken, aligned, quality, 'breakout'),
+            'entry_status': _entry_status_bullish(already_broken, aligned, quality, 'breakout', counter_trend_severity('BULLISH', daily_trend, h1_trend)),
             'entry_zone': f"${entry_low:.0f} - ${entry_high:.0f}",
             'entry_trigger': (
                 f"\u7a81\u7834 ${entry_trigger_level:.0f}" if not already_broken
@@ -2673,7 +2710,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
             'rr_tp1': round(rr_tp1, 1),
             'rr_tp2': round(rr_tp2, 1),
             'daily_alignment': daily_alignment_str('BULLISH', daily_trend, h1_trend),
-            'note': '' if aligned else '\u26a0\ufe0f \u9006\u52e2\u4ea4\u6613\uff0c\u53ea\u7528\u534a\u5009 (0.01)',
+            'note': '' if aligned else _counter_trend_note('BULLISH', daily_trend, h1_trend),
         })
 
         # --- Pullback entry for flags/wedges (not broken, decent consolidation quality) ---
@@ -2721,7 +2758,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                                 'confidence': pattern.get('confidence', 'MEDIUM'),
                                 'quality': pb_quality,
                                 'entry_mode': 'pullback',
-                                'entry_status': _entry_status_bullish(False, aligned, pb_quality, 'pullback'),
+                                'entry_status': _entry_status_bullish(False, aligned, pb_quality, 'pullback', counter_trend_severity('BULLISH', daily_trend, h1_trend)),
                                 'entry_zone': f"${pb_entry - atr * 0.3:.0f} - ${pb_entry + atr * 0.3:.0f}",
                                 'entry_trigger': f"\u65d7\u9762\u53cd\u5f48\u5165\u5834 @ ${pb_entry:.0f}",
                                 'add_position': f"\u7a81\u7834 ${add_level:.0f} \u52a0\u6ce8 {'0.02' if aligned else '0.01'}",
@@ -2734,7 +2771,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                                 'rr_tp1': round(pb_rr1, 1),
                                 'rr_tp2': round(pb_rr2, 1),
                                 'daily_alignment': daily_alignment_str('BULLISH', daily_trend, h1_trend),
-                                'note': '🎯 反彈入場 — 旗面內縮倉，待突破追加' if aligned else '⚠️ 逆勢反彈，半倉 (0.01)',
+                                'note': '🎯 反彈入場 — 旗面內縮倉，待突破追加' if aligned else _counter_trend_note('BULLISH', daily_trend, h1_trend, prefix='反彈'),
                             })
 
     if not setups:
@@ -3212,7 +3249,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 |------|------|
 | M30 ATR | ${atr_m30:.1f} |
 | 平均風險/筆 | ~${avg_risk:.0f} |
-| 建議倉位 | 0.02 (順勢) / 0.01 (逆勢) |
+| 建議倉位 | 0.02 (順勢) / 0.01 (單級逆勢) / 0.005 (日線+H1雙逆勢🚫) |
 | 最大日虧損 | 賬戶 2% |
 | 追蹤止損 | {trail_rule} |
 
