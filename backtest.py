@@ -134,8 +134,8 @@ POS_HALF = 0.01
 # For simplicity: PnL = (exit - entry) * position_size * 100
 CONTRACT_MULTIPLIER = 100  # $ per $1 move per 1.0 lot
 # P2 FIX: slippage & commission model for realistic backtest results
-SLIPPAGE_TICKS = 0.3  # $0.30 per side — typical gold bid-ask spread on M30
-COMMISSION_PER_TRADE = 2.0  # $2 round-turn commission per trade (simulated)
+SLIPPAGE_TICKS = 0.15  # $0.15 per side — gold bid-ask spread
+COMMISSION_PER_TRADE = 0.0  # $0 commission (broker uses spread only)
 
 
 class Trade:
