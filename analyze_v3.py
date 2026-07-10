@@ -55,9 +55,9 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
 
 ⚖️ QUALITY / PRIORITY
   - R:R quality tiers: ≥2.0 → GOOD, ≥1.0 → OK, <1.0 → POOR_RR
-  - Priority 1-5 (1=best): broken+aligned+GOOD=1, broken+aligned+OK=2,
+  - Priority 1-6 (1=best): broken+aligned+GOOD=1, broken+aligned+OK=2,
     broken+counter-trend=2, aligned waiting=3, not aligned=4,
-    POOR_RR/UNCONFIRMED=5
+    POOR_RR/UNCONFIRMED=5, SEVERE counter-trend=6
   - UNCONFIRMED downgrade: broken but no retest/volume confirmation
 
 🚪 ENTRY MODES
@@ -2016,14 +2016,15 @@ def counter_trend_severity(side, daily_trend, h1_trend):
 
 
 def _counter_trend_note(side, daily_trend, h1_trend, prefix=''):
-    """Generate graded counter-trend warning based on severity.
-    SEVERE (both daily+H1 against): 🚫 強烈不建議, 1/4 倉
-    MILD (one TF against): ⚠️ 逆勢, 半倉"""
+    """Generate graded counter-trend warning based on severity (uses _volume_risk_tier)."""
     severity = counter_trend_severity(side, daily_trend, h1_trend)
+    if severity == 'ALIGNED':
+        return ''
+    vol, _ = _volume_risk_tier(severity)
     label = f'{prefix} ' if prefix else ''
     if severity == 'SEVERE':
-        return f'🚫 逆勢{label}— 日線+H1 均相反，強烈不建議！最多 1/4 倉 (0.005)'
-    return f'⚠️ 逆勢{label}— 半倉 (0.01)'
+        return f'🚫 逆勢{label}— 日線+H1 均相反，強烈不建議！最多 1/4 倉 ({vol})'
+    return f'⚠️ 逆勢{label}— 半倉 ({vol})'
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2105,10 +2106,10 @@ def _volume_risk_tier(severity='ALIGNED', vol=0.02):
 def setup_priority(side, already_broken, daily_trend, h1_trend, quality):
     aligned = aligned_with_trends(side, daily_trend, h1_trend)
     severity = counter_trend_severity(side, daily_trend, h1_trend)
-    if quality == 'UNCONFIRMED' or quality == 'POOR_RR':
-        return 5
     if severity == 'SEVERE':
         return 6  # Both daily + H1 against → lowest priority, strong discouragement
+    if quality == 'UNCONFIRMED' or quality == 'POOR_RR':
+        return 5
     if already_broken and aligned and quality == 'GOOD':
         return 1
     if already_broken and aligned and quality == 'OK':
@@ -2437,6 +2438,8 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         # --- Boundary entry for reversal patterns (check BEFORE continue) ---
         already_broken = current_price < trigger_level
         aligned = aligned_with_trends('BEARISH', daily_trend, h1_trend)
+        severity = counter_trend_severity('BEARISH', daily_trend, h1_trend)
+        add_vol = _volume_risk_tier(severity)[0]
         boundary_emitted = False
         if not already_broken and _is_boundary_reversal(pattern):
             bd_entry = _boundary_entry_level(pattern, 'SELL')
@@ -2468,7 +2471,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         'entry_status': _entry_status_bearish(False, aligned, bd_quality, 'boundary', counter_trend_severity('BEARISH', daily_trend, h1_trend)),
                         'entry_zone': f"${bd_entry - atr * 0.3:.0f} - ${bd_entry + atr * 0.3:.0f}",
                         'entry_trigger': f"限價沽出 @ ${bd_entry:.0f}（形態邊界入場）",
-                        'add_position': f"跌穿 ${pattern.get('neckline', bd_entry - bd_risk):.0f} 加注 0.02",
+                        'add_position': f"跌穿 ${pattern.get('neckline', bd_entry - bd_risk):.0f} 加注 {add_vol}",
                         'stop_loss': f"${bd_stop:.0f}",
                         'stop_rationale': bd_sl_rationale,
                         'tp1': f"${bd_tp1:.0f} ({_tp_method_label(pattern, bd_tp1, bd_fib_tp, bd_rr_tp)}, 止賺 1/3)",
@@ -2561,7 +2564,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                 f"\u8dcc\u7a7f ${trigger_level:.0f} \u5165\u5834" if not already_broken
                 else f"\u5df2\u8dcc\u7a7f ${trigger_level:.0f}\uff0c\u73fe\u50f9 ${current_price:.0f} \u5165\u5834"
             ),
-            'add_position': f"\u8dcc\u7a7f ${add_level:.0f} \u52a0\u6ce8 0.02",
+            'add_position': f"\u8dcc\u7a7f ${add_level:.0f} \u52a0\u6ce8 {add_vol}",
             'stop_loss': f"${stop_level:.0f}",
             'stop_rationale': stop_rationale,
             'tp1': f"${tp1:.0f} ({_tp_method_label(pattern, tp1, fib_tp, rr_tp)}, \u6b62\u8cfa 1/3)",
@@ -2624,7 +2627,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                                 'entry_status': _entry_status_bearish(False, aligned, pb_quality, 'pullback', counter_trend_severity('BEARISH', daily_trend, h1_trend)),
                                 'entry_zone': f"${pb_entry - atr * 0.3:.0f} - ${pb_entry + atr * 0.3:.0f}",
                                 'entry_trigger': f"\u65d7\u9762\u53cd\u5f48\u5165\u5834 @ ${pb_entry:.0f}",
-                                'add_position': f"\u8dcc\u7a7f ${add_level:.0f} \u52a0\u6ce8 0.02",
+                                'add_position': f"\u8dcc\u7a7f ${add_level:.0f} \u52a0\u6ce8 {add_vol}",
                                 'stop_loss': f"${pb_stop:.0f}",
                                 'stop_rationale': pb_stop_rationale,
                                 'tp1': f"${pb_tp1:.0f} ({_tp_method_label(pattern, pb_tp1, pb_fib_tp, pb_rr_tp)}, \u6b62\u8cfa 1/3)",
@@ -2655,6 +2658,8 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
 
         already_broken = current_price > entry_trigger_level
         aligned = aligned_with_trends('BULLISH', daily_trend, h1_trend)
+        severity = counter_trend_severity('BULLISH', daily_trend, h1_trend)
+        add_vol = _volume_risk_tier(severity)[0]
 
         # --- Boundary entry for reversal patterns (check BEFORE continue) ---
         boundary_emitted = False
@@ -2690,7 +2695,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         'entry_status': _entry_status_bullish(False, aligned, bd_quality, 'boundary', counter_trend_severity('BULLISH', daily_trend, h1_trend)),
                         'entry_zone': f"${bd_entry - atr * 0.3:.0f} - ${bd_entry + atr * 0.3:.0f}",
                         'entry_trigger': f"限價買入 @ ${bd_entry:.0f}（形態邊界入場）",
-                        'add_position': f"突破 ${pattern.get('neckline', bd_entry + bd_risk):.0f} 加注 {'0.02' if aligned else '0.01'}",
+                        'add_position': f"突破 ${pattern.get('neckline', bd_entry + bd_risk):.0f} 加注 {add_vol}",
                         'stop_loss': f"${bd_stop:.0f}",
                         'stop_rationale': bd_sl_rationale,
                         'tp1': f"${bd_tp1:.0f} ({_tp_method_label(pattern, bd_tp1, bd_fib_tp, bd_rr_tp)}, 止賺 1/3)",
@@ -2776,7 +2781,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                 f"\u7a81\u7834 ${entry_trigger_level:.0f}" if not already_broken
                 else f"\u5df2\u7a81\u7834 ${entry_trigger_level:.0f}"
             ),
-            'add_position': f"\u7a81\u7834 ${add_level:.0f} \u52a0\u6ce8 {'0.02' if aligned else '0.01'}",
+            'add_position': f"\u7a81\u7834 ${add_level:.0f} \u52a0\u6ce8 {add_vol}",
             'stop_loss': f"${stop_level:.0f}",
             'stop_rationale': stop_rationale,
             'tp1': f"${tp1:.0f} ({_tp_method_label(pattern, tp1, fib_tp, rr_tp)}, \u6b62\u8cfa 1/3)",
@@ -2837,7 +2842,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                                 'entry_status': _entry_status_bullish(False, aligned, pb_quality, 'pullback', counter_trend_severity('BULLISH', daily_trend, h1_trend)),
                                 'entry_zone': f"${pb_entry - atr * 0.3:.0f} - ${pb_entry + atr * 0.3:.0f}",
                                 'entry_trigger': f"\u65d7\u9762\u53cd\u5f48\u5165\u5834 @ ${pb_entry:.0f}",
-                                'add_position': f"\u7a81\u7834 ${add_level:.0f} \u52a0\u6ce8 {'0.02' if aligned else '0.01'}",
+                                'add_position': f"\u7a81\u7834 ${add_level:.0f} \u52a0\u6ce8 {add_vol}",
                                 'stop_loss': f"${pb_stop:.0f}",
                                 'stop_rationale': pb_stop_rationale,
                                 'tp1': f"${pb_tp1:.0f} ({_tp_method_label(pattern, pb_tp1, pb_fib_tp, pb_rr_tp)}, \u6b62\u8cfa 1/3)",
@@ -3248,6 +3253,12 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
     else:
         priority_text = "## ⭐ 當前最優先 Setup\n\n⚠️ 無有效交易信號 — 等待形態形成\n\n"
 
+    if setups:
+        best_side = 'BEARISH' if 'SELL' in setups[0].get('direction', '') else 'BULLISH'
+        vol_advice = _volume_risk_tier(counter_trend_severity(best_side, daily_trend, h1_trend))[1]
+    else:
+        vol_advice = _volume_risk_tier('ALIGNED')[1]
+
     # Time quality advisory
     tq_level, tq_advice = _time_quality_score()
     time_quality_line = f"\n| ⏰ 時段品質 | {'🌅 黃金時段' if tq_level == 'golden' else '🚫 危險時段' if tq_level == 'danger' else '➖ 一般時段'} | - | - |"
@@ -3337,7 +3348,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 |------|------|
 | M30 ATR | ${atr_m30:.1f} |
 | 平均風險/筆 | ~${avg_risk:.0f} |
-| 建議倉位 | {_volume_risk_tier('ALIGNED')[1]} |
+| 建議倉位 | {vol_advice} |
 | ⛔ 大倉禁忌 | ≥0.07 歷史勝率僅 22%, 虧損 -$122/週 |
 | 最大日交易數 | {MAX_DAILY_TRADES} 筆 (歷史: 17筆/日 = 過度交易) |
 | 最大日虧損 | 賬戶 2% |
