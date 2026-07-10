@@ -2026,6 +2026,82 @@ def _counter_trend_note(side, daily_trend, h1_trend, prefix=''):
     return f'⚠️ 逆勢{label}— 半倉 (0.01)'
 
 
+# ═══════════════════════════════════════════════════════════
+# Trading Performance Insights (from Jul 2026 weekly analysis)
+# 123 trades analyzed: 35% win rate, -$317 total
+# Key findings encoded below as advisory functions.
+# ═══════════════════════════════════════════════════════════
+
+# Broker timezone = UTC-3. Hours below are broker-local.
+GOLDEN_HOURS = {1, 9}       # 01:00 +$174.60 (7t), 09:00 +$78.30 (8t)
+DANGER_HOURS = {17}          # 17:00 -$173.09 (16t)
+MAX_DAILY_TRADES = 8         # Overtrading threshold (123 trades/week = ~17/day avg)
+
+
+def _time_quality_score():
+    """Rate current broker time for trading quality.
+
+    Based on 123-trade weekly analysis (Jul 2026):
+    - Golden hours (01:00, 09:00 broker): +$252.90 combined, 60% win rate
+    - Danger hour (17:00 broker): -$173.09, 19% win rate
+    - Other hours: roughly break-even
+
+    Returns: ('golden'|'danger'|'normal', advisory_text)
+    """
+    now_utc = datetime.utcnow()
+    broker_hour = (now_utc.hour - 3) % 24  # UTC-3
+
+    if broker_hour in GOLDEN_HOURS:
+        return ('golden', '🌅 黃金時段 (歷史勝率 60%, +$252/週) — 適合入場')
+    if broker_hour in DANGER_HOURS:
+        return ('danger', '🚫 危險時段 (歷史勝率 19%, -$173/週) — 建議觀望')
+    return ('normal', '')
+
+
+def _scalp_risk_warning():
+    """Warn against ultra-short holding periods.
+
+    Historical data:
+    - <5min hold: 29% win, -$79.95 (17 trades)
+    - 5-15min hold: 17% win, -$190.60 (23 trades) ← WORST
+    - 15-60min hold: 38% win, +$48.98 (48 trades) ← ONLY PROFITABLE
+    - 1-4h hold: 42% win, -$76.37
+    - >4h hold: 55% win, -$19.15 (small sample)
+    """
+    return (
+        "⚠️ **反剝頭皮提醒 (基於 123 筆歷史數據):**\n"
+        "- <5min 持倉: 勝率 29%, 虧損 -$80\n"
+        "- 5-15min 持倉: 勝率 17%, 虧損 -$191 ← **最差**\n"
+        "- 15-60min 持倉: 勝率 38%, **唯一盈利** +$49\n"
+        "- 建議: 持倉至少 15 分鐘, 讓形態充分發展"
+    )
+
+
+def _volume_risk_tier(severity='ALIGNED', vol=0.02):
+    """Recommend position size with volume-aware risk tiers.
+
+    Historical data (Jul 2026 weekly):
+    - 0.01-0.02: 34% win, -$92 (too frequent, too small to matter)
+    - 0.03-0.06: 40% win, -$103 (moderate)
+    - 0.07+: 22% win, -$122 ← BIG VOLUME IS DESTRUCTIVE
+    - 0.10 trades: 0% win (3 trades, all losses, -$75)
+
+    Combined with counter-trend severity:
+    ALIGNED: 0.03 base, 0.05 if golden hour
+    MILD: 0.01 (half)
+    SEVERE: 0.005 (quarter) + 🚫
+    """
+    if severity == 'SEVERE':
+        return 0.005, '🚫 強烈不建議！最多 0.005 倉 (歷史: 大倉逆勢 22% 勝率)'
+    elif severity == 'MILD':
+        return 0.01, '⚠️ 逆勢半倉 0.01 (歷史: 逆勢虧損率 65%)'
+    else:
+        tq, _ = _time_quality_score()
+        if tq == 'golden':
+            return 0.03, '🌅 順勢 + 黃金時段, 0.03 倉 (歷史: 60% 勝率)'
+        return 0.02, '順勢 0.02 倉'
+
+
 def setup_priority(side, already_broken, daily_trend, h1_trend, quality):
     aligned = aligned_with_trends(side, daily_trend, h1_trend)
     severity = counter_trend_severity(side, daily_trend, h1_trend)
@@ -3172,6 +3248,12 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
     else:
         priority_text = "## ⭐ 當前最優先 Setup\n\n⚠️ 無有效交易信號 — 等待形態形成\n\n"
 
+    # Time quality advisory
+    tq_level, tq_advice = _time_quality_score()
+    time_quality_line = f"\n| ⏰ 時段品質 | {'🌅 黃金時段' if tq_level == 'golden' else '🚫 危險時段' if tq_level == 'danger' else '➖ 一般時段'} | - | - |"
+    if tq_advice:
+        time_quality_line += f"\n| | {tq_advice} | - | - |"
+
     report = f"""# 🔥 XAUUSD 圖表形態深度分析 v3
 
 **日期:** {today}  
@@ -3192,7 +3274,9 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | MA20 | - | ${h1['ma20']:.0f} | ${daily_trend['ma20']:.0f} |
 | MA50 | - | ${h1['ma50']:.0f} | ${daily_trend['ma50']:.0f} |
 | 趨勢 | - | {h1['trend']} ({h1['strength']}/2) | {daily_trend['trend']} ({daily_trend['strength']}/2) |
-| 成交量 | {vol_ratio:.1f}x avg{vol_suffix} | - | - |
+| 成交量 | {vol_ratio:.1f}x avg{vol_suffix} | - | - |{time_quality_line}
+
+> {_scalp_risk_warning()}
 
 ## 📐 二、圖表形態
 
@@ -3224,10 +3308,14 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 |------|------|
 | 📍 入場 | 突破 / 邊界限價 / 旗楔形回撤 |
 | 📍 加注 | 突破前底/前頂（或跌穿 neckline） |
-| 🛑 止損 | 前頂之上 / 前底之下 + 1 ATR |
+| 🛑 止損 | 前頂之上 / 前底之下 + 1 ATR (必設!) |
 | 🎯 TP1 (1/3) | 1:1 RR、0.618 Fib ext 或通道量度目標 (取較近) |
 | 🎯 TP2 (1/3) | 1:1 RR、0.618 Fib ext 或通道量度目標 (取較遠) |
 | 🎯 TP3 (1/3) | 放飛 + 追蹤止損 |
+| ⏰ 最佳時段 | 01:00 / 09:00 (broker time) — 勝率 60% |
+| 🚫 避開時段 | 17:00 (broker time) — 勝率 19% |
+| ⛔ 倉位上限 | 0.07+ 大倉歷史勝率僅 22% — 禁止! |
+| 📉 日上限 | 最多 {MAX_DAILY_TRADES} 筆/日 |
 
 {setup_text}
 {m15_text}
@@ -3249,9 +3337,26 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 |------|------|
 | M30 ATR | ${atr_m30:.1f} |
 | 平均風險/筆 | ~${avg_risk:.0f} |
-| 建議倉位 | 0.02 (順勢) / 0.01 (單級逆勢) / 0.005 (日線+H1雙逆勢🚫) |
+| 建議倉位 | {_volume_risk_tier('ALIGNED')[1]} |
+| ⛔ 大倉禁忌 | ≥0.07 歷史勝率僅 22%, 虧損 -$122/週 |
+| 最大日交易數 | {MAX_DAILY_TRADES} 筆 (歷史: 17筆/日 = 過度交易) |
 | 最大日虧損 | 賬戶 2% |
+| 🎯 止盈要求 | **必須設 TP** (歷史: 89% 無 TP, 無 TP 虧損 -$317/週) |
 | 追蹤止損 | {trail_rule} |
+
+### 📊 歷史交易績效回顧 (Jul 2026, 123 筆)
+
+| 指標 | 數值 |
+|------|------|
+| 總交易數 | 123 筆/週 |
+| 勝率 | 35% (43W/80L) |
+| 總盈虧 | -$317.09 |
+| SL 被觸發 | 36 筆, 虧損 -$524 |
+| SL 未觸發 | 58 筆, 盈利 +$323 |
+| 最佳時段 | 01:00 (+$175), 09:00 (+$78) |
+| 最差時段 | 17:00 (-$173) |
+| 最佳持倉 | 15-60min (唯一盈利時段) |
+| 最差持倉 | 5-15min (17% 勝率, -$191) |
 
 ## 📝 八、交易日誌
 
