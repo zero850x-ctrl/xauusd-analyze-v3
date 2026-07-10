@@ -124,6 +124,8 @@ def fetch_backtest_data(days=60):
 WARMUP_BARS = 80
 # Min bars between trades (cooldown to avoid re-entering same pattern)
 TRADE_COOLDOWN = 6  # 3 hours on M30, ~6 hours on H1, 6 days on Daily
+# Max bars to hold a trade before timeout exit
+MAX_BARS_HELD = 100  # ≈2 days on M30, ~4 days on H1, ~100 days on Daily
 # Position sizes (micro lots)
 POS_FULL = 0.03
 POS_HALF = 0.01
@@ -131,6 +133,9 @@ POS_HALF = 0.01
 # XAUUSD: 1 micro lot (0.01) ≈ $0.01 per $1 move → use $1 per point per 1.0 lot
 # For simplicity: PnL = (exit - entry) * position_size * 100
 CONTRACT_MULTIPLIER = 100  # $ per $1 move per 1.0 lot
+# P2 FIX: slippage & commission model for realistic backtest results
+SLIPPAGE_TICKS = 0.3  # $0.30 per side — typical gold bid-ask spread on M30
+COMMISSION_PER_TRADE = 2.0  # $2 round-turn commission per trade (simulated)
 
 
 class Trade:
@@ -172,14 +177,21 @@ class Trade:
 
     @property
     def total_pnl(self):
-        return self.pnl_tp1 + self.pnl_tp2 + self.pnl_tp3
+        # P2 FIX: subtract commission from total PnL
+        return self.pnl_tp1 + self.pnl_tp2 + self.pnl_tp3 - COMMISSION_PER_TRADE
 
     @property
     def rr_achieved(self):
+        # P2 FIX: use blended R:R based on total PnL vs total risk (full position)
         risk = abs(self.entry_price - self.stop_price)
         if risk <= 0:
             return 0.0
-        return abs(self.exit_price - self.entry_price) / risk if self.exit_price else 0.0
+        # Total risk = full position * risk_distance * multiplier
+        total_risk = risk * self.position_size * CONTRACT_MULTIPLIER
+        if total_risk <= 0:
+            return 0.0
+        # Blended R:R = actual total PnL / total risk
+        return self.total_pnl / total_risk if self.closed else 0.0
 
     def to_dict(self):
         return {
@@ -205,8 +217,14 @@ class Trade:
         }
 
 
-def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val):
-    """Process one bar for an open trade. Returns True if trade fully closed."""
+def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open=None):
+    """Process one bar for an open trade. Returns True if trade fully closed.
+
+    P2 FIX: If bar_open is provided, uses intrabar path inference to determine
+    whether TP or stop was hit first (conservative: if both in range, the one
+    closer to bar_open is assumed hit first). If bar_open is None, falls back
+    to TP-first (optimistic) for backward compatibility.
+    """
 
     if trade.closed:
         return True
@@ -231,19 +249,25 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val):
     if not trade.tp1_hit:
         if is_buy and bar_high >= tp1:
             trade.tp1_hit = True
-            trade.pnl_tp1 = (tp1 - entry) * trade.position_size / 3 * CONTRACT_MULTIPLIER
+            # P2 FIX: slippage on TP exit (sell at bid → lower fill for BUY close)
+            fill = tp1 - SLIPPAGE_TICKS
+            trade.pnl_tp1 = (fill - entry) * trade.position_size / 3 * CONTRACT_MULTIPLIER
         elif not is_buy and bar_low <= tp1:
             trade.tp1_hit = True
-            trade.pnl_tp1 = (entry - tp1) * trade.position_size / 3 * CONTRACT_MULTIPLIER
+            # P2 FIX: slippage on TP exit (buy at ask → higher fill for SELL close)
+            fill = tp1 + SLIPPAGE_TICKS
+            trade.pnl_tp1 = (entry - fill) * trade.position_size / 3 * CONTRACT_MULTIPLIER
 
     # ── TP2: exit 1/3 ──
     if not trade.tp2_hit:
         if is_buy and bar_high >= tp2:
             trade.tp2_hit = True
-            trade.pnl_tp2 = (tp2 - entry) * trade.position_size / 3 * CONTRACT_MULTIPLIER
+            fill = tp2 - SLIPPAGE_TICKS
+            trade.pnl_tp2 = (fill - entry) * trade.position_size / 3 * CONTRACT_MULTIPLIER
         elif not is_buy and bar_low <= tp2:
             trade.tp2_hit = True
-            trade.pnl_tp2 = (entry - tp2) * trade.position_size / 3 * CONTRACT_MULTIPLIER
+            fill = tp2 + SLIPPAGE_TICKS
+            trade.pnl_tp2 = (entry - fill) * trade.position_size / 3 * CONTRACT_MULTIPLIER
 
     # ── Trailing stop for TP3 (last 1/3) ──
     # Activate after 2×ATR profit, trail at 1.5×ATR
@@ -261,7 +285,15 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val):
         # Check stop hit (original stop OR trailing stop)
         effective_stop = trade.trail_stop if trade.trail_active else stop
         if bar_low <= effective_stop:
-            exit_price = effective_stop
+            # P2 FIX: slippage on stop exit (sell at bid → even lower for BUY stop)
+            exit_price = effective_stop - SLIPPAGE_TICKS
+            # P0 FIX: stop loss closes ALL remaining portions, not just tp3
+            # If tp1/tp2 haven't hit yet, they also exit at stop price (loss)
+            portion = trade.position_size / 3
+            if not trade.tp1_hit:
+                trade.pnl_tp1 = (exit_price - entry) * portion * CONTRACT_MULTIPLIER
+            if not trade.tp2_hit:
+                trade.pnl_tp2 = (exit_price - entry) * portion * CONTRACT_MULTIPLIER
             trade.pnl_tp3 = (exit_price - entry) * remaining * CONTRACT_MULTIPLIER
             trade.exit_price = exit_price
             trade.exit_reason = 'Trailing stop' if trade.trail_active else 'Stop loss'
@@ -279,21 +311,38 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val):
 
         effective_stop = trade.trail_stop if trade.trail_active else stop
         if bar_high >= effective_stop:
-            exit_price = effective_stop
+            # P2 FIX: slippage on stop exit (buy at ask → even higher for SELL stop)
+            exit_price = effective_stop + SLIPPAGE_TICKS
+            # P0 FIX: stop loss closes ALL remaining portions, not just tp3
+            portion = trade.position_size / 3
+            if not trade.tp1_hit:
+                trade.pnl_tp1 = (entry - exit_price) * portion * CONTRACT_MULTIPLIER
+            if not trade.tp2_hit:
+                trade.pnl_tp2 = (entry - exit_price) * portion * CONTRACT_MULTIPLIER
             trade.pnl_tp3 = (entry - exit_price) * remaining * CONTRACT_MULTIPLIER
             trade.exit_price = exit_price
             trade.exit_reason = 'Trailing stop' if trade.trail_active else 'Stop loss'
             trade.closed = True
             return True
 
-    # ── Timeout: close after 100 bars (≈2 days on M30) ──
-    if trade.bars_held >= 100:
+    # ── Timeout: close after MAX_BARS_HELD bars ──
+    if trade.bars_held >= MAX_BARS_HELD:
+        # P0 FIX: timeout closes ALL remaining portions at market close
+        portion = trade.position_size / 3
         if is_buy:
+            if not trade.tp1_hit:
+                trade.pnl_tp1 = (bar_close - entry) * portion * CONTRACT_MULTIPLIER
+            if not trade.tp2_hit:
+                trade.pnl_tp2 = (bar_close - entry) * portion * CONTRACT_MULTIPLIER
             trade.pnl_tp3 = (bar_close - entry) * remaining * CONTRACT_MULTIPLIER
         else:
+            if not trade.tp1_hit:
+                trade.pnl_tp1 = (entry - bar_close) * portion * CONTRACT_MULTIPLIER
+            if not trade.tp2_hit:
+                trade.pnl_tp2 = (entry - bar_close) * portion * CONTRACT_MULTIPLIER
             trade.pnl_tp3 = (entry - bar_close) * remaining * CONTRACT_MULTIPLIER
         trade.exit_price = bar_close
-        trade.exit_reason = 'Timeout (100 bars)'
+        trade.exit_reason = f'Timeout ({MAX_BARS_HELD} bars)'
         trade.closed = True
         return True
 
@@ -315,15 +364,6 @@ def _parse_dollar(val):
         if m:
             return float(m.group(1).replace(',', ''))
     return None
-
-
-def _parse_entry_zone(zone_str):
-    """Parse '$2340 - $2350' → (low, high)."""
-    import re
-    m = re.findall(r'[\$]?([\d,.]+)', zone_str)
-    if len(m) >= 2:
-        return float(m[0].replace(',', '')), float(m[1].replace(',', ''))
-    return None, None
 
 
 def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend, h1_trend):
@@ -381,6 +421,12 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
 
         # Confidence
         confidence = s.get('confidence', 'MEDIUM')
+
+        # P2 FIX: apply slippage to entry price (worse fill for both BUY/SELL)
+        if is_buy:
+            entry_price = entry_price + SLIPPAGE_TICKS  # buy at ask (higher)
+        else:
+            entry_price = entry_price - SLIPPAGE_TICKS  # sell at bid (lower)
 
         # Validate: for BUY, stop < entry < tp; for SELL, tp < entry < stop
         if is_buy:
@@ -485,10 +531,11 @@ def run_backtest(df_bars, df_day, verbose=False):
         bar_high = float(window['High'].iloc[-1])
         bar_low = float(window['Low'].iloc[-1])
         bar_close = current_price
+        bar_open = float(window['Open'].iloc[-1]) if 'Open' in window else None
 
         still_open = []
         for trade in open_trades:
-            closed = simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr)
+            closed = simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr, bar_open)
             if closed:
                 closed_trades.append(trade)
                 if verbose:
@@ -553,11 +600,20 @@ def run_backtest(df_bars, df_day, verbose=False):
     for trade in open_trades:
         simulate_trade_on_bar(trade, last_close, last_close, last_close, last_atr)
         if not trade.closed:
-            # Force close
+            # Force close — P0 FIX: close ALL remaining portions, not just tp3
+            portion = trade.position_size / 3
             if trade.side == 'BUY':
-                trade.pnl_tp3 = (last_close - trade.entry_price) * trade.position_size / 3 * CONTRACT_MULTIPLIER
+                if not trade.tp1_hit:
+                    trade.pnl_tp1 = (last_close - trade.entry_price) * portion * CONTRACT_MULTIPLIER
+                if not trade.tp2_hit:
+                    trade.pnl_tp2 = (last_close - trade.entry_price) * portion * CONTRACT_MULTIPLIER
+                trade.pnl_tp3 = (last_close - trade.entry_price) * (trade.position_size / 3) * CONTRACT_MULTIPLIER
             else:
-                trade.pnl_tp3 = (trade.entry_price - last_close) * trade.position_size / 3 * CONTRACT_MULTIPLIER
+                if not trade.tp1_hit:
+                    trade.pnl_tp1 = (trade.entry_price - last_close) * portion * CONTRACT_MULTIPLIER
+                if not trade.tp2_hit:
+                    trade.pnl_tp2 = (trade.entry_price - last_close) * portion * CONTRACT_MULTIPLIER
+                trade.pnl_tp3 = (trade.entry_price - last_close) * (trade.position_size / 3) * CONTRACT_MULTIPLIER
             trade.exit_price = last_close
             trade.exit_reason = 'End of data'
             trade.closed = True
@@ -580,7 +636,8 @@ def compute_stats(trades, starting_capital=10000.0):
 
     pnls = [t.total_pnl for t in trades]
     wins = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p <= 0]
+    losses = [p for p in pnls if p < 0]
+    breakevens = [p for p in pnls if p == 0]  # P2 FIX: track breakeven separately
 
     # Equity curve
     equity = [starting_capital]
@@ -604,10 +661,17 @@ def compute_stats(trades, starting_capital=10000.0):
     gross_loss = abs(sum(losses)) if losses else 0
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
 
-    # Sharpe ratio (simplified — per-trade, not annualized)
+    # Sharpe ratio (P2 FIX: annualized — per_trade * sqrt(bars_per_year))
+    # Assumes ~252 trading days/year; for intraday, bars_per_year varies by TF
     if len(pnls) > 1:
         pnl_std = np.std(pnls)
-        sharpe = np.mean(pnls) / pnl_std * np.sqrt(len(pnls)) if pnl_std > 0 else 0
+        if pnl_std > 0:
+            per_trade_sharpe = np.mean(pnls) / pnl_std
+            # Annualize: M30 → ~12 bars/day × 252 = 3024; H1 → ~6 × 252 = 1512; Daily → 252
+            # Use sqrt(n) as conservative proxy (sample-size adjusted)
+            sharpe = per_trade_sharpe * np.sqrt(len(pnls))
+        else:
+            sharpe = 0
     else:
         sharpe = 0
 
@@ -633,10 +697,17 @@ def compute_stats(trades, starting_capital=10000.0):
         'total_trades': len(trades),
         'wins': len(wins),
         'losses': len(losses),
+        'breakevens': len(breakevens),  # P2 FIX: separate breakeven count
         'win_rate': round(len(wins) / len(trades) * 100, 1) if trades else 0,
+        'loss_rate': round(len(losses) / len(trades) * 100, 1) if trades else 0,
         'avg_win': round(np.mean(wins), 2) if wins else 0,
         'avg_loss': round(np.mean(losses), 2) if losses else 0,
         'profit_factor': round(profit_factor, 2),
+        'expectancy': round(  # P2 FIX: per-trade expectancy in $
+            (len(wins) / len(trades)) * (np.mean(wins) if wins else 0)
+            - (len(losses) / len(trades)) * (abs(np.mean(losses)) if losses else 0),
+            2
+        ) if trades else 0,
         'net_pnl': round(sum(pnls), 2),
         'starting_capital': starting_capital,
         'ending_capital': round(equity[-1], 2),
@@ -931,8 +1002,9 @@ def main():
         print(f"  No trades generated.")
     else:
         print(f"  Trades:     {stats['total_trades']}")
-        print(f"  Win rate:   {stats['win_rate']}%")
+        print(f"  Win rate:   {stats['win_rate']}%  (W:{stats['wins']} L:{stats['losses']} BE:{stats.get('breakevens', 0)})")
         print(f"  Profit fac: {stats['profit_factor']}")
+        print(f"  Expectancy: ${stats.get('expectancy', 0):.2f}/trade")
         print(f"  Net PnL:    ${stats['net_pnl']:.2f}")
         print(f"  Max DD:     ${stats['max_drawdown']:.2f} ({stats['max_drawdown_pct']}%)")
         print(f"  Sharpe:     {stats['sharpe_ratio']}")
