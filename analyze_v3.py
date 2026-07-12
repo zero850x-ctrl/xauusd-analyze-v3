@@ -77,13 +77,17 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
     ALIGNED counter-trend + NOT danger hour + has TP + priority≤2 (breakout) or ≤3 (pullback/boundary/fib)
   - JSON also includes time_quality (session), counter_trend_severity, recommended_volume
 
-🚫 DISCIPLINE GUARDS (based on 5-trade mentor review 2026-07-10)
+🚫 DISCIPLINE GUARDS (based on 15-trade / 3-account mentor review 2026-07-10)
   - Danger hour block: 17:00 broker-local → cron_push_eligible = false (19% win rate)
-  - TP mandatory: no TP1 → cron_push_eligible = false (80% of mentor losses had no TP)
+  - TP mandatory: no TP1 → cron_push_eligible = false (100% of 15 trades had no TP!)
+  - SL mandatory: no SL → cron_push_eligible = false (Account C Trade 3: no SL = -51.74)
   - Min holding: paper_trade.py enforces 15-min minimum (scalping <5min = 29% win)
-  - Cooldown: 15-min lockout after any trade close (prevents 16-second revenge entry)
+  - Cooldown: 15-min lockout after trade close (prevents 16-sec / 25-sec revenge entry)
   - Anti-martingale: paper_trade.py blocks volume increase after consecutive losses
+  - Anti-stacking: paper_trade.py blocks new trade when LIVE position exists
   - SL floor: paper_trade.py rejects SL < 0.5×ATR (too tight = noise stop-out)
+  - Direction bias: counter_trend_severity == ALIGNED prevents all-counter-trend days
+    (Account C: 5 BUYs on bearish day = -115.14)
 
 Data sources: TradingView (OANDA:XAUUSD M30/H1/M15) + Yahoo Finance (GC=F daily)
 
@@ -1903,6 +1907,7 @@ def cron_push_eligible(setup):
     - counter_trend_severity == ALIGNED
     - NOT in danger hour (17:00 broker-local, 19% historical win rate)
     - Has TP targets (tp1 > 0) — no naked trades
+    - Has SL (stop_loss > 0) — no naked positions (Account C: no SL = -51.74)
     - breakout: priority ≤ 2; pullback/boundary/fib: priority ≤ 3
     """
     if not setup.get('kline_confirmed'):
@@ -1917,6 +1922,10 @@ def cron_push_eligible(setup):
     # Must have TP targets — no naked entries
     tp1_str = str(setup.get('tp1', ''))
     if not tp1_str or tp1_str == '0' or '$0' in tp1_str:
+        return False
+    # Must have SL — no naked positions (Account C Trade 3: no SL = -51.74)
+    sl_str = str(setup.get('stop_loss', ''))
+    if not sl_str or sl_str == '0' or '$0' in sl_str:
         return False
     priority = setup.get('priority', 99)
     entry_mode = setup.get('entry_mode', 'breakout')
