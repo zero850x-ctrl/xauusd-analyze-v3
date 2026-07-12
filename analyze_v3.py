@@ -74,8 +74,16 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - default → ~/.hermes/reports/xauusd_v3_<date>.md (full report with M15 section)
   - Designed to feed paper_trade.py for simulated execution
   - cron_push_eligible on each setup (JSON): kline confirmed + OK/GOOD quality +
-    ALIGNED counter-trend + priority≤2 (breakout) or ≤3 (pullback/boundary/fib)
+    ALIGNED counter-trend + NOT danger hour + has TP + priority≤2 (breakout) or ≤3 (pullback/boundary/fib)
   - JSON also includes time_quality (session), counter_trend_severity, recommended_volume
+
+🚫 DISCIPLINE GUARDS (based on 5-trade mentor review 2026-07-10)
+  - Danger hour block: 17:00 broker-local → cron_push_eligible = false (19% win rate)
+  - TP mandatory: no TP1 → cron_push_eligible = false (80% of mentor losses had no TP)
+  - Min holding: paper_trade.py enforces 15-min minimum (scalping <5min = 29% win)
+  - Cooldown: 15-min lockout after any trade close (prevents 16-second revenge entry)
+  - Anti-martingale: paper_trade.py blocks volume increase after consecutive losses
+  - SL floor: paper_trade.py rejects SL < 0.5×ATR (too tight = noise stop-out)
 
 Data sources: TradingView (OANDA:XAUUSD M30/H1/M15) + Yahoo Finance (GC=F daily)
 
@@ -1893,6 +1901,8 @@ def cron_push_eligible(setup):
     - kline_confirmed
     - quality in (OK, GOOD)
     - counter_trend_severity == ALIGNED
+    - NOT in danger hour (17:00 broker-local, 19% historical win rate)
+    - Has TP targets (tp1 > 0) — no naked trades
     - breakout: priority ≤ 2; pullback/boundary/fib: priority ≤ 3
     """
     if not setup.get('kline_confirmed'):
@@ -1900,6 +1910,13 @@ def cron_push_eligible(setup):
     if setup.get('quality') not in ('OK', 'GOOD'):
         return False
     if setup.get('counter_trend_severity') != 'ALIGNED':
+        return False
+    # Danger hour block (19% win rate historically)
+    if setup.get('time_quality') == 'danger':
+        return False
+    # Must have TP targets — no naked entries
+    tp1_str = str(setup.get('tp1', ''))
+    if not tp1_str or tp1_str == '0' or '$0' in tp1_str:
         return False
     priority = setup.get('priority', 99)
     entry_mode = setup.get('entry_mode', 'breakout')
