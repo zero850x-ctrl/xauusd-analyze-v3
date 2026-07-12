@@ -10,7 +10,7 @@ Methodology (mirrors analyze_v3.py):
   TP1:     0.618 Fib ext or 1:1 RR (whichever closer) — exit 1/3
   TP2:     0.618 Fib ext or 1:1 RR (whichever further) — exit 1/3
   TP3:     Trailing stop (2×ATR profit trigger, 1.5×ATR trail) — exit 1/3
-  Trend:   H1 + Daily alignment → full position (0.03); misaligned → half (0.01)
+  Trend:   H1 + Daily alignment → position via _volume_risk_tier (0.02/0.01/0.005)
 
 Usage:
   python3 backtest.py                    # default: 60-day backtest (M30)
@@ -43,6 +43,8 @@ from analyze_v3 import (
     analyze_h1_trend,
     generate_trade_setups,
     aligned_with_trends,
+    counter_trend_severity,
+    _volume_risk_tier,
     pattern_stop_swing,
     pattern_add_level,
     _compute_tp1,
@@ -409,15 +411,20 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
         elif 'Fib' in tp1_str:
             tp1_method = '0.618 Fib'
 
-        # Position size based on alignment
-        aligned_str = s.get('daily_alignment', '')
-        aligned = '✅' in aligned_str and '⚠️' not in aligned_str
-        # More robust: check note field
-        note = s.get('note', '')
-        if '半倉' in note or '逆勢' in note:
-            aligned = False
-
-        position_size = POS_FULL if aligned else POS_HALF
+        # Position size — mirror analyze_v3 _volume_risk_tier when metadata absent
+        if 'recommended_volume' in s:
+            position_size = s['recommended_volume']
+        else:
+            trend_side = 'BULLISH' if is_buy else 'BEARISH'
+            severity = counter_trend_severity(trend_side, daily_trend, h1_trend)
+            position_size = _volume_risk_tier(severity)[0]
+        aligned = s.get('counter_trend_severity', '') == 'ALIGNED'
+        if not aligned and 'counter_trend_severity' not in s:
+            aligned_str = s.get('daily_alignment', '')
+            aligned = '✅' in aligned_str and '⚠️' not in aligned_str
+            note = s.get('note', '')
+            if '半倉' in note or '逆勢' in note:
+                aligned = False
 
         # Confidence
         confidence = s.get('confidence', 'MEDIUM')
@@ -482,7 +489,7 @@ def run_backtest(df_bars, df_day, verbose=False):
     daily_trend_cache = {}
 
     print(f"\n[*] Starting backtest: {total_bars} bars, warmup={WARMUP_BARS}")
-    print(f"    Position sizes: full={POS_FULL} (aligned), half={POS_HALF} (counter-trend)")
+    print(f"    Position sizes: via _volume_risk_tier (aligned≈0.02, mild=0.01, severe=0.005)")
     print(f"    Contract multiplier: ${CONTRACT_MULTIPLIER}/$1 per 1.0 lot")
     print()
 

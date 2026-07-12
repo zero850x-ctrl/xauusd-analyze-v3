@@ -54,18 +54,20 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
     TRAIL_STOP_ATR trail)
 
 ⚖️ QUALITY / PRIORITY
-  - R:R quality tiers: ≥2.0 → GOOD, ≥1.0 → OK, <1.0 → POOR_RR
-  - Priority 1-6 (1=best): broken+aligned+GOOD=1, broken+aligned+OK=2,
-    broken+counter-trend=2, aligned waiting=3, not aligned=4,
-    POOR_RR/UNCONFIRMED=5, SEVERE counter-trend=6
-  - UNCONFIRMED downgrade: broken but no retest/volume confirmation
+  - R:R quality tiers: ≥2.0 → GOOD, ≥1.0 → OK, <1.0 → POOR_RR (threshold 1.0 since Jul 2026)
+  - Quality uses max(TP1 R:R, TP2 R:R) — TP1 alone is capped at ~1:1 by design
+  - Priority 1-6 (1=best, SEVERE checked first):
+    1 broken+aligned+GOOD | 2 broken+aligned+OK | 3 aligned waiting
+    4 MILD counter-trend (waiting or broken) | 5 POOR_RR/UNCONFIRMED | 6 SEVERE
+  - UNCONFIRMED: broken OK/GOOD without retest/volume — Channel/Wedge/Flag/Triangle/Double
+  - Setup generation keeps top MAX_PATTERNS_PER_DIRECTION (2) patterns per side before ranking
 
 🚪 ENTRY MODES
   - breakout: wait for price to cross trigger level
   - pullback: enter at current price inside flag/wedge consolidation
     (tighter SL, requires consolidation quality gate)
   - boundary: limit order at double top/bottom or wedge boundary
-    (double: HIGH confidence; wedge: MEDIUM+; skip duplicate breakout-wait setup)
+    (double: HIGH confidence; wedge: MEDIUM+; emits boundary then skips breakout+pullback)
 
 📡 OUTPUT
   - --json → ~/.hermes/reports/xauusd_v3_<date>.json (setups, patterns, candles)
@@ -73,6 +75,7 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - Designed to feed paper_trade.py for simulated execution
   - cron_push_eligible on each setup (JSON): kline confirmed + OK/GOOD quality +
     ALIGNED counter-trend + priority≤2 (breakout) or ≤3 (pullback/boundary/fib)
+  - JSON also includes time_quality (session), counter_trend_severity, recommended_volume
 
 Data sources: TradingView (OANDA:XAUUSD M30/H1/M15) + Yahoo Finance (GC=F daily)
 
@@ -82,7 +85,7 @@ Architecture: fetch_data → add_indicators → find_swings → detect patterns
 """
 
 import os, json, argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -249,6 +252,13 @@ def _pattern_retest_levels(pattern, direction):
             resistance = level
         elif direction == 'BEARISH' and support is None:
             support = level
+    ptype = pattern.get('type', '')
+    if ('Double' in ptype or '雙' in ptype) and 'neckline' in pattern:
+        neckline = pattern['neckline']
+        if direction == 'BEARISH' and support is None:
+            support = neckline
+        elif direction == 'BULLISH' and resistance is None:
+            resistance = neckline
     return support, resistance
 
 
@@ -272,9 +282,10 @@ def _breakout_volume_confirmed(pattern, df):
 
 
 def _pattern_breakout_confirmed(pattern):
-    """True when retest/volume gate passed; N/A patterns default to confirmed."""
+    """True when retest/volume gate passed for gated pattern types."""
     p_type = pattern.get('type', '')
-    if not any(ft in p_type for ft in ('Channel', 'Wedge', 'Flag')):
+    gated = ('Channel', 'Wedge', 'Flag', 'Triangle', 'Double', '雙')
+    if not any(ft in p_type for ft in gated):
         return True
     if 'retest_confirmed' not in pattern and 'vol_breakout_confirmed' not in pattern:
         return True
@@ -1312,8 +1323,8 @@ def detect_all_patterns(df, points, atr=None):
     conf_order = {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}
     all_patterns.sort(key=lambda p: conf_order.get(p.get('confidence', 'LOW'), 2))
 
-    # Breakout + retest / volume confirmation for Channels/Wedges/Flags
-    _false_breakout_types = {'Channel', 'Wedge', 'Flag'}
+    # Breakout + retest / volume confirmation for major pattern types
+    _false_breakout_types = {'Channel', 'Wedge', 'Flag', 'Triangle', 'Double', '雙'}
     for p in all_patterns:
         p_type = p.get('type', '')
         if not any(ft in p_type for ft in _false_breakout_types):
@@ -1831,7 +1842,7 @@ def candlestick_confirmation(candle_patterns, direction, lookback_bars=5, last_b
     if last_bar_idx is None:
         last_bar_idx = max(p['bar_index'] for p in candle_patterns)
 
-    recent = [p for p in candle_patterns if p['bar_index'] >= last_bar_idx - lookback_bars]
+    recent = [p for p in candle_patterns if p['bar_index'] >= last_bar_idx - lookback_bars + 1]
 
     score = 0
     confirming = []
@@ -1898,13 +1909,15 @@ def cron_push_eligible(setup):
 
 
 def _inject_push_metadata(setups, daily_trend, h1_trend):
-    """Attach counter-trend severity, recommended volume, and cron gate to setups."""
+    """Attach counter-trend severity, recommended volume, time quality, and cron gate."""
+    tq_level, _ = _time_quality_score()
     for s in setups:
         side = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
         severity = counter_trend_severity(side, daily_trend, h1_trend)
         vol, _ = _volume_risk_tier(severity)
         s['counter_trend_severity'] = severity
         s['recommended_volume'] = vol
+        s['time_quality'] = tq_level
         s['cron_push_eligible'] = cron_push_eligible(s)
 
 
@@ -2032,22 +2045,25 @@ def aligned_with_trends(side, daily_trend, h1_trend):
 
 def counter_trend_severity(side, daily_trend, h1_trend):
     """Classify counter-trend severity: 'ALIGNED', 'MILD', 'SEVERE'.
-    SEVERE = daily AND h1 both opposite → strong discouragement.
-    MILD = only one TF opposite, other neutral → caution.
-    ALIGNED = both TFs aligned or neutral."""
+
+    ALIGNED — matches aligned_with_trends(), or daily NEUTRAL with supportive H1.
+    SEVERE — daily AND H1 both opposite.
+    MILD — exactly one TF opposite (daily neutral alone is not MILD).
+    """
+    if aligned_with_trends(side, daily_trend, h1_trend):
+        return 'ALIGNED'
     h1 = (h1_trend or {}).get('trend', 'NEUTRAL')
+    daily = daily_trend['trend']
     if side == 'BEARISH':
-        daily_ok = daily_trend['trend'] == 'BEARISH'
-        h1_ok = h1 in ('BEARISH', 'NEUTRAL')
-        daily_opp = daily_trend['trend'] == 'BULLISH'
+        if daily == 'NEUTRAL' and h1 in ('BEARISH', 'NEUTRAL'):
+            return 'ALIGNED'
+        daily_opp = daily == 'BULLISH'
         h1_opp = h1 == 'BULLISH'
     else:
-        daily_ok = daily_trend['trend'] == 'BULLISH'
-        h1_ok = h1 in ('BULLISH', 'NEUTRAL')
-        daily_opp = daily_trend['trend'] == 'BEARISH'
+        if daily == 'NEUTRAL' and h1 in ('BULLISH', 'NEUTRAL'):
+            return 'ALIGNED'
+        daily_opp = daily == 'BEARISH'
         h1_opp = h1 == 'BEARISH'
-    if daily_ok and h1_ok:
-        return 'ALIGNED'
     if daily_opp and h1_opp:
         return 'SEVERE'
     return 'MILD'
@@ -2071,10 +2087,20 @@ def _counter_trend_note(side, daily_trend, h1_trend, prefix=''):
 # Key findings encoded below as advisory functions.
 # ═══════════════════════════════════════════════════════════
 
-# Broker timezone = UTC-3. Hours below are broker-local.
+# Broker timezone offset from UTC (hours). Override via BROKER_UTC_OFFSET_HOURS env.
+BROKER_UTC_OFFSET_HOURS = int(os.environ.get('BROKER_UTC_OFFSET_HOURS', '-3'))
+MAX_PATTERNS_PER_DIRECTION = 2  # top-N patterns per side before setup generation
+
+# Broker-local hours below (UTC + offset).
 GOLDEN_HOURS = {1, 9}       # 01:00 +$174.60 (7t), 09:00 +$78.30 (8t)
 DANGER_HOURS = {17}          # 17:00 -$173.09 (16t)
 MAX_DAILY_TRADES = 8         # Overtrading threshold (123 trades/week = ~17/day avg)
+
+
+def _broker_hour():
+    """Current hour in broker-local time (UTC + BROKER_UTC_OFFSET_HOURS)."""
+    utc = datetime.now(timezone.utc)
+    return (utc.hour + BROKER_UTC_OFFSET_HOURS) % 24
 
 
 def _time_quality_score():
@@ -2087,8 +2113,7 @@ def _time_quality_score():
 
     Returns: ('golden'|'danger'|'normal', advisory_text)
     """
-    now_utc = datetime.utcnow()
-    broker_hour = (now_utc.hour - 3) % 24  # UTC-3
+    broker_hour = _broker_hour()
 
     if broker_hour in GOLDEN_HOURS:
         return ('golden', '🌅 黃金時段 (歷史勝率 60%, +$252/週) — 適合入場')
@@ -2126,7 +2151,7 @@ def _volume_risk_tier(severity='ALIGNED', vol=0.02):
     - 0.10 trades: 0% win (3 trades, all losses, -$75)
 
     Combined with counter-trend severity:
-    ALIGNED: 0.03 base, 0.05 if golden hour
+    ALIGNED: 0.02 base, 0.03 if golden hour
     MILD: 0.01 (half)
     SEVERE: 0.005 (quarter) + 🚫
     """
@@ -2152,10 +2177,10 @@ def setup_priority(side, already_broken, daily_trend, h1_trend, quality):
         return 1
     if already_broken and aligned and quality == 'OK':
         return 2
-    if already_broken and quality in ('GOOD', 'OK'):
-        return 2
     if aligned:
         return 3
+    if already_broken and quality in ('GOOD', 'OK'):
+        return 4  # MILD counter-trend broken — below aligned waiting (3)
     return 4
 
 
@@ -2227,7 +2252,7 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
     """Build 0.618 Fib fallback setup through shared quality/priority pipeline."""
     rr_tp1 = abs(entry_level - tp1) / risk if side == 'BEARISH' else abs(tp1 - entry_level) / risk
     rr_tp2 = abs(entry_level - tp2) / risk if side == 'BEARISH' else abs(tp2 - entry_level) / risk
-    quality = _quality_from_rr(rr_tp1)
+    quality = _quality_from_rr(rr_tp1, rr_tp2)
     aligned = aligned_with_trends(side, daily_trend, h1_trend)
     severity = counter_trend_severity(side, daily_trend, h1_trend)
 
@@ -2283,9 +2308,15 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
 
 def _entry_status_bearish(already_broken, aligned, quality, entry_mode='breakout', severity='ALIGNED'):
     if entry_mode == 'pullback':
+        if severity == 'SEVERE':
+            return '🚫 反彈入場 (日線+H1逆勢!)'
         return '🎯 反彈入場 (待突破)'
     if entry_mode == 'boundary':
+        if severity == 'SEVERE':
+            return '🚫 邊界沽出 (日線+H1逆勢!)'
         return '📍 邊界沽出 (限價入場)'
+    if severity == 'SEVERE':
+        return '🚫 已觸發 (日線+H1逆勢!)' if already_broken else '🚫 等待跌穿 (日線+H1逆勢!)'
     if already_broken and quality == 'UNCONFIRMED':
         return '⚠️ 已觸發 (未確認突破)'
     if already_broken and aligned and quality == 'GOOD':
@@ -2295,19 +2326,25 @@ def _entry_status_bearish(already_broken, aligned, quality, entry_mode='breakout
     if already_broken and quality == 'POOR_RR':
         return '⚠️ 已觸發 (R:R低)'
     if already_broken:
-        return '🚫 已觸發 (日線+H1逆勢!)' if severity == 'SEVERE' else '⚠️ 已觸發 (逆勢!)'
+        return '⚠️ 已觸發 (逆勢!)'
     if not aligned:
-        return '🚫 等待跌穿 (日線+H1逆勢!)' if severity == 'SEVERE' else '⏳ 等待跌穿 (逆勢⚠️)'
+        return '⏳ 等待跌穿 (逆勢⚠️)'
     return '⏳ 等待跌穿'
 
 
 def _entry_status_bullish(already_broken, aligned, quality, entry_mode='breakout', severity='ALIGNED'):
     if entry_mode == 'pullback':
+        if severity == 'SEVERE':
+            return '🚫 回撤入場 (日線+H1逆勢!)'
         return '🎯 回撤入場 (待突破)'
     if entry_mode == 'boundary':
+        if severity == 'SEVERE':
+            return '🚫 邊界買入 (日線+H1逆勢!)'
         return '📍 邊界買入 (限價入場)'
+    if severity == 'SEVERE':
+        return '🚫 已突破 (日線+H1逆勢!)' if already_broken else '🚫 等待突破 (日線+H1逆勢!)'
     if not already_broken:
-        return '🚫 等待突破 (日線+H1逆勢!)' if severity == 'SEVERE' else ('⏳ 等待突破 (逆勢⚠️)' if not aligned else '⏳ 等待突破')
+        return '⏳ 等待突破 (逆勢⚠️)' if not aligned else '⏳ 等待突破'
     if quality == 'UNCONFIRMED':
         return '⚠️ 已突破 (未確認)'
     if quality == 'GOOD' and aligned:
@@ -2316,7 +2353,7 @@ def _entry_status_bullish(already_broken, aligned, quality, entry_mode='breakout
         return '✅ 已突破 (順勢)'
     if quality == 'POOR_RR':
         return '⚠️ 已突破 (R:R低)'
-    return '🚫 已突破 (日線+H1逆勢!)' if severity == 'SEVERE' else '⚠️ 已突破 (逆勢!)'
+    return '⚠️ 已突破 (逆勢!)'
 
 
 def daily_alignment_str(expected_trend, daily_trend, h1_trend=None):
@@ -2332,12 +2369,14 @@ def daily_alignment_str(expected_trend, daily_trend, h1_trend=None):
     return f"\u65e5\u7dda{chk if d_ok else wrn} H1{chk if h_ok else wrn}"
 
 
-def _quality_from_rr(rr_tp1):
-    """R:R quality tiers shared by breakout and pullback setups.
-    ≥2.0 → GOOD, ≥1.0 → OK, <1.0 → POOR_RR"""
-    if rr_tp1 < 1.0:
+def _quality_from_rr(rr_tp1, rr_tp2=None):
+    """R:R quality tiers — uses best of TP1/TP2 R:R (TP1 alone is often capped at 1:1).
+
+    ≥2.0 → GOOD, ≥1.0 → OK, <1.0 → POOR_RR (threshold 1.0 since Jul 2026)."""
+    rr = max(rr_tp1, rr_tp2 if rr_tp2 is not None else rr_tp1)
+    if rr < 1.0:
         return 'POOR_RR'
-    if rr_tp1 >= 2.0:
+    if rr >= 2.0:
         return 'GOOD'
     return 'OK'
 
@@ -2509,11 +2548,11 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
     bearish_p = sorted(
         [p for p in patterns if p['direction'] == 'BEARISH'],
         key=_pattern_setup_order,
-    )[:2]
+    )[:MAX_PATTERNS_PER_DIRECTION]
     bullish_p = sorted(
         [p for p in patterns if p['direction'] == 'BULLISH'],
         key=_pattern_setup_order,
-    )[:2]
+    )[:MAX_PATTERNS_PER_DIRECTION]
 
     seen_trigger_keys = set()
     tp3_trail = trail_stop_text(atr)
@@ -2551,7 +2590,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                     bd_tp2 = min(bd_fib_tp, bd_rr_tp)
                     bd_rr1 = abs(bd_entry - bd_tp1) / bd_risk
                     bd_rr2 = abs(bd_entry - bd_tp2) / bd_risk
-                    bd_quality = _quality_from_rr(bd_rr1)
+                    bd_quality = _quality_from_rr(bd_rr1, bd_rr2)
                     if 'Double' in pattern.get('type', ''):
                         bd_sl_rationale = f"雙頂頂部 ${bd_entry:.0f} + 0.5 ATR"
                     elif 'Wedge' in pattern.get('type', ''):
@@ -2625,7 +2664,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         rr_tp1 = abs(actual_entry - tp1) / risk
         rr_tp2 = abs(actual_entry - tp2) / risk
 
-        quality = _quality_from_rr(rr_tp1)
+        quality = _quality_from_rr(rr_tp1, rr_tp2)
         # UNCONFIRMED: breakout triggered but not confirmed by retest/volume
         if quality in ('OK', 'GOOD') and already_broken and not _pattern_breakout_confirmed(pattern):
             quality = 'UNCONFIRMED'
@@ -2708,7 +2747,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                             pb_tp2 = min(pb_fib_tp, pb_rr_tp)
                             pb_rr1 = abs(pb_entry - pb_tp1) / pb_risk
                             pb_rr2 = abs(pb_entry - pb_tp2) / pb_risk
-                            pb_quality = _quality_from_rr(pb_rr1)
+                            pb_quality = _quality_from_rr(pb_rr1, pb_rr2)
 
                             pb_stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (flag_high ${flag_high:.1f} + 0.5 ATR)"
                             if 'resistance' in pattern and is_wedge:
@@ -2773,7 +2812,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                     bd_tp2 = max(bd_fib_tp, bd_rr_tp)
                     bd_rr1 = abs(bd_tp1 - bd_entry) / bd_risk
                     bd_rr2 = abs(bd_tp2 - bd_entry) / bd_risk
-                    bd_quality = _quality_from_rr(bd_rr1)
+                    bd_quality = _quality_from_rr(bd_rr1, bd_rr2)
 
                     if 'Double' in pattern.get('type', ''):
                         bd_sl_rationale = f"雙底底部 ${bd_entry:.0f} - 0.5 ATR"
@@ -2842,7 +2881,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         rr_tp1 = abs(tp1 - actual_entry) / risk
         rr_tp2 = abs(tp2 - actual_entry) / risk
 
-        quality = _quality_from_rr(rr_tp1)
+        quality = _quality_from_rr(rr_tp1, rr_tp2)
         # UNCONFIRMED: breakout triggered but not confirmed by retest/volume
         if quality in ('OK', 'GOOD') and already_broken and not _pattern_breakout_confirmed(pattern):
             quality = 'UNCONFIRMED'
@@ -2923,7 +2962,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                             pb_tp2 = max(pb_fib_tp, pb_rr_tp)
                             pb_rr1 = abs(pb_tp1 - pb_entry) / pb_risk
                             pb_rr2 = abs(pb_tp2 - pb_entry) / pb_risk
-                            pb_quality = _quality_from_rr(pb_rr1)
+                            pb_quality = _quality_from_rr(pb_rr1, pb_rr2)
 
                             pb_stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (flag_low ${flag_low:.1f} - 0.5 ATR)"
                             if 'support' in pattern and is_wedge:
@@ -3456,7 +3495,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 > ⚠️ **免責聲明:** AI 自動分析 v3，僅供學習參考。交易有風險，入市需謹慎。  
 > 📡 數據源: {_data_source_label()} | 形態辨識: 三角形/旗形/雙頂底/楔形/通道
 
-*生成: {datetime.now().strftime('%Y-%m-%d %H:%M')} UTC*
+*生成: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC*
 """
     return report
 
@@ -3554,6 +3593,7 @@ def main():
     _log(f"\n[OK] Report: {output_path}")
     
     if args.json:
+        tq_level, tq_advice = _time_quality_score()
         json_out = {
             'date': today,
             'price': current,
@@ -3563,6 +3603,11 @@ def main():
             'atr_30m': round(atr, 2),
             'daily_trend': daily_trend,
             'h1_trend': h1_trend,
+            'time_quality': {
+                'level': tq_level,
+                'advice': tq_advice,
+                'broker_utc_offset_hours': BROKER_UTC_OFFSET_HOURS,
+            },
             'patterns': patterns,
             'candlestick_m30': candle_m30,
             'candlestick_daily': candle_day,
