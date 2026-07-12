@@ -31,7 +31,7 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - Engulfing, Morning/Evening Star, Hammer/Shooting Star, Harami,
     Three White Soldiers / Three Black Crows, etc.
   - Scoring: +2 HIGH, +1 MEDIUM, opposing subtracts
-  - K-line confirmation: M30 score + Daily score ≥ 2 → confirmed
+  - K-line confirmation: total ≥ 2 AND m30_score ≥ 0 AND day_score ≥ 0
 
 🛡️ ENTRY FILTERS (3-layer)
   - _retest_confirm() → post-breakout retest of support/resistance
@@ -71,6 +71,8 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - --json → ~/.hermes/reports/xauusd_v3_<date>.json (setups, patterns, candles)
   - default → ~/.hermes/reports/xauusd_v3_<date>.md (full report with M15 section)
   - Designed to feed paper_trade.py for simulated execution
+  - cron_push_eligible on each setup (JSON): kline confirmed + OK/GOOD quality +
+    ALIGNED counter-trend + priority≤2 (breakout) or ≤3 (pullback/boundary/fib)
 
 Data sources: TradingView (OANDA:XAUUSD M30/H1/M15) + Yahoo Finance (GC=F daily)
 
@@ -1870,6 +1872,42 @@ def _inject_kline_scores(setups, candle_m30, candle_day, last_m30_idx, last_day_
         s['kline_opposing'] = [cp['name'] for cp in (m30_opp + day_opp)]
 
 
+def cron_push_eligible(setup):
+    """Whether a setup qualifies for automated cron/Hermes push.
+
+    Replaces the legacy prompt rule (priority≤2 ∧ kline ∧ quality≠POOR_RR) which
+    admitted MILD counter-trend breakouts and excluded pullback/boundary entries.
+
+    All conditions required:
+    - kline_confirmed
+    - quality in (OK, GOOD)
+    - counter_trend_severity == ALIGNED
+    - breakout: priority ≤ 2; pullback/boundary/fib: priority ≤ 3
+    """
+    if not setup.get('kline_confirmed'):
+        return False
+    if setup.get('quality') not in ('OK', 'GOOD'):
+        return False
+    if setup.get('counter_trend_severity') != 'ALIGNED':
+        return False
+    priority = setup.get('priority', 99)
+    entry_mode = setup.get('entry_mode', 'breakout')
+    if entry_mode in ('pullback', 'boundary', 'fib'):
+        return priority <= 3
+    return priority <= 2
+
+
+def _inject_push_metadata(setups, daily_trend, h1_trend):
+    """Attach counter-trend severity, recommended volume, and cron gate to setups."""
+    for s in setups:
+        side = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
+        severity = counter_trend_severity(side, daily_trend, h1_trend)
+        vol, _ = _volume_risk_tier(severity)
+        s['counter_trend_severity'] = severity
+        s['recommended_volume'] = vol
+        s['cron_push_eligible'] = cron_push_eligible(s)
+
+
 # ═══════════════════════════════════════════════════════════
 # FIBONACCI (proper extension calculation)
 # ═══════════════════════════════════════════════════════════
@@ -2182,6 +2220,65 @@ def pattern_add_level(pattern, side, points, trigger_level):
     if candidates:
         return candidates[0]
     return pattern.get('resistance', trigger_level)
+
+
+def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp3_trail,
+                              daily_trend, h1_trend, atr):
+    """Build 0.618 Fib fallback setup through shared quality/priority pipeline."""
+    rr_tp1 = abs(entry_level - tp1) / risk if side == 'BEARISH' else abs(tp1 - entry_level) / risk
+    rr_tp2 = abs(entry_level - tp2) / risk if side == 'BEARISH' else abs(tp2 - entry_level) / risk
+    quality = _quality_from_rr(rr_tp1)
+    aligned = aligned_with_trends(side, daily_trend, h1_trend)
+    severity = counter_trend_severity(side, daily_trend, h1_trend)
+
+    if side == 'BEARISH':
+        swing_label = f"前頂 ${fib['swing_start']:.0f}"
+        return {
+            'direction': '🔴 SELL',
+            'priority': setup_priority(side, False, daily_trend, h1_trend, quality),
+            'pattern': f"0.618 Fib 回調 (${fib['swing_start']:.0f}→${fib['swing_end']:.0f})",
+            'confidence': 'MEDIUM',
+            'quality': quality,
+            'entry_mode': 'fib',
+            'entry_status': _entry_status_bearish(False, aligned, quality, 'breakout', severity),
+            'entry_zone': f"${entry_level:.0f} - ${entry_level + atr:.0f}",
+            'entry_trigger': f"跌破 0.618 Fib (${entry_level:.0f})",
+            'add_position': '-',
+            'stop_loss': f"${stop_level:.0f}",
+            'stop_rationale': f"{swing_label} + 1 ATR",
+            'tp1': f"${tp1:.0f} (0.618 RR, 止賺 1/3)",
+            'tp2': f"${tp2:.0f} (1:1 RR, 止賺 1/3)",
+            'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+            'risk_amount': round(risk, 1),
+            'rr_tp1': round(rr_tp1, 1),
+            'rr_tp2': round(rr_tp2, 1),
+            'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
+            'note': '' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='Fib'),
+        }
+
+    swing_label = f"前底 ${fib['swing_end']:.0f}"
+    return {
+        'direction': '🟢 BUY',
+        'priority': setup_priority(side, False, daily_trend, h1_trend, quality),
+        'pattern': f"0.618 Fib 回調 (${fib['swing_start']:.0f}→${fib['swing_end']:.0f})",
+        'confidence': 'MEDIUM',
+        'quality': quality,
+        'entry_mode': 'fib',
+        'entry_status': _entry_status_bullish(False, aligned, quality, 'breakout', severity),
+        'entry_zone': f"${entry_level - atr:.0f} - ${entry_level:.0f}",
+        'entry_trigger': f"突破 0.618 Fib (${entry_level:.0f})",
+        'add_position': '-',
+        'stop_loss': f"${stop_level:.0f}",
+        'stop_rationale': f"{swing_label} - 1 ATR",
+        'tp1': f"${tp1:.0f} (0.618 RR, 止賺 1/3)",
+        'tp2': f"${tp2:.0f} (1:1 RR, 止賺 1/3)",
+        'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+        'risk_amount': round(risk, 1),
+        'rr_tp1': round(rr_tp1, 1),
+        'rr_tp2': round(rr_tp2, 1),
+        'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
+        'note': '' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='Fib'),
+    }
 
 
 def _entry_status_bearish(already_broken, aligned, quality, entry_mode='breakout', severity='ALIGNED'):
@@ -2873,26 +2970,10 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         if risk > 0:
                             tp1 = entry_level - risk * 0.618
                             tp2 = entry_level - risk
-                            setups.append({
-                                'direction': '🔴 SELL',
-                                'priority': 3,
-                                'pattern': f"0.618 Fib 回調 (${fib['swing_start']:.0f}→${fib['swing_end']:.0f})",
-                                'confidence': 'MEDIUM',
-                                'quality': 'OK',
-                                'entry_status': '⏳ 等待跌破 0.618',
-                                'entry_zone': f"${entry_level:.0f} - ${entry_level + atr:.0f}",
-                                'entry_trigger': f"跌破 0.618 Fib (${entry_level:.0f})",
-                                'add_position': '-',
-                                'stop_loss': f"${stop_level:.0f}",
-                                'stop_rationale': f"前頂 ${swing_high:.0f} + 1 ATR",
-                                'tp1': f"${tp1:.0f} (0.618 RR, 止賺 1/3)",
-                                'tp2': f"${tp2:.0f} (1:1 RR, 止賺 1/3)",
-                                'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
-                                'risk_amount': round(risk, 1),
-                                'rr_tp1': round(abs(entry_level - tp1) / risk, 1),
-                                'rr_tp2': 1.0,
-                                'daily_alignment': '✅ 順日線',
-                            })
+                            setups.append(_build_fib_fallback_setup(
+                                'BEARISH', fib, entry_level, stop_level, risk, tp1, tp2, tp3_trail,
+                                daily_trend, h1_trend, atr,
+                            ))
                     else:
                         swing_low = fib_end['price']
                         entry_level = fib['0.618']
@@ -2901,26 +2982,10 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         if risk > 0:
                             tp1 = entry_level + risk * 0.618
                             tp2 = entry_level + risk
-                            setups.append({
-                                'direction': '🟢 BUY',
-                                'priority': 3,
-                                'pattern': f"0.618 Fib 回調 (${fib['swing_start']:.0f}→${fib['swing_end']:.0f})",
-                                'confidence': 'MEDIUM',
-                                'quality': 'OK',
-                                'entry_status': '⏳ 等待突破 0.618',
-                                'entry_zone': f"${entry_level - atr:.0f} - ${entry_level:.0f}",
-                                'entry_trigger': f"突破 0.618 Fib (${entry_level:.0f})",
-                                'add_position': '-',
-                                'stop_loss': f"${stop_level:.0f}",
-                                'stop_rationale': f"前底 ${swing_low:.0f} - 1 ATR",
-                                'tp1': f"${tp1:.0f} (0.618 RR, 止賺 1/3)",
-                                'tp2': f"${tp2:.0f} (1:1 RR, 止賺 1/3)",
-                                'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
-                                'risk_amount': round(risk, 1),
-                                'rr_tp1': round(abs(tp1 - entry_level) / risk, 1),
-                                'rr_tp2': 1.0,
-                                'daily_alignment': '✅ 順日線',
-                            })
+                            setups.append(_build_fib_fallback_setup(
+                                'BULLISH', fib, entry_level, stop_level, risk, tp1, tp2, tp3_trail,
+                                daily_trend, h1_trend, atr,
+                            ))
 
     setups.sort(key=lambda s: (s['priority'], -s.get('rr_tp1', 0)))
     return setups
@@ -3468,6 +3533,7 @@ def main():
 
     # 7b. Inject K-line confirmation scores into setups (used by paper_trade + cron filtering)
     _inject_kline_scores(setups, candle_m30, candle_day, len(df_m30) - 1, len(df_day) - 1)
+    _inject_push_metadata(setups, daily_trend, h1_trend)
     
     # 8. Generate report
     report = generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend,
