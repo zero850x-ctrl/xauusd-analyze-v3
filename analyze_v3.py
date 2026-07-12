@@ -57,7 +57,7 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - R:R quality tiers: ≥2.0 → GOOD, ≥1.0 → OK, <1.0 → POOR_RR (threshold 1.0 since Jul 2026)
   - Quality uses max(TP1 R:R, TP2 R:R) — TP1 alone is capped at ~1:1 by design
   - Priority 1-6 (1=best, SEVERE checked first):
-    1 broken+aligned+GOOD | 2 broken+aligned+OK | 3 aligned waiting
+    1 broken+ALIGNED+GOOD | 2 broken+ALIGNED+OK | 3 ALIGNED waiting
     4 MILD counter-trend (waiting or broken) | 5 POOR_RR/UNCONFIRMED | 6 SEVERE
   - UNCONFIRMED: broken OK/GOOD without retest/volume — Channel/Wedge/Flag/Triangle/Double
   - Setup generation keeps top MAX_PATTERNS_PER_DIRECTION (2) patterns per side before ranking
@@ -293,15 +293,21 @@ def _breakout_volume_confirmed(pattern, df):
     return pattern.get('vol_confirm') is True
 
 
+GATED_BREAKOUT_PATTERN_TYPES = ('Channel', 'Wedge', 'Flag', 'Triangle', 'Double')
+
+
 def _pattern_breakout_confirmed(pattern):
     """True when retest/volume gate passed for gated pattern types."""
     p_type = pattern.get('type', '')
-    gated = ('Channel', 'Wedge', 'Flag', 'Triangle', 'Double', '雙')
+    gated = GATED_BREAKOUT_PATTERN_TYPES
     if not any(ft in p_type for ft in gated):
         return True
-    if 'retest_confirmed' not in pattern and 'vol_breakout_confirmed' not in pattern:
-        return True
-    return bool(pattern.get('retest_confirmed') or pattern.get('vol_breakout_confirmed'))
+    broke = pattern.get('broke_recently') or pattern.get('broken_now')
+    if broke:
+        if 'retest_confirmed' not in pattern and 'vol_breakout_confirmed' not in pattern:
+            return False
+        return bool(pattern.get('retest_confirmed') or pattern.get('vol_breakout_confirmed'))
+    return True
 
 
 def _volume_spike(df, idx=None, window=5, multiplier=1.3):
@@ -1336,7 +1342,7 @@ def detect_all_patterns(df, points, atr=None):
     all_patterns.sort(key=lambda p: conf_order.get(p.get('confidence', 'LOW'), 2))
 
     # Breakout + retest / volume confirmation for major pattern types
-    _false_breakout_types = {'Channel', 'Wedge', 'Flag', 'Triangle', 'Double', '雙'}
+    _false_breakout_types = GATED_BREAKOUT_PATTERN_TYPES
     for p in all_patterns:
         p_type = p.get('type', '')
         if not any(ft in p_type for ft in _false_breakout_types):
@@ -2062,6 +2068,22 @@ def _pattern_setup_order(pattern):
     return (unconfirmed, _pattern_confidence_order(pattern))
 
 
+def _triangle_breakout_tol(current_price):
+    """Tolerance band used in detect_triangles _breakout_status (tol_dollars * 0.5)."""
+    return max(current_price * 0.008, 15) * 0.5
+
+
+def _setup_breakout_triggered(side, current_price, level, pattern):
+    """Whether price has broken trigger level — matches _breakout_status for triangles."""
+    tol = 0.0
+    ptype = pattern.get('type', '')
+    if 'Triangle' in ptype or '三角' in ptype:
+        tol = _triangle_breakout_tol(current_price)
+    if side == 'BEARISH':
+        return current_price < level - tol
+    return current_price > level + tol
+
+
 def aligned_with_trends(side, daily_trend, h1_trend):
     h1 = (h1_trend or {}).get('trend', 'NEUTRAL')
     if side == 'BEARISH':
@@ -2193,8 +2215,8 @@ def _volume_risk_tier(severity='ALIGNED', vol=0.02):
 
 
 def setup_priority(side, already_broken, daily_trend, h1_trend, quality):
-    aligned = aligned_with_trends(side, daily_trend, h1_trend)
     severity = counter_trend_severity(side, daily_trend, h1_trend)
+    aligned = severity == 'ALIGNED'
     if severity == 'SEVERE':
         return 6  # Both daily + H1 against → lowest priority, strong discouragement
     if quality == 'UNCONFIRMED' or quality == 'POOR_RR':
@@ -2279,8 +2301,8 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
     rr_tp1 = abs(entry_level - tp1) / risk if side == 'BEARISH' else abs(tp1 - entry_level) / risk
     rr_tp2 = abs(entry_level - tp2) / risk if side == 'BEARISH' else abs(tp2 - entry_level) / risk
     quality = _quality_from_rr(rr_tp1, rr_tp2)
-    aligned = aligned_with_trends(side, daily_trend, h1_trend)
     severity = counter_trend_severity(side, daily_trend, h1_trend)
+    aligned = severity == 'ALIGNED'
 
     if side == 'BEARISH':
         swing_label = f"前頂 ${fib['swing_start']:.0f}"
@@ -2291,7 +2313,7 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
             'confidence': 'MEDIUM',
             'quality': quality,
             'entry_mode': 'fib',
-            'entry_status': _entry_status_bearish(False, aligned, quality, 'breakout', severity),
+            'entry_status': _entry_status_bearish(False, aligned, quality, 'fib', severity),
             'entry_zone': f"${entry_level:.0f} - ${entry_level + atr:.0f}",
             'entry_trigger': f"跌破 0.618 Fib (${entry_level:.0f})",
             'add_position': '-',
@@ -2307,7 +2329,7 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
             'note': '' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='Fib'),
         }
 
-    swing_label = f"前底 ${fib['swing_end']:.0f}"
+    swing_label = f"前底 ${fib['swing_start']:.0f}"
     return {
         'direction': '🟢 BUY',
         'priority': setup_priority(side, False, daily_trend, h1_trend, quality),
@@ -2315,7 +2337,7 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
         'confidence': 'MEDIUM',
         'quality': quality,
         'entry_mode': 'fib',
-        'entry_status': _entry_status_bullish(False, aligned, quality, 'breakout', severity),
+        'entry_status': _entry_status_bullish(False, aligned, quality, 'fib', severity),
         'entry_zone': f"${entry_level - atr:.0f} - ${entry_level:.0f}",
         'entry_trigger': f"突破 0.618 Fib (${entry_level:.0f})",
         'add_position': '-',
@@ -2333,6 +2355,11 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
 
 
 def _entry_status_bearish(already_broken, aligned, quality, entry_mode='breakout', severity='ALIGNED'):
+    is_aligned = severity == 'ALIGNED'
+    if entry_mode == 'fib':
+        if severity == 'SEVERE':
+            return '🚫 Fib 回調 (日線+H1逆勢!)'
+        return '⏳ 等待跌破 0.618 Fib'
     if entry_mode == 'pullback':
         if severity == 'SEVERE':
             return '🚫 反彈入場 (日線+H1逆勢!)'
@@ -2345,20 +2372,25 @@ def _entry_status_bearish(already_broken, aligned, quality, entry_mode='breakout
         return '🚫 已觸發 (日線+H1逆勢!)' if already_broken else '🚫 等待跌穿 (日線+H1逆勢!)'
     if already_broken and quality == 'UNCONFIRMED':
         return '⚠️ 已觸發 (未確認突破)'
-    if already_broken and aligned and quality == 'GOOD':
+    if already_broken and is_aligned and quality == 'GOOD':
         return '🌟 已觸發 (順勢, R:R佳)'
-    if already_broken and aligned and quality == 'OK':
+    if already_broken and is_aligned and quality == 'OK':
         return '✅ 已觸發 (順勢)'
     if already_broken and quality == 'POOR_RR':
         return '⚠️ 已觸發 (R:R低)'
     if already_broken:
         return '⚠️ 已觸發 (逆勢!)'
-    if not aligned:
+    if not is_aligned:
         return '⏳ 等待跌穿 (逆勢⚠️)'
     return '⏳ 等待跌穿'
 
 
 def _entry_status_bullish(already_broken, aligned, quality, entry_mode='breakout', severity='ALIGNED'):
+    is_aligned = severity == 'ALIGNED'
+    if entry_mode == 'fib':
+        if severity == 'SEVERE':
+            return '🚫 Fib 回調 (日線+H1逆勢!)'
+        return '⏳ 等待突破 0.618 Fib'
     if entry_mode == 'pullback':
         if severity == 'SEVERE':
             return '🚫 回撤入場 (日線+H1逆勢!)'
@@ -2370,12 +2402,12 @@ def _entry_status_bullish(already_broken, aligned, quality, entry_mode='breakout
     if severity == 'SEVERE':
         return '🚫 已突破 (日線+H1逆勢!)' if already_broken else '🚫 等待突破 (日線+H1逆勢!)'
     if not already_broken:
-        return '⏳ 等待突破 (逆勢⚠️)' if not aligned else '⏳ 等待突破'
+        return '⏳ 等待突破 (逆勢⚠️)' if not is_aligned else '⏳ 等待突破'
     if quality == 'UNCONFIRMED':
         return '⚠️ 已突破 (未確認)'
-    if quality == 'GOOD' and aligned:
+    if quality == 'GOOD' and is_aligned:
         return '🌟 已突破 (順勢, R:R佳)'
-    if quality == 'OK' and aligned:
+    if quality == 'OK' and is_aligned:
         return '✅ 已突破 (順勢)'
     if quality == 'POOR_RR':
         return '⚠️ 已突破 (R:R低)'
@@ -2598,9 +2630,9 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         seen_trigger_keys.add(trigger_level)
 
         # --- Boundary entry for reversal patterns (check BEFORE continue) ---
-        already_broken = current_price < trigger_level
-        aligned = aligned_with_trends('BEARISH', daily_trend, h1_trend)
+        already_broken = _setup_breakout_triggered('BEARISH', current_price, trigger_level, pattern)
         severity = counter_trend_severity('BEARISH', daily_trend, h1_trend)
+        aligned = severity == 'ALIGNED'
         add_vol = _volume_risk_tier(severity)[0]
         boundary_emitted = False
         if not already_broken and _is_boundary_reversal(pattern):
@@ -2651,12 +2683,12 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
             continue
 
         # Breakout: price must be below trigger (ignore stale pattern.broken if recovered)
-        already_broken = current_price < trigger_level
+        already_broken = _setup_breakout_triggered('BEARISH', current_price, trigger_level, pattern)
         if current_price > trigger_level + atr * 2:
             continue
 
         actual_entry = current_price if already_broken else trigger_level
-        aligned = aligned_with_trends('BEARISH', daily_trend, h1_trend)
+        aligned = severity == 'ALIGNED'
 
         if already_broken:
             entry_low = current_price - atr * 0.3
@@ -2818,9 +2850,9 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
             continue
         seen_trigger_keys.add(entry_trigger_level)
 
-        already_broken = current_price > entry_trigger_level
-        aligned = aligned_with_trends('BULLISH', daily_trend, h1_trend)
+        already_broken = _setup_breakout_triggered('BULLISH', current_price, entry_trigger_level, pattern)
         severity = counter_trend_severity('BULLISH', daily_trend, h1_trend)
+        aligned = severity == 'ALIGNED'
         add_vol = _volume_risk_tier(severity)[0]
 
         # --- Boundary entry for reversal patterns (check BEFORE continue) ---
@@ -3040,7 +3072,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                                 daily_trend, h1_trend, atr,
                             ))
                     else:
-                        swing_low = fib_end['price']
+                        swing_low = fib_start['price']
                         entry_level = fib['0.618']
                         stop_level = swing_low - atr
                         risk = entry_level - stop_level
