@@ -49,13 +49,13 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
 
 💰 TAKE PROFIT (3-tier)
   - TP1 (1/3): closer of 1:1 RR or 0.618 Fib ext → take profit first
-  - TP2 (1/3): closer of 2:1 RR or 1.0 Fib ext (further than TP1 by design)
+  - TP2 (1/3): further of 2:1 RR or 1.0 Fib ext (beyond TP1 by design)
   - TP3 (1/3): runner with trailing stop (TRAIL_PROFIT_ATR activate,
     TRAIL_STOP_ATR trail)
 
 ⚖️ QUALITY / PRIORITY
   - R:R quality tiers: ≥2.0 → GOOD, ≥1.0 → OK, <1.0 → POOR_RR (threshold 1.0 since Jul 2026)
-  - Quality uses max(TP1 R:R, TP2 R:R) — TP1 ~1:1, TP2 ~2:1 by design
+  - Quality from TP1 R:R only — TP2 ~2:1 by design and must not inflate tiers
   - Priority 1-6 (1=best, SEVERE checked first):
     1 broken+ALIGNED+GOOD | 2 broken+ALIGNED+OK | 3 ALIGNED waiting
     4 MILD counter-trend (waiting or broken) | 5 POOR_RR/UNCONFIRMED | 6 SEVERE
@@ -2428,10 +2428,10 @@ def daily_alignment_str(expected_trend, daily_trend, h1_trend=None):
 
 
 def _quality_from_rr(rr_tp1, rr_tp2=None):
-    """R:R quality tiers — uses best of TP1/TP2 R:R (TP1 alone is often capped at 1:1).
+    """R:R quality tiers — TP1 R:R only (TP2 is ~2:1 by design and must not inflate quality).
 
     ≥2.0 → GOOD, ≥1.0 → OK, <1.0 → POOR_RR (threshold 1.0 since Jul 2026)."""
-    rr = max(rr_tp1, rr_tp2 if rr_tp2 is not None else rr_tp1)
+    rr = rr_tp1
     if rr < 1.0:
         return 'POOR_RR'
     if rr >= 2.0:
@@ -2595,11 +2595,11 @@ def _compute_tp1(pattern, actual_entry, risk, side):
 
 
 def _compute_tp2(pattern, actual_entry, risk, side, fib_ext=None):
-    """Compute TP2 target: closer of 1.0 Fib extension or 2:1 RR.
-    
-    TP2 is intentionally further than TP1 to create meaningful separation:
+    """Compute TP2 target: further of 1.0 Fib extension or 2:1 RR.
+
+    TP2 is intentionally further than TP1:
     - TP1 = closer of (0.618 Fib ext, 1:1 RR)
-    - TP2 = closer of (1.0 Fib ext, 2:1 RR)
+    - TP2 = further of (1.0 Fib ext, 2:1 RR)
     """
     if 'Channel' in pattern.get('type', '') and pattern.get('target') is not None:
         # For channels with measured move target, TP2 = 2x the measured move distance
@@ -2607,22 +2607,27 @@ def _compute_tp2(pattern, actual_entry, risk, side, fib_ext=None):
         if side == 'SELL':
             tp2_rr = actual_entry - risk * 2  # 2:1 RR
             tp2_fib = actual_entry - (actual_entry - ch_tgt) * 2  # 2x channel target distance
-            return max(tp2_fib, tp2_rr), max(tp2_fib, tp2_rr)  # further = lower for SELL
+            tp2 = min(tp2_fib, tp2_rr)  # further = lower for SELL
+            return tp2, tp2_fib
         else:
             tp2_rr = actual_entry + risk * 2  # 2:1 RR
             tp2_fib = actual_entry + (ch_tgt - actual_entry) * 2  # 2x channel target distance
-            return min(tp2_fib, tp2_rr), min(tp2_fib, tp2_rr)  # further = higher for BUY
-    
+            tp2 = max(tp2_fib, tp2_rr)  # further = higher for BUY
+            return tp2, tp2_fib
+
     if fib_ext is not None:
         tp2_fib = fib_ext.get('ext_1.0', fib_ext.get('ext_0.618'))
     else:
         # Recompute fib_ext if not provided
         tp1_result = _compute_tp1(pattern, actual_entry, risk, side)
         tp2_fib = tp1_result[1].get('ext_1.0', tp1_result[1].get('ext_0.618')) if tp1_result[1] else None
-    
+
     if tp2_fib is None:
-        tp2_fib = fib_ext.get('ext_0.618') if fib_ext else actual_entry - risk
-    
+        if fib_ext:
+            tp2_fib = fib_ext.get('ext_0.618')
+        else:
+            tp2_fib = actual_entry - risk if side == 'SELL' else actual_entry + risk
+
     if side == 'SELL':
         tp2_rr = actual_entry - risk * 2  # 2:1 RR
         # TP2 = further target = min(fib, rr) for SELL (lower = further)
@@ -2639,6 +2644,22 @@ def _compute_tp2(pattern, actual_entry, risk, side, fib_ext=None):
         if tp2 <= actual_entry:
             tp2 = tp2_rr
         return tp2, tp2_fib
+
+
+def _enforce_tp2_beyond_tp1(tp1, tp2, entry, risk, side):
+    """Ensure TP2 is further from entry than TP1 (SELL: tp2 < tp1; BUY: tp2 > tp1)."""
+    min_sep = risk * 0.1
+    if side == 'SELL':
+        if tp2 >= tp1:
+            tp2 = entry - risk * 2
+        if tp2 >= tp1:
+            tp2 = tp1 - min_sep
+        return tp2
+    if tp2 <= tp1:
+        tp2 = entry + risk * 2
+    if tp2 <= tp1:
+        tp2 = tp1 + min_sep
+    return tp2
 
 
 def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, atr, h1_trend=None):
@@ -2698,6 +2719,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                     bd_rr_tp = bd_entry - bd_risk
                     bd_tp1 = max(bd_fib_tp, bd_rr_tp)
                     bd_tp2, bd_tp2_fib = _compute_tp2(pattern, bd_entry, bd_risk, 'SELL', bd_fib_ext)
+                    bd_tp2 = _enforce_tp2_beyond_tp1(bd_tp1, bd_tp2, bd_entry, bd_risk, 'SELL')
                     bd_tp2_rr = bd_entry - bd_risk * 2  # 2:1 RR
                     bd_rr1 = abs(bd_entry - bd_tp1) / bd_risk
                     bd_rr2 = abs(bd_entry - bd_tp2) / bd_risk
@@ -2772,6 +2794,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         tp1 = max(fib_tp, rr_tp)
         # TP2 = further target using 1.0 Fib ext or 2:1 RR (closer of the two)
         tp2, tp2_fib = _compute_tp2(pattern, actual_entry, risk, 'SELL', fib_ext)
+        tp2 = _enforce_tp2_beyond_tp1(tp1, tp2, actual_entry, risk, 'SELL')
         tp2_rr = actual_entry - risk * 2  # 2:1 RR
         rr_tp1 = abs(actual_entry - tp1) / risk
         rr_tp2 = abs(actual_entry - tp2) / risk
@@ -2857,6 +2880,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                             pb_rr_tp = pb_entry - pb_risk
                             pb_tp1 = max(pb_fib_tp, pb_rr_tp)
                             pb_tp2, pb_tp2_fib = _compute_tp2(pattern, pb_entry, pb_risk, 'SELL', pb_fib_ext)
+                            pb_tp2 = _enforce_tp2_beyond_tp1(pb_tp1, pb_tp2, pb_entry, pb_risk, 'SELL')
                             pb_tp2_rr = pb_entry - pb_risk * 2  # 2:1 RR
                             pb_rr1 = abs(pb_entry - pb_tp1) / pb_risk
                             pb_rr2 = abs(pb_entry - pb_tp2) / pb_risk
@@ -2923,6 +2947,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                     bd_rr_tp = bd_entry + bd_risk
                     bd_tp1 = min(bd_fib_tp, bd_rr_tp)
                     bd_tp2, bd_tp2_fib = _compute_tp2(pattern, bd_entry, bd_risk, 'BUY', bd_fib_ext)
+                    bd_tp2 = _enforce_tp2_beyond_tp1(bd_tp1, bd_tp2, bd_entry, bd_risk, 'BUY')
                     bd_tp2_rr = bd_entry + bd_risk * 2  # 2:1 RR
                     bd_rr1 = abs(bd_tp1 - bd_entry) / bd_risk
                     bd_rr2 = abs(bd_tp2 - bd_entry) / bd_risk
@@ -2992,6 +3017,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         tp1 = min(fib_tp, rr_tp)
         # TP2 = further target using 1.0 Fib ext or 2:1 RR (closer of the two)
         tp2, tp2_fib = _compute_tp2(pattern, actual_entry, risk, 'BUY', fib_ext)
+        tp2 = _enforce_tp2_beyond_tp1(tp1, tp2, actual_entry, risk, 'BUY')
         tp2_rr = actual_entry + risk * 2  # 2:1 RR
         rr_tp1 = abs(tp1 - actual_entry) / risk
         rr_tp2 = abs(tp2 - actual_entry) / risk
@@ -3075,6 +3101,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                             pb_rr_tp = pb_entry + pb_risk
                             pb_tp1 = min(pb_fib_tp, pb_rr_tp)
                             pb_tp2, pb_tp2_fib = _compute_tp2(pattern, pb_entry, pb_risk, 'BUY', pb_fib_ext)
+                            pb_tp2 = _enforce_tp2_beyond_tp1(pb_tp1, pb_tp2, pb_entry, pb_risk, 'BUY')
                             pb_tp2_rr = pb_entry + pb_risk * 2  # 2:1 RR
                             pb_rr1 = abs(pb_tp1 - pb_entry) / pb_risk
                             pb_rr2 = abs(pb_tp2 - pb_entry) / pb_risk
@@ -3541,7 +3568,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 📍 加注 | 突破前底/前頂（或跌穿 neckline） |
 | 🛑 止損 | 前頂之上 / 前底之下 + 1 ATR (必設!) |
 | 🎯 TP1 (1/3) | 1:1 RR 或 0.618 Fib ext (取較近) |
-| 🎯 TP2 (1/3) | 2:1 RR 或 1.0 Fib ext (取較近，比 TP1 更遠) |
+| 🎯 TP2 (1/3) | 2:1 RR 或 1.0 Fib ext (取較遠，比 TP1 更遠) |
 | 🎯 TP3 (1/3) | 放飛 + 追蹤止損 |
 | ⏰ 最佳時段 | 01:00 / 09:00 (broker time) — 勝率 60% |
 | 🚫 避開時段 | 17:00 (broker time) — 勝率 19% |
