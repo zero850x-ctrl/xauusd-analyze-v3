@@ -48,14 +48,14 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - Pullback entries get even tighter structure stops
 
 💰 TAKE PROFIT (3-tier)
-  - TP1 (1/3): closer of 1:1 RR or Fibonacci extension → take profit first
-  - TP2 (1/3): further of 1:1 RR or Fibonacci extension
+  - TP1 (1/3): closer of 1:1 RR or 0.618 Fib ext → take profit first
+  - TP2 (1/3): closer of 2:1 RR or 1.0 Fib ext (further than TP1 by design)
   - TP3 (1/3): runner with trailing stop (TRAIL_PROFIT_ATR activate,
     TRAIL_STOP_ATR trail)
 
 ⚖️ QUALITY / PRIORITY
   - R:R quality tiers: ≥2.0 → GOOD, ≥1.0 → OK, <1.0 → POOR_RR (threshold 1.0 since Jul 2026)
-  - Quality uses max(TP1 R:R, TP2 R:R) — TP1 alone is capped at ~1:1 by design
+  - Quality uses max(TP1 R:R, TP2 R:R) — TP1 ~1:1, TP2 ~2:1 by design
   - Priority 1-6 (1=best, SEVERE checked first):
     1 broken+ALIGNED+GOOD | 2 broken+ALIGNED+OK | 3 ALIGNED waiting
     4 MILD counter-trend (waiting or broken) | 5 POOR_RR/UNCONFIRMED | 6 SEVERE
@@ -2320,7 +2320,7 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
             'stop_loss': f"${stop_level:.0f}",
             'stop_rationale': f"{swing_label} + 1 ATR",
             'tp1': f"${tp1:.0f} (0.618 RR, 止賺 1/3)",
-            'tp2': f"${tp2:.0f} (1:1 RR, 止賺 1/3)",
+            'tp2': f"${tp2:.0f} (2:1 RR, 止賺 1/3)",
             'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
             'risk_amount': round(risk, 1),
             'rr_tp1': round(rr_tp1, 1),
@@ -2344,7 +2344,7 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
         'stop_loss': f"${stop_level:.0f}",
         'stop_rationale': f"{swing_label} - 1 ATR",
         'tp1': f"${tp1:.0f} (0.618 RR, 止賺 1/3)",
-        'tp2': f"${tp2:.0f} (1:1 RR, 止賺 1/3)",
+        'tp2': f"${tp2:.0f} (2:1 RR, 止賺 1/3)",
         'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
         'risk_amount': round(risk, 1),
         'rr_tp1': round(rr_tp1, 1),
@@ -2492,7 +2492,7 @@ def _pullback_consolidation_ok(pattern, atr, is_flag, is_wedge):
     return False
 
 
-def _tp_method_label(pattern, tp_value, fib_tp, rr_tp):
+def _tp_method_label(pattern, tp_value, fib_tp, rr_tp, tp2_fib_tp=None, tp2_rr_tp=None):
     """Label TP method — channels use measured move, not Fib extension."""
     if 'Channel' in pattern.get('type', ''):
         ch_tgt = pattern.get('target')
@@ -2502,6 +2502,10 @@ def _tp_method_label(pattern, tp_value, fib_tp, rr_tp):
         return '1:1 RR'
     if abs(tp_value - fib_tp) < 0.01:
         return '0.618 Fib ext'
+    if tp2_rr_tp is not None and abs(tp_value - tp2_rr_tp) < 1.0:
+        return '2:1 RR'
+    if tp2_fib_tp is not None and abs(tp_value - tp2_fib_tp) < 1.0:
+        return '1.0 Fib ext'
     if 'Channel' in pattern.get('type', ''):
         return '通道量度目標'
     return '0.618 Fib ext'
@@ -2589,6 +2593,54 @@ def _compute_tp1(pattern, actual_entry, risk, side):
     return tp1, fib_ext
 
 
+
+def _compute_tp2(pattern, actual_entry, risk, side, fib_ext=None):
+    """Compute TP2 target: closer of 1.0 Fib extension or 2:1 RR.
+    
+    TP2 is intentionally further than TP1 to create meaningful separation:
+    - TP1 = closer of (0.618 Fib ext, 1:1 RR)
+    - TP2 = closer of (1.0 Fib ext, 2:1 RR)
+    """
+    if 'Channel' in pattern.get('type', '') and pattern.get('target') is not None:
+        # For channels with measured move target, TP2 = 2x the measured move distance
+        ch_tgt = pattern['target']
+        if side == 'SELL':
+            tp2_rr = actual_entry - risk * 2  # 2:1 RR
+            tp2_fib = actual_entry - (actual_entry - ch_tgt) * 2  # 2x channel target distance
+            return max(tp2_fib, tp2_rr), max(tp2_fib, tp2_rr)  # further = lower for SELL
+        else:
+            tp2_rr = actual_entry + risk * 2  # 2:1 RR
+            tp2_fib = actual_entry + (ch_tgt - actual_entry) * 2  # 2x channel target distance
+            return min(tp2_fib, tp2_rr), min(tp2_fib, tp2_rr)  # further = higher for BUY
+    
+    if fib_ext is not None:
+        tp2_fib = fib_ext.get('ext_1.0', fib_ext.get('ext_0.618'))
+    else:
+        # Recompute fib_ext if not provided
+        tp1_result = _compute_tp1(pattern, actual_entry, risk, side)
+        tp2_fib = tp1_result[1].get('ext_1.0', tp1_result[1].get('ext_0.618')) if tp1_result[1] else None
+    
+    if tp2_fib is None:
+        tp2_fib = fib_ext.get('ext_0.618') if fib_ext else actual_entry - risk
+    
+    if side == 'SELL':
+        tp2_rr = actual_entry - risk * 2  # 2:1 RR
+        # TP2 = further target = min(fib, rr) for SELL (lower = further)
+        tp2 = min(tp2_fib, tp2_rr)
+        # Ensure TP2 is beyond entry
+        if tp2 >= actual_entry:
+            tp2 = tp2_rr
+        return tp2, tp2_fib
+    else:
+        tp2_rr = actual_entry + risk * 2  # 2:1 RR
+        # TP2 = further target = max(fib, rr) for BUY (higher = further)
+        tp2 = max(tp2_fib, tp2_rr)
+        # Ensure TP2 is beyond entry
+        if tp2 <= actual_entry:
+            tp2 = tp2_rr
+        return tp2, tp2_fib
+
+
 def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, atr, h1_trend=None):
     """Generate trade setups following user's methodology."""
     setups = []
@@ -2642,10 +2694,11 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                 bd_risk = bd_stop - bd_entry
                 max_risk = _max_boundary_risk(atr, current_price)
                 if bd_risk > 0 and bd_risk <= max_risk:
-                    bd_fib_tp, _ = _compute_tp1(pattern, bd_entry, bd_risk, 'SELL')
+                    bd_fib_tp, bd_fib_ext = _compute_tp1(pattern, bd_entry, bd_risk, 'SELL')
                     bd_rr_tp = bd_entry - bd_risk
                     bd_tp1 = max(bd_fib_tp, bd_rr_tp)
-                    bd_tp2 = min(bd_fib_tp, bd_rr_tp)
+                    bd_tp2, bd_tp2_fib = _compute_tp2(pattern, bd_entry, bd_risk, 'SELL', bd_fib_ext)
+                    bd_tp2_rr = bd_entry - bd_risk * 2  # 2:1 RR
                     bd_rr1 = abs(bd_entry - bd_tp1) / bd_risk
                     bd_rr2 = abs(bd_entry - bd_tp2) / bd_risk
                     bd_quality = _quality_from_rr(bd_rr1, bd_rr2)
@@ -2669,7 +2722,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         'stop_loss': f"${bd_stop:.0f}",
                         'stop_rationale': bd_sl_rationale,
                         'tp1': f"${bd_tp1:.0f} ({_tp_method_label(pattern, bd_tp1, bd_fib_tp, bd_rr_tp)}, 止賺 1/3)",
-                        'tp2': f"${bd_tp2:.0f} ({_tp_method_label(pattern, bd_tp2, bd_fib_tp, bd_rr_tp)}, 止賺 1/3)",
+                        'tp2': f"${bd_tp2:.0f} ({_tp_method_label(pattern, bd_tp2, bd_fib_tp, bd_rr_tp, bd_tp2_fib, bd_tp2_rr)}, 止賺 1/3)",
                         'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
                         'risk_amount': round(bd_risk, 1),
                         'rr_tp1': round(bd_rr1, 1),
@@ -2713,12 +2766,13 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         if risk <= 0:
             continue
 
-        fib_tp, _ = _compute_tp1(pattern, actual_entry, risk, 'SELL')
+        fib_tp, fib_ext = _compute_tp1(pattern, actual_entry, risk, 'SELL')
         rr_tp = actual_entry - risk  # 1:1 RR base target
         # TP1 = closer target (higher price for SELL, first to exit)
-        # TP2 = further target (lower price for SELL, second to exit)
         tp1 = max(fib_tp, rr_tp)
-        tp2 = min(fib_tp, rr_tp)
+        # TP2 = further target using 1.0 Fib ext or 2:1 RR (closer of the two)
+        tp2, tp2_fib = _compute_tp2(pattern, actual_entry, risk, 'SELL', fib_ext)
+        tp2_rr = actual_entry - risk * 2  # 2:1 RR
         rr_tp1 = abs(actual_entry - tp1) / risk
         rr_tp2 = abs(actual_entry - tp2) / risk
 
@@ -2762,7 +2816,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
             'stop_loss': f"${stop_level:.0f}",
             'stop_rationale': stop_rationale,
             'tp1': f"${tp1:.0f} ({_tp_method_label(pattern, tp1, fib_tp, rr_tp)}, \u6b62\u8cfa 1/3)",
-            'tp2': f"${tp2:.0f} ({_tp_method_label(pattern, tp2, fib_tp, rr_tp)}, \u6b62\u8cfa 1/3)",
+            'tp2': f"${tp2:.0f} ({_tp_method_label(pattern, tp2, fib_tp, rr_tp, tp2_fib, tp2_rr)}, \u6b62\u8cfa 1/3)",
             'tp3': f"\u653e\u98db + {tp3_trail} (\u5c3e\u5009 1/3)",
             'risk_amount': round(risk, 1),
             'rr_tp1': round(rr_tp1, 1),
@@ -2799,10 +2853,11 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         pb_stop = min(pb_stop, current_price + atr * 2)
                         pb_risk = pb_stop - pb_entry
                         if pb_risk > 0:
-                            pb_fib_tp, _ = _compute_tp1(pattern, pb_entry, pb_risk, 'SELL')
+                            pb_fib_tp, pb_fib_ext = _compute_tp1(pattern, pb_entry, pb_risk, 'SELL')
                             pb_rr_tp = pb_entry - pb_risk
                             pb_tp1 = max(pb_fib_tp, pb_rr_tp)
-                            pb_tp2 = min(pb_fib_tp, pb_rr_tp)
+                            pb_tp2, pb_tp2_fib = _compute_tp2(pattern, pb_entry, pb_risk, 'SELL', pb_fib_ext)
+                            pb_tp2_rr = pb_entry - pb_risk * 2  # 2:1 RR
                             pb_rr1 = abs(pb_entry - pb_tp1) / pb_risk
                             pb_rr2 = abs(pb_entry - pb_tp2) / pb_risk
                             pb_quality = _quality_from_rr(pb_rr1, pb_rr2)
@@ -2825,7 +2880,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                                 'stop_loss': f"${pb_stop:.0f}",
                                 'stop_rationale': pb_stop_rationale,
                                 'tp1': f"${pb_tp1:.0f} ({_tp_method_label(pattern, pb_tp1, pb_fib_tp, pb_rr_tp)}, \u6b62\u8cfa 1/3)",
-                                'tp2': f"${pb_tp2:.0f} ({_tp_method_label(pattern, pb_tp2, pb_fib_tp, pb_rr_tp)}, \u6b62\u8cfa 1/3)",
+                                'tp2': f"${pb_tp2:.0f} ({_tp_method_label(pattern, pb_tp2, pb_fib_tp, pb_rr_tp, pb_tp2_fib, pb_tp2_rr)}, \u6b62\u8cfa 1/3)",
                                 'tp3': f"\u653e\u98db + {tp3_trail} (\u5c3e\u5009 1/3)",
                                 'risk_amount': round(pb_risk, 1),
                                 'rr_tp1': round(pb_rr1, 1),
@@ -2864,10 +2919,11 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                 bd_risk = bd_entry - bd_stop
                 max_risk = _max_boundary_risk(atr, current_price)
                 if bd_risk > 0 and bd_risk <= max_risk:
-                    bd_fib_tp, _ = _compute_tp1(pattern, bd_entry, bd_risk, 'BUY')
+                    bd_fib_tp, bd_fib_ext = _compute_tp1(pattern, bd_entry, bd_risk, 'BUY')
                     bd_rr_tp = bd_entry + bd_risk
                     bd_tp1 = min(bd_fib_tp, bd_rr_tp)
-                    bd_tp2 = max(bd_fib_tp, bd_rr_tp)
+                    bd_tp2, bd_tp2_fib = _compute_tp2(pattern, bd_entry, bd_risk, 'BUY', bd_fib_ext)
+                    bd_tp2_rr = bd_entry + bd_risk * 2  # 2:1 RR
                     bd_rr1 = abs(bd_tp1 - bd_entry) / bd_risk
                     bd_rr2 = abs(bd_tp2 - bd_entry) / bd_risk
                     bd_quality = _quality_from_rr(bd_rr1, bd_rr2)
@@ -2893,7 +2949,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         'stop_loss': f"${bd_stop:.0f}",
                         'stop_rationale': bd_sl_rationale,
                         'tp1': f"${bd_tp1:.0f} ({_tp_method_label(pattern, bd_tp1, bd_fib_tp, bd_rr_tp)}, 止賺 1/3)",
-                        'tp2': f"${bd_tp2:.0f} ({_tp_method_label(pattern, bd_tp2, bd_fib_tp, bd_rr_tp)}, 止賺 1/3)",
+                        'tp2': f"${bd_tp2:.0f} ({_tp_method_label(pattern, bd_tp2, bd_fib_tp, bd_rr_tp, bd_tp2_fib, bd_tp2_rr)}, 止賺 1/3)",
                         'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
                         'risk_amount': round(bd_risk, 1),
                         'rr_tp1': round(bd_rr1, 1),
@@ -2930,12 +2986,13 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
         if risk <= 0:
             continue
 
-        fib_tp, _ = _compute_tp1(pattern, actual_entry, risk, 'BUY')
+        fib_tp, fib_ext = _compute_tp1(pattern, actual_entry, risk, 'BUY')
         rr_tp = actual_entry + risk  # 1:1 RR base target
         # TP1 = closer target (lower price for BUY, first to exit)
-        # TP2 = further target (higher price for BUY, second to exit)
         tp1 = min(fib_tp, rr_tp)
-        tp2 = max(fib_tp, rr_tp)
+        # TP2 = further target using 1.0 Fib ext or 2:1 RR (closer of the two)
+        tp2, tp2_fib = _compute_tp2(pattern, actual_entry, risk, 'BUY', fib_ext)
+        tp2_rr = actual_entry + risk * 2  # 2:1 RR
         rr_tp1 = abs(tp1 - actual_entry) / risk
         rr_tp2 = abs(tp2 - actual_entry) / risk
 
@@ -2979,7 +3036,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
             'stop_loss': f"${stop_level:.0f}",
             'stop_rationale': stop_rationale,
             'tp1': f"${tp1:.0f} ({_tp_method_label(pattern, tp1, fib_tp, rr_tp)}, \u6b62\u8cfa 1/3)",
-            'tp2': f"${tp2:.0f} ({_tp_method_label(pattern, tp2, fib_tp, rr_tp)}, \u6b62\u8cfa 1/3)",
+            'tp2': f"${tp2:.0f} ({_tp_method_label(pattern, tp2, fib_tp, rr_tp, tp2_fib, tp2_rr)}, \u6b62\u8cfa 1/3)",
             'tp3': f"\u653e\u98db + {tp3_trail} (\u5c3e\u5009 1/3)",
             'risk_amount': round(risk, 1),
             'rr_tp1': round(rr_tp1, 1),
@@ -3014,10 +3071,11 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         pb_stop = max(pb_stop, current_price - atr * 2)
                         pb_risk = pb_entry - pb_stop
                         if pb_risk > 0:
-                            pb_fib_tp, _ = _compute_tp1(pattern, pb_entry, pb_risk, 'BUY')
+                            pb_fib_tp, pb_fib_ext = _compute_tp1(pattern, pb_entry, pb_risk, 'BUY')
                             pb_rr_tp = pb_entry + pb_risk
                             pb_tp1 = min(pb_fib_tp, pb_rr_tp)
-                            pb_tp2 = max(pb_fib_tp, pb_rr_tp)
+                            pb_tp2, pb_tp2_fib = _compute_tp2(pattern, pb_entry, pb_risk, 'BUY', pb_fib_ext)
+                            pb_tp2_rr = pb_entry + pb_risk * 2  # 2:1 RR
                             pb_rr1 = abs(pb_tp1 - pb_entry) / pb_risk
                             pb_rr2 = abs(pb_tp2 - pb_entry) / pb_risk
                             pb_quality = _quality_from_rr(pb_rr1, pb_rr2)
@@ -3040,7 +3098,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                                 'stop_loss': f"${pb_stop:.0f}",
                                 'stop_rationale': pb_stop_rationale,
                                 'tp1': f"${pb_tp1:.0f} ({_tp_method_label(pattern, pb_tp1, pb_fib_tp, pb_rr_tp)}, \u6b62\u8cfa 1/3)",
-                                'tp2': f"${pb_tp2:.0f} ({_tp_method_label(pattern, pb_tp2, pb_fib_tp, pb_rr_tp)}, \u6b62\u8cfa 1/3)",
+                                'tp2': f"${pb_tp2:.0f} ({_tp_method_label(pattern, pb_tp2, pb_fib_tp, pb_rr_tp, pb_tp2_fib, pb_tp2_rr)}, \u6b62\u8cfa 1/3)",
                                 'tp3': f"\u653e\u98db + {tp3_trail} (\u5c3e\u5009 1/3)",
                                 'risk_amount': round(pb_risk, 1),
                                 'rr_tp1': round(pb_rr1, 1),
@@ -3066,7 +3124,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         risk = stop_level - entry_level
                         if risk > 0:
                             tp1 = entry_level - risk * 0.618
-                            tp2 = entry_level - risk
+                            tp2 = entry_level - risk * 2  # 2:1 RR for TP2
                             setups.append(_build_fib_fallback_setup(
                                 'BEARISH', fib, entry_level, stop_level, risk, tp1, tp2, tp3_trail,
                                 daily_trend, h1_trend, atr,
@@ -3078,7 +3136,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         risk = entry_level - stop_level
                         if risk > 0:
                             tp1 = entry_level + risk * 0.618
-                            tp2 = entry_level + risk
+                            tp2 = entry_level + risk * 2  # 2:1 RR for TP2
                             setups.append(_build_fib_fallback_setup(
                                 'BULLISH', fib, entry_level, stop_level, risk, tp1, tp2, tp3_trail,
                                 daily_trend, h1_trend, atr,
@@ -3482,8 +3540,8 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 📍 入場 | 突破 / 邊界限價 / 旗楔形回撤 |
 | 📍 加注 | 突破前底/前頂（或跌穿 neckline） |
 | 🛑 止損 | 前頂之上 / 前底之下 + 1 ATR (必設!) |
-| 🎯 TP1 (1/3) | 1:1 RR、0.618 Fib ext 或通道量度目標 (取較近) |
-| 🎯 TP2 (1/3) | 1:1 RR、0.618 Fib ext 或通道量度目標 (取較遠) |
+| 🎯 TP1 (1/3) | 1:1 RR 或 0.618 Fib ext (取較近) |
+| 🎯 TP2 (1/3) | 2:1 RR 或 1.0 Fib ext (取較近，比 TP1 更遠) |
 | 🎯 TP3 (1/3) | 放飛 + 追蹤止損 |
 | ⏰ 最佳時段 | 01:00 / 09:00 (broker time) — 勝率 60% |
 | 🚫 避開時段 | 17:00 (broker time) — 勝率 19% |
