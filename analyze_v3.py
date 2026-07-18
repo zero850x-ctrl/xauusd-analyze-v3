@@ -2217,9 +2217,14 @@ def _volume_risk_tier(severity='ALIGNED', vol=0.02):
     in new data: 0.07-0.15 is the second-best tier by net PnL.
 
     Combined with counter-trend severity:
-    ALIGNED: 0.02 base, 0.03 if golden hour
+    ALIGNED: 0.02 base, 0.05 if golden hour
     MILD: 0.01 (half)
     SEVERE: 0.005 (quarter) + 🚫
+
+    Cap raised 2026-07-18: 0.03→0.05 on ALIGNED+golden. The 0.07-0.15 tier
+    was the *best* net tier in the 68-trade sample (+$365, 36.8% win) —
+    the old 0.03 cap was needlessly conservative and left golden-hour
+    profits on the table. 0.16+ is still toxic and not authorized.
     """
     if severity == 'SEVERE':
         return 0.005, '🚫 強烈不建議！最多 0.005 倉 (風險管理: 逆勢大倉極端波動)'
@@ -2228,7 +2233,7 @@ def _volume_risk_tier(severity='ALIGNED', vol=0.02):
     else:
         tq, _ = _time_quality_score()
         if tq == 'golden':
-            return 0.03, '🌅 順勢 + 黃金時段, 0.03 倉 (deduped: 09:00 66.7% 勝)'
+            return 0.05, '🌅 順勢 + 黃金時段, 0.05 倉 (deduped: 0.07-0.15 最佳盈利桶 +$365 / 36.8% 勝; 0.16+ 才真有毒)'
         return 0.02, '順勢 0.02 倉'
 
 
