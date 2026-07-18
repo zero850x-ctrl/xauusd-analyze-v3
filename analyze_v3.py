@@ -77,17 +77,21 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
     ALIGNED counter-trend + NOT danger hour + has TP + priority≤2 (breakout) or ≤3 (pullback/boundary/fib)
   - JSON also includes time_quality (session), counter_trend_severity, recommended_volume
 
-🚫 DISCIPLINE GUARDS (based on 15-trade / 3-account mentor review 2026-07-10)
-  - Danger hour block: 17:00 broker-local → cron_push_eligible = false (19% win rate)
-  - TP mandatory: no TP1 → cron_push_eligible = false (100% of 15 trades had no TP!)
-  - SL mandatory: no SL → cron_push_eligible = false (Account C Trade 3: no SL = -51.74)
-  - Min holding: paper_trade.py enforces 15-min minimum (scalping <5min = 29% win)
+🚫 DISCIPLINE GUARDS (based on 15-trade review 2026-07-10 + 69-trade update 2026-07-18)
+  - Danger hour block: 04:00–06:00 broker-local (0/7 win, -$337) +
+    legacy 17:00 retained as ADVISORY (new data 55.6% win, +$432 — no longer hard block)
+  - TP mandatory: kept for risk discipline (NOT for PnL — 65/69 trades had no TP, +$293)
+  - SL mandatory: kept for risk discipline (NOT for PnL — 18/69 no-SL trades 61% win, +$311)
+  - Min holding: paper_trade.py enforces 15-min minimum (scalping <15min: 21% win, -$502)
   - Cooldown: 15-min lockout after trade close (prevents 16-sec / 25-sec revenge entry)
   - Anti-martingale: paper_trade.py blocks volume increase after consecutive losses
   - Anti-stacking: paper_trade.py blocks new trade when LIVE position exists
+    (NOTE: 2026-07-18 data shows 95 same-direction overlap pairs net +$10,645 —
+    same-direction averaging consistent with 前輩 methodology §2「突破前底加注」.
+    Consider relaxing to block reverse-direction only. See §TODO.)
   - SL floor: paper_trade.py rejects SL < 0.5×ATR (too tight = noise stop-out)
   - Direction bias: counter_trend_severity == ALIGNED prevents all-counter-trend days
-    (Account C: 5 BUYs on bearish day = -115.14)
+  - Max holding benefit: >4h hold = 67% win, +$688, avg +$38 (best bucket)
 
 Data sources: TradingView (OANDA:XAUUSD M30/H1/M15) + Yahoo Finance (GC=F daily)
 
@@ -1911,9 +1915,14 @@ def cron_push_eligible(setup):
     - kline_confirmed
     - quality in (OK, GOOD)
     - counter_trend_severity == ALIGNED
-    - NOT in danger hour (17:00 broker-local, 19% historical win rate)
+    - NOT in danger hour (04-06/08 broker-local, 0% win in 69-trade sample 2026-07-18)
+      [17:00 was previously hard-blocked; new data shows 55.6% win → moved to advisory]
     - Has TP targets (tp1 > 0) — no naked trades
-    - Has SL (stop_loss > 0) — no naked positions (Account C: no SL = -51.74)
+      [Note: 69-trade sample shows no-TP trades 61% win vs TP-set 33% win — TP-mandatory
+       is a RISK MANAGEMENT guard, not a statistical edge signal.]
+    - Has SL (stop_loss > 0) — no naked positions
+      [Note: 69-trade sample shows no-SL trades 61% win vs SL-set 33% win — SL-mandatory
+       is a RISK MANAGEMENT guard, not a statistical edge signal.]
     - breakout: priority ≤ 2; pullback/boundary/fib: priority ≤ 3
     """
     if not setup.get('kline_confirmed'):
@@ -1922,14 +1931,14 @@ def cron_push_eligible(setup):
         return False
     if setup.get('counter_trend_severity') != 'ALIGNED':
         return False
-    # Danger hour block (19% win rate historically)
-    if setup.get('time_quality') == 'danger':
+    # Danger hour block (04-06/08: 0% win in 69-trade new data; 17:00 → advisory)
+    if setup.get('time_quality') == 'danger':  # 'advisory' allowed through
         return False
     # Must have TP targets — no naked entries
     tp1_str = str(setup.get('tp1', ''))
     if not tp1_str or tp1_str == '0' or '$0' in tp1_str:
         return False
-    # Must have SL — no naked positions (Account C Trade 3: no SL = -51.74)
+    # Must have SL — risk guard (note: no-SL trades 61% win in 69-sample, but tail risk)
     sl_str = str(setup.get('stop_loss', ''))
     if not sl_str or sl_str == '0' or '$0' in sl_str:
         return False
@@ -2140,8 +2149,9 @@ BROKER_UTC_OFFSET_HOURS = int(os.environ.get('BROKER_UTC_OFFSET_HOURS', '-3'))
 MAX_PATTERNS_PER_DIRECTION = 2  # top-N patterns per side before setup generation
 
 # Broker-local hours below (UTC + offset).
-GOLDEN_HOURS = {1, 9}       # 01:00 +$174.60 (7t), 09:00 +$78.30 (8t)
-DANGER_HOURS = {17}          # 17:00 -$173.09 (16t)
+GOLDEN_HOURS = {1, 9}        # 01:00 (4t 50%), 09:00 (3t 66.7%, +$39) — 69-trade update 2026-07-18
+DANGER_HOURS = {4, 5, 6, 8}  # 04-06 0/7 win -$337 ; 08:00 0/4 -$182
+DANGER_ADVISORY_HOURS = {17} # legacy 17:00 → ADVISORY only (55.6% win, +$432 in new data)
 MAX_DAILY_TRADES = 8         # Overtrading threshold (123 trades/week = ~17/day avg)
 
 
@@ -2154,49 +2164,57 @@ def _broker_hour():
 def _time_quality_score():
     """Rate current broker time for trading quality.
 
-    Based on 123-trade weekly analysis (Jul 2026):
-    - Golden hours (01:00, 09:00 broker): +$252.90 combined, 60% win rate
-    - Danger hour (17:00 broker): -$173.09, 19% win rate
-    - Other hours: roughly break-even
+    Updated 2026-07-18 (69-trade sample):
+    - Golden hours (01:00, 09:00 broker): moderate positive
+    - Danger hours (04-06, 08): 0% win, heavy losses → hard block
+    - Advisory 17:00: was danger (old 15-trade), now 55.6% win in 69-trade → advisory
+    - 15:00 +$198 (5t 60%), 14:00 +$63 (3t 100%), 13:00 +$44 (2t 100%), 19:00 +$371 (avg +$93)
 
-    Returns: ('golden'|'danger'|'normal', advisory_text)
+    Returns: ('golden'|'danger'|'advisory'|'normal', advisory_text)
     """
     broker_hour = _broker_hour()
 
     if broker_hour in GOLDEN_HOURS:
-        return ('golden', '🌅 黃金時段 (歷史勝率 60%, +$252/週) — 適合入場')
+        return ('golden', '🌅 黃金時段 (01:00/09:00 broker) — 適合入場')
     if broker_hour in DANGER_HOURS:
-        return ('danger', '🚫 危險時段 (歷史勝率 19%, -$173/週) — 建議觀望')
+        return ('danger', '🚫 危險時段 (04-06/08 broker: 0% 勝率, -$337+) — 建議觀望')
+    if broker_hour in DANGER_ADVISORY_HOURS:
+        return ('advisory', '⚠️ 17:00 broker 時段 (舊判危險, 新數據 55.6% 勝 +$432) — 謹慎入場')
     return ('normal', '')
 
 
 def _scalp_risk_warning():
     """Warn against ultra-short holding periods.
 
-    Historical data:
-    - <5min hold: 29% win, -$79.95 (17 trades)
-    - 5-15min hold: 17% win, -$190.60 (23 trades) ← WORST
-    - 15-60min hold: 38% win, +$48.98 (48 trades) ← ONLY PROFITABLE
-    - 1-4h hold: 42% win, -$76.37
-    - >4h hold: 55% win, -$19.15 (small sample)
+    Updated 2026-07-18 (69-trade sample):
+    - <5min hold: 16.7% win, -$274 (12 trades)
+    - 5-15min hold: 25% win, -$229 (12 trades)
+    - 15-60min hold: 13.3% win, -$283 (15 trades) ← NOT profitable (old +$49 small sample)
+    - 1-4h hold: 75% win, +$390 (12 trades)
+    - >4h hold: 66.7% win, +$688, avg +$38 (18 trades) ← LONG-TERM HOLDS WIN
     """
     return (
-        "⚠️ **反剝頭皮提醒 (基於 123 筆歷史數據):**\n"
-        "- <5min 持倉: 勝率 29%, 虧損 -$80\n"
-        "- 5-15min 持倉: 勝率 17%, 虧損 -$191 ← **最差**\n"
-        "- 15-60min 持倉: 勝率 38%, **唯一盈利** +$49\n"
-        "- 建議: 持倉至少 15 分鐘, 讓形態充分發展"
+        "⚠️ **反剝頭皮提醒 (基於 69 筆數據 2026-07-18):**\n"
+        "- <5min 持倉: 勝率 16.7%, 虧損 -$274\n"
+        "- 5-15min 持倉: 勝率 25%, 虧損 -$229\n"
+        "- 15-60min 持倉: 勝率 13.3%, 虧損 -$283 ← **新數據最差**\n"
+        "- 1-4h 持倉: 勝率 75%, **盈利 +$390**\n"
+        "- >4h 持倉: 勝率 66.7%, **盈利 +$688** (最佳)\n"
+        "- 建議: 前輩贏錢靠放飛, 持倉 ≥1h 才讓形態充分發展"
     )
 
 
 def _volume_risk_tier(severity='ALIGNED', vol=0.02):
     """Recommend position size with volume-aware risk tiers.
 
-    Historical data (Jul 2026 weekly):
-    - 0.01-0.02: 34% win, -$92 (too frequent, too small to matter)
-    - 0.03-0.06: 40% win, -$103 (moderate)
-    - 0.07+: 22% win, -$122 ← BIG VOLUME IS DESTRUCTIVE
-    - 0.10 trades: 0% win (3 trades, all losses, -$75)
+    Updated 2026-07-18 (69-trade sample):
+    - 0.01-0.02: 75% win, +$38 (8 trades) — small but safe, high win rate
+    - 0.03-0.06: 37.5% win, -$86 (32 trades) — moderate, most frequent
+    - 0.07-0.15: 36.8% win, +$365 (19 trades) ← NEW: profitable mid-large
+    - 0.16+: 30% win, -$24 (10 trades) ← truly destructive
+
+    Old claim "0.07+ 22% win, -$122" was from small 15-trade sample and WRONG
+    in new data: 0.07-0.15 is the second-best tier by net PnL.
 
     Combined with counter-trend severity:
     ALIGNED: 0.02 base, 0.03 if golden hour
@@ -2204,7 +2222,7 @@ def _volume_risk_tier(severity='ALIGNED', vol=0.02):
     SEVERE: 0.005 (quarter) + 🚫
     """
     if severity == 'SEVERE':
-        return 0.005, '🚫 強烈不建議！最多 0.005 倉 (歷史: 大倉逆勢 22% 勝率)'
+        return 0.005, '🚫 強烈不建議！最多 0.005 倉 (風險管理: 逆勢大倉極端波動)'
     elif severity == 'MILD':
         return 0.01, '⚠️ 逆勢半倉 0.01 (歷史: 逆勢虧損率 65%)'
     else:
@@ -3570,9 +3588,10 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 🎯 TP1 (1/3) | 1:1 RR 或 0.618 Fib ext (取較近) |
 | 🎯 TP2 (1/3) | 2:1 RR 或 1.0 Fib ext (取較遠，比 TP1 更遠) |
 | 🎯 TP3 (1/3) | 放飛 + 追蹤止損 |
-| ⏰ 最佳時段 | 01:00 / 09:00 (broker time) — 勝率 60% |
-| 🚫 避開時段 | 17:00 (broker time) — 勝率 19% |
-| ⛔ 倉位上限 | 0.07+ 大倉歷史勝率僅 22% — 禁止! |
+| ⏰ 最佳時段 | 01:00 / 09:00 (broker time) — 69-sample 50-67% 勝 |
+| 🚫 避開時段 | 04:00-06:00/08:00 (broker) — 69-sample 0% 勝 (-$337+) |
+| ⚠️ 舊避開17:00 | 新數據 55.6% 勅 +$432 — 改為 advisory (不再硬擋) |
+| ⛔ 倉位上限 | 0.16+ 大倉歷史勝率 30% — 禁止! (0.07-0.15 新數據 36.8% 勝 +$365) |
 | 📉 日上限 | 最多 {MAX_DAILY_TRADES} 筆/日 |
 
 {setup_text}
@@ -3596,10 +3615,10 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | M30 ATR | ${atr_m30:.1f} |
 | 平均風險/筆 | ~${avg_risk:.0f} |
 | 建議倉位 | {vol_advice} |
-| ⛔ 大倉禁忌 | ≥0.07 歷史勝率僅 22%, 虧損 -$122/週 |
+| ⛔ 大倉禁忌 | ≥0.16 歷史勝率 30%, 虧損 -$24 (69-sample) |
 | 最大日交易數 | {MAX_DAILY_TRADES} 筆 (歷史: 17筆/日 = 過度交易) |
 | 最大日虧損 | 賬戶 2% |
-| 🎯 止盈要求 | **必須設 TP** (歷史: 89% 無 TP, 無 TP 虧損 -$317/週) |
+| 🎯 TP 要求 | **風控要求** (69-sample: 65/69 無 TP 淨 +$293 但尾部風險高) |
 | 追蹤止損 | {trail_rule} |
 
 ### 📊 歷史交易績效回顧 (Jul 2026, 123 筆)
@@ -3611,7 +3630,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 總盈虧 | -$317.09 |
 | SL 被觸發 | 36 筆, 虧損 -$524 |
 | SL 未觸發 | 58 筆, 盈利 +$323 |
-| 最佳時段 | 01:00 (+$175), 09:00 (+$78) |
+| 最佳時段 | 01:00 / 09:00 (69-sample: 中等正收益) |
 | 最差時段 | 17:00 (-$173) |
 | 最佳持倉 | 15-60min (唯一盈利時段) |
 | 最差持倉 | 5-15min (17% 勝率, -$191) |
