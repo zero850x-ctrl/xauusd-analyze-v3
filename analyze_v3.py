@@ -85,12 +85,13 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - Min holding: downstream paper_trade.py enforces 15-min minimum (scalping <15min: 21% win, -$502)
   - Cooldown: 15-min lockout after trade close (prevents 16-sec / 25-sec revenge entry)
   - Anti-martingale: downstream paper_trade.py blocks volume increase after consecutive losses
-  - Anti-stacking: downstream paper_trade.py blocks new trade when LIVE position exists
-    (NOTE: overlap analysis in scripts/mentor_trades.py is exploratory; do not use pair-sum
-    PnL as evidence to relax stacking — unique overlapping trades net ~+$428 in deduped sample)
+  - Anti-stacking: enforced by downstream paper_trade.py (Hermes stack — external, not in this repo).
+    This analyzer emits recommended_volume only; it does not implement stacking rules.
+    Overlap stats in scripts/mentor_trades.py are exploratory — do not relax stacking
+    guards based on unique-trade overlap PnL (~+$428 deduped) without verifying the executor.
   - SL floor: downstream paper_trade.py rejects SL < 0.5×ATR (too tight = noise stop-out)
   - Direction bias: counter_trend_severity == ALIGNED prevents all-counter-trend days
-  - Max holding benefit: >4h hold = 67% win, +$688, avg +$38 (best bucket)
+  - Max holding benefit: >4h hold = 64.7% win, +$571 (17 trades, deduped sample)
 
 Data sources: TradingView (OANDA:XAUUSD M30/H1/M15) + Yahoo Finance (GC=F daily)
 
@@ -2186,20 +2187,20 @@ def _time_quality_score():
 def _scalp_risk_warning():
     """Warn against ultra-short holding periods.
 
-    Updated 2026-07-18 (69-trade sample):
+    Updated 2026-07-18 (68-trade deduped sample):
     - <5min hold: 16.7% win, -$274 (12 trades)
     - 5-15min hold: 25% win, -$229 (12 trades)
-    - 15-60min hold: 13.3% win, -$283 (15 trades) ← NOT profitable (old +$49 small sample)
+    - 15-60min hold: 13.3% win, -$283 (15 trades)
     - 1-4h hold: 75% win, +$390 (12 trades)
-    - >4h hold: 66.7% win, +$688, avg +$38 (18 trades) ← LONG-TERM HOLDS WIN
+    - >4h hold: 64.7% win, +$571 (17 trades) ← LONG-TERM HOLDS WIN
     """
     return (
-        "⚠️ **反剝頭皮提醒 (基於 69 筆數據 2026-07-18):**\n"
+        "⚠️ **反剝頭皮提醒 (基於 68 筆 deduped 數據 2026-07-18):**\n"
         "- <5min 持倉: 勝率 16.7%, 虧損 -$274\n"
         "- 5-15min 持倉: 勝率 25%, 虧損 -$229\n"
-        "- 15-60min 持倉: 勝率 13.3%, 虧損 -$283 ← **新數據最差**\n"
+        "- 15-60min 持倉: 勝率 13.3%, 虧損 -$283 ← **最差**\n"
         "- 1-4h 持倉: 勝率 75%, **盈利 +$390**\n"
-        "- >4h 持倉: 勝率 66.7%, **盈利 +$688** (最佳)\n"
+        "- >4h 持倉: 勝率 64.7%, **盈利 +$571** (最佳)\n"
         "- 建議: 前輩贏錢靠放飛, 持倉 ≥1h 才讓形態充分發展"
     )
 
@@ -2207,24 +2208,20 @@ def _scalp_risk_warning():
 def _volume_risk_tier(severity='ALIGNED', vol=0.02):
     """Recommend position size with volume-aware risk tiers.
 
-    Updated 2026-07-18 (69-trade sample):
+    Updated 2026-07-18 (68-trade deduped sample):
     - 0.01-0.02: 75% win, +$38 (8 trades) — small but safe, high win rate
-    - 0.03-0.06: 37.5% win, -$86 (32 trades) — moderate, most frequent
-    - 0.07-0.15: 36.8% win, +$365 (19 trades) ← NEW: profitable mid-large
-    - 0.16+: 30% win, -$24 (10 trades) ← truly destructive
-
-    Old claim "0.07+ 22% win, -$122" was from small 15-trade sample and WRONG
-    in new data: 0.07-0.15 is the second-best tier by net PnL.
+    - 0.03-0.06: 35.5% win, -$204 (31 trades) — moderate, net negative
+    - 0.07-0.15: 36.8% win, +$365 (19 trades) — best net tier (advisory only)
+    - 0.16+: 30% win, -$24 (10 trades) — avoid
 
     Combined with counter-trend severity:
-    ALIGNED: 0.02 base, 0.05 if golden hour
+    ALIGNED: 0.02 base, 0.03 if golden hour (n=3 at 09:00; no 0.05 trades in sample)
     MILD: 0.01 (half)
     SEVERE: 0.005 (quarter) + 🚫
 
-    Cap raised 2026-07-18: 0.03→0.05 on ALIGNED+golden. The 0.07-0.15 tier
-    was the *best* net tier in the 68-trade sample (+$365, 36.8% win) —
-    the old 0.03 cap was needlessly conservative and left golden-hour
-    profits on the table. 0.16+ is still toxic and not authorized.
+    recommended_volume is advisory metadata for downstream executor — not enforced here.
+    Do not raise golden-hour cap above 0.03 without golden-hour evidence at that size;
+    0.07-0.15 profitability does not justify 0.05 (which sits in the losing 0.03-0.06 bucket).
     """
     if severity == 'SEVERE':
         return 0.005, '🚫 強烈不建議！最多 0.005 倉 (風險管理: 逆勢大倉極端波動)'
@@ -2233,7 +2230,7 @@ def _volume_risk_tier(severity='ALIGNED', vol=0.02):
     else:
         tq, _ = _time_quality_score()
         if tq == 'golden':
-            return 0.05, '🌅 順勢 + 黃金時段, 0.05 倉 (deduped: 0.07-0.15 最佳盈利桶 +$365 / 36.8% 勝; 0.16+ 才真有毒)'
+            return 0.03, '🌅 順勢 + 黃金時段, 0.03 倉 (deduped 09:00 n=3; 0.16+ 避免)'
         return 0.02, '順勢 0.02 倉'
 
 
@@ -3631,7 +3628,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | M30 ATR | ${atr_m30:.1f} |
 | 平均風險/筆 | ~${avg_risk:.0f} |
 | 建議倉位 | {vol_advice} |
-| ⛔ 大倉禁忌 | ≥0.16 歷史勝率 30%, 虧損 -$24 (69-sample) |
+| ⛔ 大倉禁忌 | ≥0.16 歷史勝率 30%, 虧損 -$24 (deduped 68-sample) |
 | 最大日交易數 | {MAX_DAILY_TRADES} 筆 (歷史: 17筆/日 = 過度交易) |
 | 最大日虧損 | 賬戶 2% |
 | 🎯 TP 要求 | **風控要求** (deduped: 64/68 無 TP, 40.6% 勝 — 尾部風險仍高) |
@@ -3651,7 +3648,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 最佳時段 | 09:00 (66.7%, +$39, n=3) |
 | 危險時段 | 04-06/08 (1/11 勝, -$520) |
 | 謹慎時段 | 17:00 (4/8 勝, +$314) — advisory only |
-| 最佳持倉 | >4h (66.7% 勝, +$688) / 1-4h (75% 勝, +$390) |
+| 最佳持倉 | >4h (64.7% 勝, +$571) / 1-4h (75% 勝, +$390) |
 | 最差持倉 | 15-60min (13.3% 勝, -$283) |
 
 > 先前 123 筆週樣本 (35% 勝, -$317) 僅供參考；以上為 2026-07-18 重算後的 deduped 樣本。
