@@ -72,24 +72,23 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
 📡 OUTPUT
   - --json → ~/.hermes/reports/xauusd_v3_<date>.json (setups, patterns, candles)
   - default → ~/.hermes/reports/xauusd_v3_<date>.md (full report with M15 section)
-  - Designed to feed paper_trade.py for simulated execution
+  - Designed for downstream execution (paper_trade.py in Hermes stack — external to this repo)
   - cron_push_eligible on each setup (JSON): kline confirmed + OK/GOOD quality +
     ALIGNED counter-trend + NOT danger hour + has TP + priority≤2 (breakout) or ≤3 (pullback/boundary/fib)
   - JSON also includes time_quality (session), counter_trend_severity, recommended_volume
 
-🚫 DISCIPLINE GUARDS (based on 15-trade review 2026-07-10 + 69-trade update 2026-07-18)
-  - Danger hour block: 04:00–06:00 broker-local (0/7 win, -$337) +
-    legacy 17:00 retained as ADVISORY (new data 55.6% win, +$432 — no longer hard block)
-  - TP mandatory: kept for risk discipline (NOT for PnL — 65/69 trades had no TP, +$293)
-  - SL mandatory: kept for risk discipline (NOT for PnL — 18/69 no-SL trades 61% win, +$311)
-  - Min holding: paper_trade.py enforces 15-min minimum (scalping <15min: 21% win, -$502)
+🚫 DISCIPLINE GUARDS (based on 15-trade review 2026-07-10 + 68-trade deduped update 2026-07-18)
+  - Danger hour block: 04:00–06:00 + 08:00 broker-local (1/11 win, -$520 in deduped sample)
+    legacy 17:00 retained as ADVISORY (deduped 4/8 win, +$314 — no longer hard block)
+  - TP mandatory: kept for risk discipline (NOT for PnL — deduped: no-TP 40.6% vs TP-set 25%)
+  - SL mandatory: kept for risk discipline (NOT for PnL — deduped: no-SL 58.8% vs SL-set 33.3%)
+  - Min holding: downstream paper_trade.py enforces 15-min minimum (scalping <15min: 21% win, -$502)
   - Cooldown: 15-min lockout after trade close (prevents 16-sec / 25-sec revenge entry)
-  - Anti-martingale: paper_trade.py blocks volume increase after consecutive losses
-  - Anti-stacking: paper_trade.py blocks new trade when LIVE position exists
-    (NOTE: 2026-07-18 data shows 95 same-direction overlap pairs net +$10,645 —
-    same-direction averaging consistent with 前輩 methodology §2「突破前底加注」.
-    Consider relaxing to block reverse-direction only. See §TODO.)
-  - SL floor: paper_trade.py rejects SL < 0.5×ATR (too tight = noise stop-out)
+  - Anti-martingale: downstream paper_trade.py blocks volume increase after consecutive losses
+  - Anti-stacking: downstream paper_trade.py blocks new trade when LIVE position exists
+    (NOTE: overlap analysis in scripts/mentor_trades.py is exploratory; do not use pair-sum
+    PnL as evidence to relax stacking — unique overlapping trades net ~+$428 in deduped sample)
+  - SL floor: downstream paper_trade.py rejects SL < 0.5×ATR (too tight = noise stop-out)
   - Direction bias: counter_trend_severity == ALIGNED prevents all-counter-trend days
   - Max holding benefit: >4h hold = 67% win, +$688, avg +$38 (best bucket)
 
@@ -1915,13 +1914,13 @@ def cron_push_eligible(setup):
     - kline_confirmed
     - quality in (OK, GOOD)
     - counter_trend_severity == ALIGNED
-    - NOT in danger hour (04-06/08 broker-local, 0% win in 69-trade sample 2026-07-18)
-      [17:00 was previously hard-blocked; new data shows 55.6% win → moved to advisory]
+    - NOT in danger hour (04-06/08 broker-local, 1/11 win in deduped 68-trade sample)
+      [17:00 was previously hard-blocked; deduped data 4/8 win → moved to advisory]
     - Has TP targets (tp1 > 0) — no naked trades
-      [Note: 69-trade sample shows no-TP trades 61% win vs TP-set 33% win — TP-mandatory
+      [Note: deduped sample shows no-TP 40.6% win vs TP-set 25% — TP-mandatory
        is a RISK MANAGEMENT guard, not a statistical edge signal.]
     - Has SL (stop_loss > 0) — no naked positions
-      [Note: 69-trade sample shows no-SL trades 61% win vs SL-set 33% win — SL-mandatory
+      [Note: deduped sample shows no-SL 58.8% win vs SL-set 33.3% — SL-mandatory
        is a RISK MANAGEMENT guard, not a statistical edge signal.]
     - breakout: priority ≤ 2; pullback/boundary/fib: priority ≤ 3
     """
@@ -1931,14 +1930,14 @@ def cron_push_eligible(setup):
         return False
     if setup.get('counter_trend_severity') != 'ALIGNED':
         return False
-    # Danger hour block (04-06/08: 0% win in 69-trade new data; 17:00 → advisory)
+    # Danger hour block (04-06/08: 1/11 win in deduped sample; 17:00 → advisory)
     if setup.get('time_quality') == 'danger':  # 'advisory' allowed through
         return False
     # Must have TP targets — no naked entries
     tp1_str = str(setup.get('tp1', ''))
     if not tp1_str or tp1_str == '0' or '$0' in tp1_str:
         return False
-    # Must have SL — risk guard (note: no-SL trades 61% win in 69-sample, but tail risk)
+    # Must have SL — risk guard (note: no-SL trades 58.8% win in deduped sample, but tail risk)
     sl_str = str(setup.get('stop_loss', ''))
     if not sl_str or sl_str == '0' or '$0' in sl_str:
         return False
@@ -2139,9 +2138,10 @@ def _counter_trend_note(side, daily_trend, h1_trend, prefix=''):
 
 
 # ═══════════════════════════════════════════════════════════
-# Trading Performance Insights (from Jul 2026 weekly analysis)
-# 123 trades analyzed: 35% win rate, -$317 total
-# Key findings encoded below as advisory functions.
+# Trading Performance Insights (Jul 2026 mentor samples)
+# Prior weekly sample: 123 trades, 35% win, -$317. Recalibrated Jul 2026-07-18:
+# 68 unique trades (deduped by ticket), 40.6% win, +$175 net.
+# Key findings encoded below as advisory functions — treat thin buckets as hypotheses.
 # ═══════════════════════════════════════════════════════════
 
 # Broker timezone offset from UTC (hours). Override via BROKER_UTC_OFFSET_HOURS env.
@@ -2149,9 +2149,9 @@ BROKER_UTC_OFFSET_HOURS = int(os.environ.get('BROKER_UTC_OFFSET_HOURS', '-3'))
 MAX_PATTERNS_PER_DIRECTION = 2  # top-N patterns per side before setup generation
 
 # Broker-local hours below (UTC + offset).
-GOLDEN_HOURS = {1, 9}        # 01:00 (4t 50%), 09:00 (3t 66.7%, +$39) — 69-trade update 2026-07-18
-DANGER_HOURS = {4, 5, 6, 8}  # 04-06 0/7 win -$337 ; 08:00 0/4 -$182
-DANGER_ADVISORY_HOURS = {17} # legacy 17:00 → ADVISORY only (55.6% win, +$432 in new data)
+GOLDEN_HOURS = {9}           # 09:00 (3t 66.7%, +$39) — deduped 68-trade sample 2026-07-18
+DANGER_HOURS = {4, 5, 6, 8}  # 04-08 combined 1/11 win (9%), -$520 (deduped sample)
+DANGER_ADVISORY_HOURS = {17} # legacy 17:00 → ADVISORY only (deduped 4/8 win, +$314)
 MAX_DAILY_TRADES = 8         # Overtrading threshold (123 trades/week = ~17/day avg)
 
 
@@ -2164,22 +2164,22 @@ def _broker_hour():
 def _time_quality_score():
     """Rate current broker time for trading quality.
 
-    Updated 2026-07-18 (69-trade sample):
-    - Golden hours (01:00, 09:00 broker): moderate positive
-    - Danger hours (04-06, 08): 0% win, heavy losses → hard block
-    - Advisory 17:00: was danger (old 15-trade), now 55.6% win in 69-trade → advisory
-    - 15:00 +$198 (5t 60%), 14:00 +$63 (3t 100%), 13:00 +$44 (2t 100%), 19:00 +$371 (avg +$93)
+    Updated 2026-07-18 (68-trade deduped sample):
+    - Golden hour (09:00 broker): 3t, 66.7% win, +$39
+    - Danger hours (04-06, 08): 1/11 win (9%), -$520 → hard block (thin sample)
+    - Advisory 17:00: was danger (old 15-trade), deduped 4/8 win +$314 → advisory
+    - 15:00 +$198 (5t 60%), 14:00 +$63 (3t 100%) — not promoted (n too small)
 
     Returns: ('golden'|'danger'|'advisory'|'normal', advisory_text)
     """
     broker_hour = _broker_hour()
 
     if broker_hour in GOLDEN_HOURS:
-        return ('golden', '🌅 黃金時段 (01:00/09:00 broker) — 適合入場')
+        return ('golden', '🌅 黃金時段 (09:00 broker) — 適合入場')
     if broker_hour in DANGER_HOURS:
-        return ('danger', '🚫 危險時段 (04-06/08 broker: 0% 勝率, -$337+) — 建議觀望')
+        return ('danger', '🚫 危險時段 (04-06/08 broker: 1/11 勝, -$520) — 建議觀望')
     if broker_hour in DANGER_ADVISORY_HOURS:
-        return ('advisory', '⚠️ 17:00 broker 時段 (舊判危險, 新數據 55.6% 勝 +$432) — 謹慎入場')
+        return ('advisory', '⚠️ 17:00 broker 時段 (舊判危險, deduped 4/8 勝 +$314) — 謹慎入場')
     return ('normal', '')
 
 
@@ -2228,8 +2228,19 @@ def _volume_risk_tier(severity='ALIGNED', vol=0.02):
     else:
         tq, _ = _time_quality_score()
         if tq == 'golden':
-            return 0.03, '🌅 順勢 + 黃金時段, 0.03 倉 (歷史: 60% 勝率)'
+            return 0.03, '🌅 順勢 + 黃金時段, 0.03 倉 (deduped: 09:00 66.7% 勝)'
         return 0.02, '順勢 0.02 倉'
+
+
+def _time_quality_label(level):
+    """Human-readable session label for report tables."""
+    if level == 'golden':
+        return '🌅 黃金時段'
+    if level == 'danger':
+        return '🚫 危險時段'
+    if level == 'advisory':
+        return '⚠️ 謹慎時段'
+    return '➖ 一般時段'
 
 
 def setup_priority(side, already_broken, daily_trend, h1_trend, quality):
@@ -3526,7 +3537,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 
     # Time quality advisory
     tq_level, tq_advice = _time_quality_score()
-    time_quality_line = f"\n| ⏰ 時段品質 | {'🌅 黃金時段' if tq_level == 'golden' else '🚫 危險時段' if tq_level == 'danger' else '➖ 一般時段'} | - | - |"
+    time_quality_line = f"\n| ⏰ 時段品質 | {_time_quality_label(tq_level)} | - | - |"
     if tq_advice:
         time_quality_line += f"\n| | {tq_advice} | - | - |"
 
@@ -3588,10 +3599,10 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 🎯 TP1 (1/3) | 1:1 RR 或 0.618 Fib ext (取較近) |
 | 🎯 TP2 (1/3) | 2:1 RR 或 1.0 Fib ext (取較遠，比 TP1 更遠) |
 | 🎯 TP3 (1/3) | 放飛 + 追蹤止損 |
-| ⏰ 最佳時段 | 01:00 / 09:00 (broker time) — 69-sample 50-67% 勝 |
-| 🚫 避開時段 | 04:00-06:00/08:00 (broker) — 69-sample 0% 勝 (-$337+) |
-| ⚠️ 舊避開17:00 | 新數據 55.6% 勅 +$432 — 改為 advisory (不再硬擋) |
-| ⛔ 倉位上限 | 0.16+ 大倉歷史勝率 30% — 禁止! (0.07-0.15 新數據 36.8% 勝 +$365) |
+| ⏰ 最佳時段 | 09:00 (broker time) — deduped 66.7% 勝 (+$39, n=3) |
+| 🚫 避開時段 | 04:00-06:00/08:00 (broker) — deduped 1/11 勝 (-$520) |
+| ⚠️ 舊避開17:00 | deduped 4/8 勝 +$314 — 改為 advisory (不再硬擋) |
+| ⛔ 倉位上限 | 0.16+ 大倉歷史勝率 30% — 建議減倉 (0.07-0.15 deduped 36.8% 勝 +$365) |
 | 📉 日上限 | 最多 {MAX_DAILY_TRADES} 筆/日 |
 
 {setup_text}
@@ -3618,22 +3629,27 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | ⛔ 大倉禁忌 | ≥0.16 歷史勝率 30%, 虧損 -$24 (69-sample) |
 | 最大日交易數 | {MAX_DAILY_TRADES} 筆 (歷史: 17筆/日 = 過度交易) |
 | 最大日虧損 | 賬戶 2% |
-| 🎯 TP 要求 | **風控要求** (69-sample: 65/69 無 TP 淨 +$293 但尾部風險高) |
+| 🎯 TP 要求 | **風控要求** (deduped: 64/68 無 TP, 40.6% 勝 — 尾部風險仍高) |
 | 追蹤止損 | {trail_rule} |
 
-### 📊 歷史交易績效回顧 (Jul 2026, 123 筆)
+### 📊 歷史交易績效回顧 (Jul 2026, deduped 68 筆 mentor sample)
 
 | 指標 | 數值 |
 |------|------|
-| 總交易數 | 123 筆/週 |
-| 勝率 | 35% (43W/80L) |
-| 總盈虧 | -$317.09 |
-| SL 被觸發 | 36 筆, 虧損 -$524 |
-| SL 未觸發 | 58 筆, 盈利 +$323 |
-| 最佳時段 | 01:00 / 09:00 (69-sample: 中等正收益) |
-| 最差時段 | 17:00 (-$173) |
-| 最佳持倉 | 15-60min (唯一盈利時段) |
-| 最差持倉 | 5-15min (17% 勝率, -$191) |
+| 總交易數 | 68 筆 (deduped by ticket, Jul 14–17) |
+| 勝率 | 40.6% (28W/40L) |
+| 總盈虧 | +$175.32 |
+| 有 SL | 51 筆, 33.3% 勝, -$18 |
+| 無 SL | 17 筆, 58.8% 勝, +$193 |
+| 有 TP | 4 筆, 25% 勝, $0 |
+| 無 TP | 64 筆, 40.6% 勝, +$175 |
+| 最佳時段 | 09:00 (66.7%, +$39, n=3) |
+| 危險時段 | 04-06/08 (1/11 勝, -$520) |
+| 謹慎時段 | 17:00 (4/8 勝, +$314) — advisory only |
+| 最佳持倉 | >4h (66.7% 勝, +$688) / 1-4h (75% 勝, +$390) |
+| 最差持倉 | 15-60min (13.3% 勝, -$283) |
+
+> 先前 123 筆週樣本 (35% 勝, -$317) 僅供參考；以上為 2026-07-18 重算後的 deduped 樣本。
 
 ## 📝 八、交易日誌
 
