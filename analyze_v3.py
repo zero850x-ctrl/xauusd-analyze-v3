@@ -2140,7 +2140,7 @@ def _counter_trend_note(side, daily_trend, h1_trend, prefix=''):
 # ═══════════════════════════════════════════════════════════
 # Trading Performance Insights (Jul 2026 mentor samples)
 # Prior weekly sample: 123 trades, 35% win, -$317. Recalibrated Jul 2026-07-18:
-# 68 unique trades (deduped by ticket), 40.6% win, +$175 net.
+# 68 unique trades (deduped by ticket), 39.7% win (27W/41L), +$175 net.
 # Key findings encoded below as advisory functions — treat thin buckets as hypotheses.
 # ═══════════════════════════════════════════════════════════
 
@@ -3637,7 +3637,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 指標 | 數值 |
 |------|------|
 | 總交易數 | 68 筆 (deduped by ticket, Jul 14–17) |
-| 勝率 | 40.6% (28W/40L) |
+| 勝率 | 39.7% (27W/41L) |
 | 總盈虧 | +$175.32 |
 | 有 SL | 51 筆, 33.3% 勝, -$18 |
 | 無 SL | 17 筆, 58.8% 勝, +$193 |
