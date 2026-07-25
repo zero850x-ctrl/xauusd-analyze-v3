@@ -1915,8 +1915,8 @@ def cron_push_eligible(setup):
     - kline_confirmed
     - quality in (OK, GOOD)
     - counter_trend_severity == ALIGNED
-    - NOT in danger hour (04-06/08 broker-local, 1/11 win in deduped 68-trade sample)
-      [17:00 was previously hard-blocked; deduped data 4/8 win → moved to advisory]
+    - NOT in danger hour (no hard-block hours as of 2026-07-24; 04-08 moved to advisory)
+      [was hard-block 04-08 on 68-sample; new week 4W/5 +$81 → advisory]
     - Has TP targets (tp1 > 0) — no naked trades
       [Note: deduped sample shows no-TP 40.6% win vs TP-set 25% — TP-mandatory
        is a RISK MANAGEMENT guard, not a statistical edge signal.]
@@ -2140,9 +2140,10 @@ def _counter_trend_note(side, daily_trend, h1_trend, prefix=''):
 
 # ═══════════════════════════════════════════════════════════
 # Trading Performance Insights (Jul 2026 mentor samples)
-# Prior weekly sample: 123 trades, 35% win, -$317. Recalibrated Jul 2026-07-18:
-# 68 unique trades (deduped by ticket), 39.7% win (27W/41L), +$175 net.
-# Key findings encoded below as advisory functions — treat thin buckets as hypotheses.
+# Recalibrated 2026-07-24: 126 trades (68 mentor deduped + 58 new Jul 20-24).
+# 40.5% win (51W/75L), net -$112. Key: short holds lose, long holds win.
+# 04-08 moved to advisory (was danger on 68-sample; new week 4W/5 +$81).
+# Same-direction stacking within 3min = consistent loss (-$151, 4 pairs).
 # ═══════════════════════════════════════════════════════════
 
 # Broker timezone offset from UTC (hours). Override via BROKER_UTC_OFFSET_HOURS env.
@@ -2150,9 +2151,9 @@ BROKER_UTC_OFFSET_HOURS = int(os.environ.get('BROKER_UTC_OFFSET_HOURS', '-3'))
 MAX_PATTERNS_PER_DIRECTION = 2  # top-N patterns per side before setup generation
 
 # Broker-local hours below (UTC + offset).
-GOLDEN_HOURS = {9}           # 09:00 (3t 66.7%, +$39) — deduped 68-trade sample 2026-07-18
-DANGER_HOURS = {4, 5, 6, 8}  # 04-08 combined 1/11 win (9%), -$520 (deduped sample)
-DANGER_ADVISORY_HOURS = {17} # legacy 17:00 → ADVISORY only (deduped 4/8 win, +$314)
+GOLDEN_HOURS = {9}           # 09:00 (66.7%) — 126-trade combined 2026-07-24
+DANGER_HOURS = set()         # 04-08 moved to advisory: new week 4W/5t +$81
+DANGER_ADVISORY_HOURS = {4, 5, 6, 8, 17}  # 04-08 + 17 — 126 combined advisory
 MAX_DAILY_TRADES = 8         # Overtrading threshold (123 trades/week = ~17/day avg)
 
 
@@ -2165,11 +2166,11 @@ def _broker_hour():
 def _time_quality_score():
     """Rate current broker time for trading quality.
 
-    Updated 2026-07-18 (68-trade deduped sample):
-    - Golden hour (09:00 broker): 3t, 66.7% win, +$39
-    - Danger hours (04-06, 08): 1/11 win (9%), -$520 → hard block (thin sample)
-    - Advisory 17:00: was danger (old 15-trade), deduped 4/8 win +$314 → advisory
-    - 15:00 +$198 (5t 60%), 14:00 +$63 (3t 100%) — not promoted (n too small)
+    Updated 2026-07-24 (126-trade combined: 68 deduped + 58 new Jul 20-24):
+    - Golden hour (09:00 broker): 66.7% win (small n)
+    - Advisory 04-08: 126-sample 5W/16t; new week 4W/5 +$81 (was danger on 68-sample)
+    - Advisory 17:00: 126-sample 5/10 win
+    - Short holds <15min: 6W/26t, -$365 (126-sample) — scalp risk
 
     Returns: ('golden'|'danger'|'advisory'|'normal', advisory_text)
     """
@@ -2178,7 +2179,7 @@ def _time_quality_score():
     if broker_hour in GOLDEN_HOURS:
         return ('golden', '🌅 黃金時段 (09:00 broker) — 適合入場')
     if broker_hour in DANGER_HOURS:
-        return ('danger', '🚫 危險時段 (04-06/08 broker: 1/11 勝, -$520) — 建議觀望')
+        return ('advisory', '⚠️ 04-08 broker (126-sample 5/16 勝; 新週 4/5 勝 +$81) — 謹慎入場')
     if broker_hour in DANGER_ADVISORY_HOURS:
         return ('advisory', '⚠️ 17:00 broker 時段 (舊判危險, deduped 4/8 勝 +$314) — 謹慎入場')
     return ('normal', '')
@@ -2187,20 +2188,20 @@ def _time_quality_score():
 def _scalp_risk_warning():
     """Warn against ultra-short holding periods.
 
-    Updated 2026-07-18 (68-trade deduped sample):
-    - <5min hold: 16.7% win, -$274 (12 trades)
-    - 5-15min hold: 25% win, -$229 (12 trades)
-    - 15-60min hold: 13.3% win, -$283 (15 trades)
-    - 1-4h hold: 75% win, +$390 (12 trades)
-    - >4h hold: 64.7% win, +$571 (17 trades) ← LONG-TERM HOLDS WIN
+    Updated 2026-07-24 (126-trade combined):
+    - <5min hold: 20% win, -$439 (22 trades) ← WORST
+    - 5-15min hold: 25% win, -$429 (28 trades)
+    - 15-60min hold: 28.6% win, -$505 (29 trades)
+    - 1-4h hold: 70% win, +$590 (20 trades) ← GOOD
+    - >4h hold: 64.3% win, +$671 (28 trades) ← BEST
     """
     return (
-        "⚠️ **反剝頭皮提醒 (基於 68 筆 deduped 數據 2026-07-18):**\n"
-        "- <5min 持倉: 勝率 16.7%, 虧損 -$274\n"
-        "- 5-15min 持倉: 勝率 25%, 虧損 -$229\n"
-        "- 15-60min 持倉: 勝率 13.3%, 虧損 -$283 ← **最差**\n"
-        "- 1-4h 持倉: 勝率 75%, **盈利 +$390**\n"
-        "- >4h 持倉: 勝率 64.7%, **盈利 +$571** (最佳)\n"
+        "⚠️ **反剝頭皮提醒 (基於 126 筆合併數據 2026-07-24):**\n"
+        "- <5min 持倉: 勝率 20%, 虧損 -$439\n"
+        "- 5-15min 持倉: 勝率 25%, 虧損 -$429\n"
+        "- 15-60min 持倉: 勝率 28.6%, 虧損 -$505 ← **最差**\n"
+        "- 1-4h 持倉: 勝率 70%, **盈利 +$590**\n"
+        "- >4h 持倉: 勝率 64.3%, **盈利 +$671** (最佳)\n"
         "- 建議: 前輩贏錢靠放飛, 持倉 ≥1h 才讓形態充分發展"
     )
 
@@ -2208,11 +2209,13 @@ def _scalp_risk_warning():
 def _volume_risk_tier(severity='ALIGNED', vol=0.02):
     """Recommend position size with volume-aware risk tiers.
 
-    Updated 2026-07-18 (68-trade deduped sample):
-    - 0.01-0.02: 75% win, +$38 (8 trades) — small but safe, high win rate
-    - 0.03-0.06: 35.5% win, -$204 (31 trades) — moderate, net negative
-    - 0.07-0.15: 36.8% win, +$365 (19 trades) — best net tier (advisory only)
-    - 0.16+: 30% win, -$24 (10 trades) — avoid
+    Updated 2026-07-24 (126-trade combined):
+    - <0.02: 29% win, -$49 (15 trades) — micro trades lose
+    - 0.02: 47% win, +$190 (38 trades) — best tier
+    - 0.03-0.04: 29% win, -$154 (48 trades) — moderate, net negative
+    - 0.05-0.06: 64% win, +$62 (17 trades) — strong
+    - 0.07-0.15: 37% win, -$136 (26 trades) — advisory only
+    - 0.16+: 27% win, -$116 (11 trades) — avoid
 
     Combined with counter-trend severity:
     ALIGNED: 0.02 base, 0.03 if golden hour (n=3 at 09:00; no 0.05 trades in sample)
@@ -3601,9 +3604,9 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 🎯 TP1 (1/3) | 1:1 RR 或 0.618 Fib ext (取較近) |
 | 🎯 TP2 (1/3) | 2:1 RR 或 1.0 Fib ext (取較遠，比 TP1 更遠) |
 | 🎯 TP3 (1/3) | 放飛 + 追蹤止損 |
-| ⏰ 最佳時段 | 09:00 (broker time) — deduped 66.7% 勝 (+$39, n=3) |
-| 🚫 避開時段 | 04:00-06:00/08:00 (broker) — deduped 1/11 勝 (-$520) |
-| ⚠️ 舊避開17:00 | deduped 4/8 勝 +$314 — 改為 advisory (不再硬擋) |
+| ⏰ 最佳時段 | 09:00 (broker time) — 126-sample 66.7% 勝 |
+| ⚠️ 謹慎時段 | 04:00-08:00/17:00 (broker) — 126-sample 5/16 勝 (advisory) |
+| ⚠️ 同向疊倉 | 3min 內同向加注: 4 對 -$151 (126-sample) — 避免 |
 | ⛔ 倉位上限 | 0.16+ 大倉歷史勝率 30% — 建議減倉 (0.07-0.15 deduped 36.8% 勝 +$365) |
 | 📉 日上限 | 最多 {MAX_DAILY_TRADES} 筆/日 |
 
@@ -3628,30 +3631,30 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | M30 ATR | ${atr_m30:.1f} |
 | 平均風險/筆 | ~${avg_risk:.0f} |
 | 建議倉位 | {vol_advice} |
-| ⛔ 大倉禁忌 | ≥0.16 歷史勝率 30%, 虧損 -$24 (deduped 68-sample) |
+| ⛔ 大倉禁忌 | ≥0.16 歷史勝率 27%, 虧損 -$116 (126-sample) |
 | 最大日交易數 | {MAX_DAILY_TRADES} 筆 (歷史: 17筆/日 = 過度交易) |
 | 最大日虧損 | 賬戶 2% |
-| 🎯 TP 要求 | **風控要求** (deduped: 64/68 無 TP, 40.6% 勝 — 尾部風險仍高) |
+| 🎯 TP 要求 | **風控要求** (126-sample: 122/126 無 TP, 41.0% 勝 — 尾部風險仍高) |
 | 追蹤止損 | {trail_rule} |
 
 ### 📊 歷史交易績效回顧 (Jul 2026, deduped 68 筆 mentor sample)
 
 | 指標 | 數值 |
 |------|------|
-| 總交易數 | 68 筆 (deduped by ticket, Jul 14–17) |
-| 勝率 | 39.7% (27W/41L) |
-| 總盈虧 | +$175.32 |
-| 有 SL | 51 筆, 33.3% 勝, -$18 |
-| 無 SL | 17 筆, 58.8% 勝, +$193 |
-| 有 TP | 4 筆, 25% 勝, $0 |
-| 無 TP | 64 筆, 40.6% 勝, +$175 |
+| 總交易數 | 126 筆 (68 deduped + 58 new Jul 20-24) |
+| 勝率 | 40.5% (51W/75L) |
+| 總盈虧 | -$111.74 |
+| 有 SL | 78 筆, 34.6% 勝 |
+| 無 SL | 33 筆, 45.5% 勝 |
+| 有 TP | 4 筆, 25% 勝 |
+| 無 TP | 122 筆, 41.0% 勝 |
 | 最佳時段 | 09:00 (66.7%, +$39, n=3) |
-| 危險時段 | 04-06/08 (1/11 勝, -$520) |
+| 謹慎時段 | 04-08 (5/16 勝, advisory) |
 | 謹慎時段 | 17:00 (4/8 勝, +$314) — advisory only |
-| 最佳持倉 | >4h (64.7% 勝, +$571) / 1-4h (75% 勝, +$390) |
-| 最差持倉 | 15-60min (13.3% 勝, -$283) |
+| 最佳持倉 | >4h (64.3% 勝, +$671) / 1-4h (70% 勝, +$590) |
+| 最差持倉 | 15-60min (28.6% 勝, -$505) |
 
-> 先前 123 筆週樣本 (35% 勝, -$317) 僅供參考；以上為 2026-07-18 重算後的 deduped 樣本。
+> 數據截至 2026-07-24: 126 筆合併 (68 deduped + 58 new), 40.5% 勝, -$112。
 
 ## 📝 八、交易日誌
 
