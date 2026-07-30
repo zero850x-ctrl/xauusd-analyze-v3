@@ -93,7 +93,14 @@ RAW_TRADES = [
 ]
 
 # Jul 20-24 mentor screenshots — paste sanitized rows here to audit 126-sample stats.
-EXTENDED_RAW_TRADES = []
+EXTENDED_RAW_TRADES = [
+    # Jul 29 screenshot — 5 trades in 18 minutes, all <6min hold, net -$146.17
+    dict(idx=70, tk=29040009, side="B", lot=0.31, op=4082.30, cp=4078.31, ot="07-29 19:13", ct="07-29 19:19", sl=4071.64, tp=None, pnl=-123.57),
+    dict(idx=71, tk=29040524, side="S", lot=0.06, op=4072.64, cp=4071.66, ot="07-29 19:19", ct="07-29 19:20", sl=None,    tp=None, pnl=5.88),
+    dict(idx=72, tk=29040622, side="B", lot=0.06, op=4070.57, cp=4068.42, ot="07-29 19:20", ct="07-29 19:23", sl=4067.64, tp=None, pnl=-12.90),
+    dict(idx=73, tk=29040861, side="B", lot=0.06, op=4067.36, cp=4064.90, ot="07-29 19:24", ct="07-29 19:25", sl=4064.90, tp=None, pnl=-14.76),
+    dict(idx=74, tk=29041087, side="B", lot=0.06, op=4066.90, cp=4066.76, ot="07-29 19:28", ct="07-29 19:31", sl=4063.70, tp=None, pnl=-0.82),
+]
 
 
 def _log(msg):
