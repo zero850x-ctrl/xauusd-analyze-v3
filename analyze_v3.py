@@ -3285,35 +3285,35 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                                 daily_trend, h1_trend, atr,
                             ))
 
-        # ── 0.786 deep retracement setup (from HK stock playbook) ──
-        near_786 = abs(current_price - fib['0.786']) < atr * 1.5
-        if near_786:
-            if trend_dir == 'BEARISH':
-                swing_high_0786 = fib_start['price']
-                entry_0786 = fib['0.786']
-                stop_0786 = swing_high_0786 + atr  # 回調浪最高點 + buffer
-                risk_0786 = stop_0786 - entry_0786
-                if risk_0786 > 0:
-                    tp1_0786 = fib['0.618']       # 跌浪中的 0.618 位置
-                    tp2_0786 = fib['swing_end']    # 跌浪最低點 (1.0 level)
-                    setups.append(_build_fib_0786_setup(
-                        'BEARISH', fib, entry_0786, stop_0786, risk_0786,
-                        tp1_0786, tp2_0786, tp3_trail,
-                        daily_trend, h1_trend, atr,
-                    ))
-            else:
-                swing_low_0786 = fib_start['price']
-                entry_0786 = fib['0.786']
-                stop_0786 = swing_low_0786 - atr  # 回調浪最低點 + buffer
-                risk_0786 = entry_0786 - stop_0786
-                if risk_0786 > 0:
-                    tp1_0786 = fib['0.618']       # 跌浪中的 0.618 位置
-                    tp2_0786 = fib['swing_end']    # 升浪最高點 (1.0 level)
-                    setups.append(_build_fib_0786_setup(
-                        'BULLISH', fib, entry_0786, stop_0786, risk_0786,
-                        tp1_0786, tp2_0786, tp3_trail,
-                        daily_trend, h1_trend, atr,
-                    ))
+            # ── 0.786 deep retracement setup (from HK stock playbook) ──
+            near_786 = abs(current_price - fib['0.786']) < atr * 1.5
+            if near_786:
+                if trend_dir == 'BEARISH':
+                    swing_high_0786 = fib_start['price']
+                    entry_0786 = fib['0.786']
+                    stop_0786 = swing_high_0786 + atr  # 回調浪最高點 + buffer
+                    risk_0786 = stop_0786 - entry_0786
+                    if risk_0786 > 0:
+                        tp1_0786 = fib['0.618']       # 跌浪中的 0.618 位置
+                        tp2_0786 = fib['swing_end']    # 跌浪最低點 (1.0 level)
+                        setups.append(_build_fib_0786_setup(
+                            'BEARISH', fib, entry_0786, stop_0786, risk_0786,
+                            tp1_0786, tp2_0786, tp3_trail,
+                            daily_trend, h1_trend, atr,
+                        ))
+                else:
+                    swing_low_0786 = fib_start['price']
+                    entry_0786 = fib['0.786']
+                    stop_0786 = swing_low_0786 - atr  # 回調浪最低點 + buffer
+                    risk_0786 = entry_0786 - stop_0786
+                    if risk_0786 > 0:
+                        tp1_0786 = fib['0.618']       # 跌浪中的 0.618 位置
+                        tp2_0786 = fib['swing_end']    # 升浪最高點 (1.0 level)
+                        setups.append(_build_fib_0786_setup(
+                            'BULLISH', fib, entry_0786, stop_0786, risk_0786,
+                            tp1_0786, tp2_0786, tp3_trail,
+                            daily_trend, h1_trend, atr,
+                        ))
 
     setups.sort(key=lambda s: (s['priority'], -s.get('rr_tp1', 0)))
     return setups
