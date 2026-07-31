@@ -26,6 +26,7 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - Double Top/Bottom: detect_double_top_bottom()
   - Channels (parallel): detect_channels()
   - Fibonacci retracement/extension for targets
+  - 0.786 deep retracement setup (from HK stock Fib 0.786 playbook research)
 
 🕯️ CANDLESTICK CONFIRMATION (17 named patterns, detect_candlestick_patterns)
   - Engulfing, Morning/Evening Star, Hammer/Shooting Star, Harami,
@@ -2395,12 +2396,83 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
     }
 
 
+def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp3_trail,
+                           daily_trend, h1_trend, atr):
+    """Build 0.786 deep retracement setup — derived from HK stock Fib 0.786 playbook.
+
+    Strategy: When price retraces deeply to 0.786 Fib level (deep wash-out),
+    enter with:
+      SL  = swing extreme (回調浪最低/高點) + buffer
+      TP1 = 0.618 Fib level (跌浪中的 0.618 位置)
+      TP2 = swing high/low (升/跌浪的最高/低點)
+    """
+    rr_tp1 = abs(tp1 - entry_level) / risk if risk > 0 else 0
+    rr_tp2 = abs(tp2 - entry_level) / risk if risk > 0 else 0
+    quality = _quality_from_rr(rr_tp1, rr_tp2)
+    severity = counter_trend_severity(side, daily_trend, h1_trend)
+    aligned = severity == 'ALIGNED'
+
+    if side == 'BEARISH':
+        swing_label = f"前頂 ${fib['swing_start']:.0f}"
+        return {
+            'direction': '🔴 SELL',
+            'priority': setup_priority(side, False, daily_trend, h1_trend, quality),
+            'pattern': f"0.786 深度回調 (${fib['swing_start']:.0f}→${fib['swing_end']:.0f})",
+            'confidence': 'MEDIUM',
+            'quality': quality,
+            'entry_mode': 'fib0786',
+            'entry_status': _entry_status_bearish(False, aligned, quality, 'fib0786', severity),
+            'entry_zone': f"${entry_level:.0f} - ${entry_level + atr:.0f}",
+            'entry_trigger': f"反彈至 0.786 Fib (${entry_level:.0f}) 後回落",
+            'add_position': '-',
+            'stop_loss': f"${stop_level:.0f}",
+            'stop_rationale': f"前頂 ${fib['swing_start']:.0f} (回調浪最高點) + 1 ATR",
+            'tp1': f"${tp1:.0f} (0.618 Fib 位, 止賺 1/3)",
+            'tp2': f"${tp2:.0f} (跌浪最低點, 止賺 1/3)",
+            'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+            'risk_amount': round(risk, 1),
+            'rr_tp1': round(rr_tp1, 1),
+            'rr_tp2': round(rr_tp2, 1),
+            'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
+            'note': '0.786 深度回調 — 港股 playbook 驗證: 19 例平均 +50%' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='0.786 Fib'),
+        }
+
+    swing_label = f"前底 ${fib['swing_start']:.0f}"
+    return {
+        'direction': '🟢 BUY',
+        'priority': setup_priority(side, False, daily_trend, h1_trend, quality),
+        'pattern': f"0.786 深度回調 (${fib['swing_start']:.0f}→${fib['swing_end']:.0f})",
+        'confidence': 'MEDIUM',
+        'quality': quality,
+        'entry_mode': 'fib0786',
+        'entry_status': _entry_status_bullish(False, aligned, quality, 'fib0786', severity),
+        'entry_zone': f"${entry_level - atr:.0f} - ${entry_level:.0f}",
+        'entry_trigger': f"回調至 0.786 Fib (${entry_level:.0f}) 後企穩",
+        'add_position': '-',
+        'stop_loss': f"${stop_level:.0f}",
+        'stop_rationale': f"前底 ${fib['swing_start']:.0f} (回調浪最低點) - 1 ATR",
+        'tp1': f"${tp1:.0f} (0.618 Fib 位, 止賺 1/3)",
+        'tp2': f"${tp2:.0f} (升浪最高點, 止賺 1/3)",
+        'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+        'risk_amount': round(risk, 1),
+        'rr_tp1': round(rr_tp1, 1),
+        'rr_tp2': round(rr_tp2, 1),
+        'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
+        'note': '0.786 深度回調 — 港股 playbook 驗證: 19 例平均 +50%' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='0.786 Fib'),
+    }
+
+
+
 def _entry_status_bearish(already_broken, aligned, quality, entry_mode='breakout', severity='ALIGNED'):
     is_aligned = severity == 'ALIGNED'
     if entry_mode == 'fib':
         if severity == 'SEVERE':
             return '🚫 Fib 回調 (日線+H1逆勢!)'
         return '⏳ 等待跌破 0.618 Fib'
+    if entry_mode == 'fib0786':
+        if severity == 'SEVERE':
+            return '🚫 0.786 深度回調 (日線+H1逆勢!)'
+        return '⏳ 等待反彈至 0.786 Fib'
     if entry_mode == 'pullback':
         if severity == 'SEVERE':
             return '🚫 反彈入場 (日線+H1逆勢!)'
@@ -2432,6 +2504,10 @@ def _entry_status_bullish(already_broken, aligned, quality, entry_mode='breakout
         if severity == 'SEVERE':
             return '🚫 Fib 回調 (日線+H1逆勢!)'
         return '⏳ 等待突破 0.618 Fib'
+    if entry_mode == 'fib0786':
+        if severity == 'SEVERE':
+            return '🚫 0.786 深度回調 (日線+H1逆勢!)'
+        return '⏳ 等待回調至 0.786 Fib'
     if entry_mode == 'pullback':
         if severity == 'SEVERE':
             return '🚫 回撤入場 (日線+H1逆勢!)'
@@ -3210,6 +3286,36 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                                 daily_trend, h1_trend, atr,
                             ))
 
+        # ── 0.786 deep retracement setup (from HK stock playbook) ──
+        near_786 = abs(current_price - fib['0.786']) < atr * 1.5
+        if near_786:
+            if trend_dir == 'BEARISH':
+                swing_high_0786 = fib_start['price']
+                entry_0786 = fib['0.786']
+                stop_0786 = swing_high_0786 + atr  # 回調浪最高點 + buffer
+                risk_0786 = stop_0786 - entry_0786
+                if risk_0786 > 0:
+                    tp1_0786 = fib['0.618']       # 跌浪中的 0.618 位置
+                    tp2_0786 = fib['swing_end']    # 跌浪最低點 (1.0 level)
+                    setups.append(_build_fib_0786_setup(
+                        'BEARISH', fib, entry_0786, stop_0786, risk_0786,
+                        tp1_0786, tp2_0786, tp3_trail,
+                        daily_trend, h1_trend, atr,
+                    ))
+            else:
+                swing_low_0786 = fib_start['price']
+                entry_0786 = fib['0.786']
+                stop_0786 = swing_low_0786 - atr  # 回調浪最低點 + buffer
+                risk_0786 = entry_0786 - stop_0786
+                if risk_0786 > 0:
+                    tp1_0786 = fib['0.618']       # 跌浪中的 0.618 位置
+                    tp2_0786 = fib['swing_end']    # 升浪最高點 (1.0 level)
+                    setups.append(_build_fib_0786_setup(
+                        'BULLISH', fib, entry_0786, stop_0786, risk_0786,
+                        tp1_0786, tp2_0786, tp3_trail,
+                        daily_trend, h1_trend, atr,
+                    ))
+
     setups.sort(key=lambda s: (s['priority'], -s.get('rr_tp1', 0)))
     return setups
 
@@ -3609,6 +3715,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 📍 加注 | 突破前底/前頂（或跌穿 neckline） |
 | 🛑 止損 | 前頂之上 / 前底之下 + 1 ATR (必設!) |
 | 🎯 TP1 (1/3) | 1:1 RR 或 0.618 Fib ext (取較近) |
+| 🔄 0.786 深度回調 | 港股 playbook 驗證: 19 例平均 +50%, SL=回調浪極端, TP1=0.618, TP2=浪頂/底 |
 | 🎯 TP2 (1/3) | 2:1 RR 或 1.0 Fib ext (取較遠，比 TP1 更遠) |
 | 🎯 TP3 (1/3) | 放飛 + 追蹤止損 |
 | ⏰ 最佳時段 | 17:00 (broker time) — 138-sample 64.3% 勝, +$339 |
