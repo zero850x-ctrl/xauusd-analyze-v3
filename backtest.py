@@ -360,9 +360,21 @@ def _parse_dollar(val):
     if isinstance(val, (int, float)):
         return float(val)
     if isinstance(val, str):
-        # Extract first number from string like "$2345 (0.618 Fib ext, 止賺 1/3)"
+        # Extract first number from strings such as '$2345 (0.618 Fib...)'.
         import re
         m = re.search(r'[\$]?([\d,.]+)', val)
+        if m:
+            return float(m.group(1).replace(',', ''))
+    return None
+
+
+def _parse_price_after_dollar(val):
+    """Parse the advertised price after '$', ignoring the Fib ratio."""
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        import re
+        m = re.search(r'\$\s*([\d,.]+)', val)
         if m:
             return float(m.group(1).replace(',', ''))
     return None
@@ -381,14 +393,21 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
         is_buy = 'BUY' in direction
         side = 'BUY' if is_buy else 'SELL'
 
-        # Entry: if already broken, use current price; else use trigger level
+        # Market setups require an explicit completed trigger.  The 0.786 setup
+        # is a touch-and-close confirmation generated on the current bar, so it
+        # is simulated as a limit fill at the advertised Fib level.
         entry_str = s.get('entry_trigger', '')
-        already_broken = '已' in entry_str  # 已突破/已跌穿
-
-        if not already_broken:
-            continue  # skip un-triggered setups
-
-        entry_price = current_price
+        entry_mode = s.get('entry_mode', '')
+        if entry_mode == 'fib0786':
+            trigger_level = _parse_price_after_dollar(entry_str)
+            if trigger_level is None:
+                continue
+            entry_price = trigger_level
+        else:
+            already_broken = '已' in entry_str  # 已突破/已跌穿
+            if not already_broken:
+                continue  # skip un-triggered setups
+            entry_price = current_price
 
         # Parse stop loss
         stop_price = _parse_dollar(s.get('stop_loss', ''))
@@ -435,12 +454,13 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
         else:
             entry_price = entry_price - SLIPPAGE_TICKS  # sell at bid (lower)
 
-        # Validate: for BUY, stop < entry < tp; for SELL, tp < entry < stop
+        # Validate the complete trade geometry: stop < entry < tp1 < tp2 for BUY;
+        # tp2 < tp1 < entry < stop for SELL.
         if is_buy:
-            if stop_price >= entry_price or tp1_price <= entry_price:
+            if not (stop_price < entry_price < tp1_price < tp2_price):
                 continue
         else:
-            if stop_price <= entry_price or tp1_price >= entry_price:
+            if not (tp2_price < tp1_price < entry_price < stop_price):
                 continue
 
         trade = Trade(

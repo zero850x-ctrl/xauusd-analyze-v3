@@ -2422,7 +2422,7 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
             'entry_mode': 'fib0786',
             'entry_status': _entry_status_bearish(False, aligned, quality, 'fib0786', severity),
             'entry_zone': f"${entry_level:.0f} - ${entry_level + atr:.0f}",
-            'entry_trigger': f"反彈至 0.786 Fib (${entry_level:.0f}) 後回落",
+            'entry_trigger': f"觸及 0.786 Fib (${entry_level:.0f}) 並收市確認回落",
             'add_position': '-',
             'stop_loss': f"${stop_level:.0f}",
             'stop_rationale': f"前頂 ${fib['swing_start']:.0f} (回調浪最高點) + 1 ATR",
@@ -2446,7 +2446,7 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
         'entry_mode': 'fib0786',
         'entry_status': _entry_status_bullish(False, aligned, quality, 'fib0786', severity),
         'entry_zone': f"${entry_level - atr:.0f} - ${entry_level:.0f}",
-        'entry_trigger': f"回調至 0.786 Fib (${entry_level:.0f}) 後企穩",
+        'entry_trigger': f"觸及 0.786 Fib (${entry_level:.0f}) 並收市確認企穩",
         'add_position': '-',
         'stop_loss': f"${stop_level:.0f}",
         'stop_rationale': f"前底 ${fib['swing_start']:.0f} (回調浪最低點) - 1 ATR",
@@ -3250,70 +3250,62 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                                 'note': '🎯 反彈入場 — 旗面內縮倉，待突破追加' if aligned else _counter_trend_note('BULLISH', daily_trend, h1_trend, prefix='反彈'),
                             })
 
-    if not setups:
-        trend_dir = daily_trend['trend']
-        if trend_dir in ('BEARISH', 'BULLISH'):
-            fib_start, fib_end = find_relevant_swing(
-                points, len(df_m30) - 1, trend_dir, atr=atr
-            )
-            if fib_start and fib_end:
-                fib = fibonacci_retracement(fib_start, fib_end)
-                near_618 = abs(current_price - fib['0.618']) < atr * 1.5
-                if near_618:
-                    if trend_dir == 'BEARISH':
-                        swing_high = fib_start['price']
-                        entry_level = fib['0.618']
-                        stop_level = swing_high + atr
-                        risk = stop_level - entry_level
-                        if risk > 0:
-                            tp1 = entry_level - risk * 0.618
-                            tp2 = entry_level - risk * 2  # 2:1 RR for TP2
-                            setups.append(_build_fib_fallback_setup(
-                                'BEARISH', fib, entry_level, stop_level, risk, tp1, tp2, tp3_trail,
-                                daily_trend, h1_trend, atr,
-                            ))
-                    else:
-                        swing_low = fib_start['price']
-                        entry_level = fib['0.618']
-                        stop_level = swing_low - atr
-                        risk = entry_level - stop_level
-                        if risk > 0:
-                            tp1 = entry_level + risk * 0.618
-                            tp2 = entry_level + risk * 2  # 2:1 RR for TP2
-                            setups.append(_build_fib_fallback_setup(
-                                'BULLISH', fib, entry_level, stop_level, risk, tp1, tp2, tp3_trail,
-                                daily_trend, h1_trend, atr,
-                            ))
+    trend_dir = daily_trend['trend']
+    if trend_dir in ('BEARISH', 'BULLISH'):
+        fib_start, fib_end = find_relevant_swing(
+            points, len(df_m30) - 1, trend_dir, atr=atr
+        )
+        fib = fibonacci_retracement(fib_start, fib_end) if fib_start and fib_end else None
 
-            # ── 0.786 deep retracement setup (from HK stock playbook) ──
-            near_786 = abs(current_price - fib['0.786']) < atr * 1.5
-            if near_786:
+        # Keep the original 0.618 fallback exclusive: 0.786 is an independent candidate.
+        if not setups and fib is not None:
+            near_618 = abs(current_price - fib['0.618']) < atr * 1.5
+            if near_618:
                 if trend_dir == 'BEARISH':
-                    swing_high_0786 = fib_start['price']
-                    entry_0786 = fib['0.786']
-                    stop_0786 = swing_high_0786 + atr  # 回調浪最高點 + buffer
-                    risk_0786 = stop_0786 - entry_0786
-                    if risk_0786 > 0:
-                        tp1_0786 = fib['0.618']       # 跌浪中的 0.618 位置
-                        tp2_0786 = fib['swing_end']    # 跌浪最低點 (1.0 level)
-                        setups.append(_build_fib_0786_setup(
-                            'BEARISH', fib, entry_0786, stop_0786, risk_0786,
-                            tp1_0786, tp2_0786, tp3_trail,
+                    entry_level = fib['0.618']
+                    stop_level = fib_start['price'] + atr
+                    risk = stop_level - entry_level
+                    if risk > 0:
+                        tp1 = entry_level - risk * 0.618
+                        tp2 = entry_level - risk * 2
+                        setups.append(_build_fib_fallback_setup(
+                            'BEARISH', fib, entry_level, stop_level, risk, tp1, tp2, tp3_trail,
                             daily_trend, h1_trend, atr,
                         ))
                 else:
-                    swing_low_0786 = fib_start['price']
-                    entry_0786 = fib['0.786']
-                    stop_0786 = swing_low_0786 - atr  # 回調浪最低點 + buffer
-                    risk_0786 = entry_0786 - stop_0786
-                    if risk_0786 > 0:
-                        tp1_0786 = fib['0.618']       # 跌浪中的 0.618 位置
-                        tp2_0786 = fib['swing_end']    # 升浪最高點 (1.0 level)
-                        setups.append(_build_fib_0786_setup(
-                            'BULLISH', fib, entry_0786, stop_0786, risk_0786,
-                            tp1_0786, tp2_0786, tp3_trail,
+                    entry_level = fib['0.618']
+                    stop_level = fib_start['price'] - atr
+                    risk = entry_level - stop_level
+                    if risk > 0:
+                        tp1 = entry_level + risk * 0.618
+                        tp2 = entry_level + risk * 2
+                        setups.append(_build_fib_fallback_setup(
+                            'BULLISH', fib, entry_level, stop_level, risk, tp1, tp2, tp3_trail,
                             daily_trend, h1_trend, atr,
                         ))
+
+        # 0.786 is evaluated even when another pattern setup exists.
+        if fib is not None and abs(current_price - fib['0.786']) < atr * 1.5:
+            if trend_dir == 'BEARISH':
+                entry_0786 = fib['0.786']
+                stop_0786 = fib_start['price'] + atr
+                risk_0786 = stop_0786 - entry_0786
+                tp1_0786, tp2_0786 = fib['0.618'], fib['swing_end']
+                if risk_0786 > 0 and tp2_0786 < tp1_0786 < entry_0786 < stop_0786:
+                    setups.append(_build_fib_0786_setup(
+                        'BEARISH', fib, entry_0786, stop_0786, risk_0786,
+                        tp1_0786, tp2_0786, tp3_trail, daily_trend, h1_trend, atr,
+                    ))
+            else:
+                entry_0786 = fib['0.786']
+                stop_0786 = fib_start['price'] - atr
+                risk_0786 = entry_0786 - stop_0786
+                tp1_0786, tp2_0786 = fib['0.618'], fib['swing_end']
+                if risk_0786 > 0 and stop_0786 < entry_0786 < tp1_0786 < tp2_0786:
+                    setups.append(_build_fib_0786_setup(
+                        'BULLISH', fib, entry_0786, stop_0786, risk_0786,
+                        tp1_0786, tp2_0786, tp3_trail, daily_trend, h1_trend, atr,
+                    ))
 
     setups.sort(key=lambda s: (s['priority'], -s.get('rr_tp1', 0)))
     return setups
