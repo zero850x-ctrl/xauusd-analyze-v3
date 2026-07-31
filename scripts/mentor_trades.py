@@ -1,24 +1,23 @@
 """One-off mentor trade analysis from Jul 2026 screenshots.
 
 Run: python scripts/mentor_trades.py
+Audit: python scripts/compute_mentor_stats.py
 
 Dedupes by ticket (keeps max-lot row). Broker hour = open-time hour as displayed
 in screenshots (assumed broker-local; cross-check vs BROKER_UTC_OFFSET_HOURS).
 
-Hour constants mirror analyze_v3.py. RAW_TRADES covers Jul 14-17 (68 deduped).
-EXTENDED_RAW_TRADES is a placeholder for Jul 20-24 rows — add sanitized tickets
-there to reproduce 126-sample stats in-repo.
+Hour constants mirror analyze_v3.py. 138 trades: 68 Jul 14-17 + 70 Jul 29-30.
 """
 import collections
 import statistics
 import sys
 from datetime import datetime
 
-GOLDEN_HOURS = {9}
+GOLDEN_HOURS = {17}
 ADVISORY_HOURS_0408 = {4, 5, 6, 8}
-ADVISORY_HOUR_1700 = {17}
-DANGER_HOURS = set()  # no hard-block hours (synced with analyze_v3.py)
-DANGER_ADVISORY_HOURS = ADVISORY_HOURS_0408 | ADVISORY_HOUR_1700
+ADVISORY_HOUR_1700 = set()
+DANGER_HOURS = {7, 18}
+DANGER_ADVISORY_HOURS = ADVISORY_HOURS_0408 | DANGER_HOURS
 
 RAW_TRADES = [
     # idx=1 dropped: duplicate ticket 28478941 (see idx=9, kept max lot)
@@ -92,7 +91,7 @@ RAW_TRADES = [
     dict(idx=69, tk=28636677, side="S", lot=0.01, op=3990.94, cp=3983.99, ot="07-17 14:39", ct="07-17 14:44", sl=None, tp=None,   pnl=6.95),
 ]
 
-# Jul 20-24 mentor screenshots — paste sanitized rows here to audit 126-sample stats.
+# Jul 29-30 mentor screenshots (70 rows; deduped with Jul 14-17 → 138 unique tickets).
 EXTENDED_RAW_TRADES = [
     # Jul 29 screenshot (5 trades) + Jul 29-30 screenshots (65 trades) = 70 extended rows total
     dict(idx=70, tk=29040009, side="B", lot=0.31, op=4082.30, cp=4078.31, ot="07-29 19:13", ct="07-29 19:19", sl=4071.64, tp=None, pnl=-123.57),
@@ -208,7 +207,9 @@ def enrich(trades):
 def hour_tag(hour):
     if hour in GOLDEN_HOURS:
         return '[G]'
-    if hour in ADVISORY_HOURS_0408 or hour in ADVISORY_HOUR_1700:
+    if hour in DANGER_HOURS:
+        return '[D]'
+    if hour in ADVISORY_HOURS_0408:
         return '[A]'
     return '   '
 
@@ -226,7 +227,7 @@ def main():
     n = len(trades)
     wins = [t for t in trades if t['win']]
     losses = [t for t in trades if not t['win']]
-    _log(f"=== Mentor sample ({n} unique tickets; {len(EXTENDED_RAW_TRADES)} extended rows pending) ===")
+    _log(f"=== Mentor sample ({n} unique tickets; {len(EXTENDED_RAW_TRADES)} Jul 29-30 rows) ===")
     _log(f"Total PnL: {sum(t['pnl'] for t in trades):+.2f}")
     _log(f"Wins: {len(wins)} ({len(wins)/n*100:.1f}%)  Losses: {len(losses)}")
     if wins:
