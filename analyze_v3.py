@@ -75,7 +75,8 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - default → ~/.hermes/reports/xauusd_v3_<date>.md (full report with M15 section)
   - Designed for downstream execution (paper_trade.py in Hermes stack — external to this repo)
   - cron_push_eligible on each setup (JSON): kline confirmed + OK/GOOD quality +
-    ALIGNED counter-trend + NOT danger hour + has TP + priority≤2 (breakout) or ≤3 (pullback/boundary/fib)
+    ALIGNED counter-trend + NOT danger hour (07/18 broker) + has TP +
+    priority≤2 (breakout) or ≤3 (pullback/boundary/fib/fib0786)
   - JSON also includes time_quality (session), counter_trend_severity, recommended_volume
 
 🚫 DISCIPLINE GUARDS (based on 138-trade combined sample through 2026-07-30)
@@ -1924,7 +1925,7 @@ def cron_push_eligible(setup):
     - Has SL (stop_loss > 0) — no naked positions
       [Note: 138-sample shows no-SL 51.4% win vs SL-set 36.9% — SL-mandatory
        is a RISK MANAGEMENT guard, not a statistical edge signal.]
-    - breakout: priority ≤ 2; pullback/boundary/fib: priority ≤ 3
+    - breakout: priority ≤ 2; pullback/boundary/fib/fib0786: priority ≤ 3
     """
     if not setup.get('kline_confirmed'):
         return False
@@ -1945,7 +1946,7 @@ def cron_push_eligible(setup):
         return False
     priority = setup.get('priority', 99)
     entry_mode = setup.get('entry_mode', 'breakout')
-    if entry_mode in ('pullback', 'boundary', 'fib'):
+    if entry_mode in ('pullback', 'boundary', 'fib', 'fib0786'):
         return priority <= 3
     return priority <= 2
 
