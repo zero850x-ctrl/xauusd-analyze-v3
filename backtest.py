@@ -222,7 +222,7 @@ class Trade:
         }
 
 
-def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open=None):
+def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open=None, exit_date=None):
     """Process one bar for an open trade. Returns True if trade fully closed.
 
     P2 FIX (implemented 2026-08-07): bar_open drives intrabar path inference.
@@ -294,6 +294,7 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
                 trade.pnl_tp2 = (entry - exit_price) * portion * CONTRACT_MULTIPLIER
             trade.pnl_tp3 = (entry - exit_price) * remaining * CONTRACT_MULTIPLIER
         trade.exit_price = exit_price
+        trade.exit_date = exit_date
         trade.exit_reason = 'Trailing stop' if trade.trail_active else 'Stop loss'
         trade.closed = True
         return True
@@ -311,7 +312,9 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
             trade.pnl_tp1 = (entry - fill) * trade.position_size / 3 * CONTRACT_MULTIPLIER
 
     # ── TP2: exit 1/3 ──
-    if tp2_in:
+    # If the stop is also inside this candle, do not claim TP2 after a
+    # possible TP1 -> reversal -> stop path.
+    if tp2_in and not stop_in:
         trade.tp2_hit = True
         if is_buy:
             fill = tp2 - SLIPPAGE_TICKS
@@ -341,6 +344,7 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
                 trade.pnl_tp2 = (exit_price - entry) * portion * CONTRACT_MULTIPLIER
             trade.pnl_tp3 = (exit_price - entry) * remaining * CONTRACT_MULTIPLIER
             trade.exit_price = exit_price
+            trade.exit_date = exit_date
             trade.exit_reason = 'Trailing stop' if trade.trail_active else 'Stop loss'
             trade.closed = True
             return True
@@ -358,6 +362,7 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
                 trade.pnl_tp2 = (entry - exit_price) * portion * CONTRACT_MULTIPLIER
             trade.pnl_tp3 = (entry - exit_price) * remaining * CONTRACT_MULTIPLIER
             trade.exit_price = exit_price
+            trade.exit_date = exit_date
             trade.exit_reason = 'Trailing stop' if trade.trail_active else 'Stop loss'
             trade.closed = True
             return True
@@ -378,7 +383,21 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
             if not trade.tp2_hit:
                 trade.pnl_tp2 = (entry - bar_close) * portion * CONTRACT_MULTIPLIER
             trade.pnl_tp3 = (entry - bar_close) * remaining * CONTRACT_MULTIPLIER
-        trade.exit_price = bar_close
+        fill = (bar_close - SLIPPAGE_TICKS) if is_buy else (bar_close + SLIPPAGE_TICKS)
+        if is_buy:
+            if not trade.tp1_hit:
+                trade.pnl_tp1 = (fill - entry) * portion * CONTRACT_MULTIPLIER
+            if not trade.tp2_hit:
+                trade.pnl_tp2 = (fill - entry) * portion * CONTRACT_MULTIPLIER
+            trade.pnl_tp3 = (fill - entry) * remaining * CONTRACT_MULTIPLIER
+        else:
+            if not trade.tp1_hit:
+                trade.pnl_tp1 = (entry - fill) * portion * CONTRACT_MULTIPLIER
+            if not trade.tp2_hit:
+                trade.pnl_tp2 = (entry - fill) * portion * CONTRACT_MULTIPLIER
+            trade.pnl_tp3 = (entry - fill) * remaining * CONTRACT_MULTIPLIER
+        trade.exit_price = fill
+        trade.exit_date = exit_date
         trade.exit_reason = f'Timeout ({MAX_BARS_HELD} bars)'
         trade.closed = True
         return True
@@ -608,7 +627,7 @@ def run_backtest(df_bars, df_day, verbose=False):
 
         still_open = []
         for trade in open_trades:
-            closed = simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr, bar_open)
+            closed = simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr, bar_open, exit_date=current_date)
             if closed:
                 closed_trades.append(trade)
                 if verbose:
@@ -687,23 +706,26 @@ def run_backtest(df_bars, df_day, verbose=False):
     last_close = float(df_bars['Close'].iloc[-1])
     last_atr = float(df_bars['ATR'].iloc[-1]) if not pd.isna(df_bars['ATR'].iloc[-1]) else 5.0
     for trade in open_trades:
-        simulate_trade_on_bar(trade, last_close, last_close, last_close, last_atr)
+        simulate_trade_on_bar(trade, last_close, last_close, last_close, last_atr, exit_date=df_bars.index[-1])
         if not trade.closed:
             # Force close — P0 FIX: close ALL remaining portions, not just tp3
             portion = trade.position_size / 3
             if trade.side == 'BUY':
+                fill = last_close - SLIPPAGE_TICKS
                 if not trade.tp1_hit:
-                    trade.pnl_tp1 = (last_close - trade.entry_price) * portion * CONTRACT_MULTIPLIER
+                    trade.pnl_tp1 = (fill - trade.entry_price) * portion * CONTRACT_MULTIPLIER
                 if not trade.tp2_hit:
-                    trade.pnl_tp2 = (last_close - trade.entry_price) * portion * CONTRACT_MULTIPLIER
-                trade.pnl_tp3 = (last_close - trade.entry_price) * (trade.position_size / 3) * CONTRACT_MULTIPLIER
+                    trade.pnl_tp2 = (fill - trade.entry_price) * portion * CONTRACT_MULTIPLIER
+                trade.pnl_tp3 = (fill - trade.entry_price) * (trade.position_size / 3) * CONTRACT_MULTIPLIER
             else:
+                fill = last_close + SLIPPAGE_TICKS
                 if not trade.tp1_hit:
-                    trade.pnl_tp1 = (trade.entry_price - last_close) * portion * CONTRACT_MULTIPLIER
+                    trade.pnl_tp1 = (trade.entry_price - fill) * portion * CONTRACT_MULTIPLIER
                 if not trade.tp2_hit:
-                    trade.pnl_tp2 = (trade.entry_price - last_close) * portion * CONTRACT_MULTIPLIER
-                trade.pnl_tp3 = (trade.entry_price - last_close) * (trade.position_size / 3) * CONTRACT_MULTIPLIER
-            trade.exit_price = last_close
+                    trade.pnl_tp2 = (trade.entry_price - fill) * portion * CONTRACT_MULTIPLIER
+                trade.pnl_tp3 = (trade.entry_price - fill) * (trade.position_size / 3) * CONTRACT_MULTIPLIER
+            trade.exit_price = fill
+            trade.exit_date = df_bars.index[-1]
             trade.exit_reason = 'End of data'
             trade.closed = True
         closed_trades.append(trade)

@@ -20,8 +20,11 @@ Usage:
   python3 paper_trade.py --seed-only        # Only seed new paper trades from latest JSON
 """
 
-import json, os, sys, argparse
+import json, os, sys, argparse, tempfile, copy
 from datetime import datetime, timezone
+
+# Match backtest.py's adverse execution model.
+SLIPPAGE_TICKS = 0.15
 import numpy as np
 import yfinance as yf
 
@@ -174,7 +177,8 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
         stop_first = bool(stop_in and (not tp_dists or abs(eff_stop - bar_open) <= min(tp_dists)))
 
         if stop_in and stop_first:
-            r_exit = (entry - eff_stop) / risk if is_sell else (eff_stop - entry) / risk
+            fill = eff_stop + SLIPPAGE_TICKS if is_sell else eff_stop - SLIPPAGE_TICKS
+            r_exit = (entry - fill) / risk if is_sell else (fill - entry) / risk
             portions_open = 3 - (1 if tp1_hit else 0) - (1 if tp2_hit else 0)
             total_r = r_tp1 + r_tp2 + r_exit * portions_open / 3.0
             trail_exit = trail_active and trail_stop is not None
@@ -183,21 +187,24 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
                 "result": "Trail" if trail_exit else "SL",
                 "pnl_r": round(total_r, 2),
                 "bars_held": bars_held,
-                "close_price": round(eff_stop, 2),
+                "close_price": round(fill, 2),
                 "tp1_hit": tp1_hit,
                 "tp2_hit": tp2_hit,
             }
 
         if not tp1_hit and tp1 > 0 and ((is_sell and low <= tp1) or (not is_sell and high >= tp1)):
             tp1_hit = True
-            r_tp1 = ((entry - tp1) / risk if is_sell else (tp1 - entry) / risk) / 3.0
+            fill = tp1 + SLIPPAGE_TICKS if is_sell else tp1 - SLIPPAGE_TICKS
+            r_tp1 = ((entry - fill) / risk if is_sell else (fill - entry) / risk) / 3.0
 
-        if not tp2_hit and tp2 > 0 and ((is_sell and low <= tp2) or (not is_sell and high >= tp2)):
+        if not tp2_hit and tp2 > 0 and not stop_in and ((is_sell and low <= tp2) or (not is_sell and high >= tp2)):
             tp2_hit = True
-            r_tp2 = ((entry - tp2) / risk if is_sell else (tp2 - entry) / risk) / 3.0
+            fill = tp2 + SLIPPAGE_TICKS if is_sell else tp2 - SLIPPAGE_TICKS
+            r_tp2 = ((entry - fill) / risk if is_sell else (fill - entry) / risk) / 3.0
 
         if bars_held >= MAX_BARS_HELD:
-            r_exit = (entry - close_px) / risk if is_sell else (close_px - entry) / risk
+            fill = close_px + SLIPPAGE_TICKS if is_sell else close_px - SLIPPAGE_TICKS
+            r_exit = (entry - fill) / risk if is_sell else (fill - entry) / risk
             portions_open = 3 - (1 if tp1_hit else 0) - (1 if tp2_hit else 0)
             total_r = r_tp1 + r_tp2 + r_exit * portions_open / 3.0
             return {
@@ -248,11 +255,19 @@ def load_log():
 
 
 def save_log(log):
-    """Atomic write: temp file + os.replace to avoid corrupt/partial log on crash."""
-    tmp_path = LOG_PATH + ".tmp"
-    with open(tmp_path, 'w') as f:
-        json.dump(log, f, indent=2, ensure_ascii=False, default=str)
-    os.replace(tmp_path, LOG_PATH)
+    """Atomic, uniquely-temporary write followed by replace."""
+    parent = os.path.dirname(LOG_PATH) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".paper_trade_log.", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(log, f, indent=2, ensure_ascii=False, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, LOG_PATH)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def _parse_dt(val):
@@ -747,7 +762,11 @@ def run_backtest(data):
     results = []
 
     # ── Discipline guards (aligned with seed_trades) ──
-    log = load_log()
+    # Use an isolated simulated log and update it after each candidate so
+    # anti-stacking, cooldown, loss and direction guards apply chronologically.
+    log = copy.deepcopy(load_log())
+    log["trades"] = [t for t in log.get("trades", []) if t.get("status") == "LIVE"]
+    log["history"] = list(log.get("history", []))
     if _runtime_danger_blocked(data):
         hour = _broker_hour(data)
         print(f"🚫 Danger hour {hour:02d}:00 broker — backtest blocked (138-sample hard-block)")
@@ -774,6 +793,8 @@ def run_backtest(data):
             entry = _parse_entry_from_setup(s, current_price)
             if entry is None:
                 continue
+            # Match backtest adverse entry fill: BUY pays ask, SELL sells bid.
+            entry = entry - SLIPPAGE_TICKS if "SELL" in direction.upper() else entry + SLIPPAGE_TICKS
             stop = float(s["stop_loss"].replace("$", "").replace(",", ""))
             tp1 = float(s["tp1"].split("$")[1].split(" ")[0]) if "tp1" in s else 0
             tp2 = float(s["tp2"].split("$")[1].split(" ")[0]) if "tp2" in s else 0
@@ -799,7 +820,7 @@ def run_backtest(data):
         scalp = " ⚠️SCALP" if bars_held < MIN_HOLDING_BARS else ""
         print(f"  {pattern}: {direction} entry={entry:.2f} SL={stop:.2f} TP1={tp1:.2f} → {status} ({pnl_r:+.1f}R, {bars_held} bars){scalp}")
 
-        results.append({
+        result_record = {
             "pattern": pattern,
             "direction": direction,
             "entry": entry,
@@ -810,7 +831,22 @@ def run_backtest(data):
             "pnl_r": pnl_r,
             "bars_held": bars_held,
             "scalp_warning": bars_held < MIN_HOLDING_BARS,
-        })
+        }
+        results.append(result_record)
+        # Feed closed simulation into history; keep LIVE simulations as an
+        # active placeholder so subsequent candidates cannot stack.
+        simulated = {
+            "direction": direction,
+            "status": "LIVE" if not sim.get("closed") else "CLOSED",
+            "seeded_time": str(seed_dt) if seed_dt else "",
+            "seeded_date": data.get("date", datetime.now().strftime('%Y-%m-%d')),
+            "pnl_r": pnl_r,
+            "close_time": str(seed_dt) if sim.get("closed") else "",
+        }
+        if simulated["status"] == "LIVE":
+            log.setdefault("trades", []).append(simulated)
+        else:
+            log.setdefault("history", []).append(simulated)
 
     if results:
         total_r = sum(r["pnl_r"] for r in results)
