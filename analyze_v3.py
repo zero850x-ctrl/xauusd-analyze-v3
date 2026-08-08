@@ -73,7 +73,7 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
 📡 OUTPUT
   - --json → ~/.hermes/reports/xauusd_v3_<date>.json (setups, patterns, candles)
   - default → ~/.hermes/reports/xauusd_v3_<date>.md (full report with M15 section)
-  - Designed for downstream execution (paper_trade.py in Hermes stack — external to this repo)
+  - Designed for downstream execution via paper_trade.py (in-repo companion module)
   - cron_push_eligible on each setup (JSON): kline confirmed + OK/GOOD quality +
     ALIGNED counter-trend + NOT danger hour (07/18 broker) + has TP +
     priority≤2 (breakout) or ≤3 (pullback/boundary/fib/fib0786)
@@ -88,10 +88,9 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - Min holding: downstream paper_trade.py enforces 15-min minimum (<15min: 26% win, -$955 combined)
   - Cooldown: 15-min lockout after trade close (prevents 16-sec / 25-sec revenge entry)
   - Anti-martingale: downstream paper_trade.py blocks volume increase after consecutive losses
-  - Anti-stacking: enforced by downstream paper_trade.py (Hermes stack — external, not in this repo).
+  - Anti-stacking: enforced by paper_trade.py — blocks ALL overlapping positions
+    (138-sample: 13 overlap pairs, -$85 net; same-dir stacking within 3min disciplined).
     This analyzer emits recommended_volume only; it does not implement stacking rules.
-    Overlap stats in scripts/mentor_trades.py are exploratory — do not relax stacking
-    guards based on unique-trade overlap PnL (~+$428 deduped) without verifying the executor.
   - SL floor: downstream paper_trade.py rejects SL < 0.5×ATR (too tight = noise stop-out)
   - Direction bias: counter_trend_severity == ALIGNED prevents all-counter-trend days
   - Max holding benefit: >4h hold = 66.7% win, +$608 (18 trades, 138-sample); 1-4h = 70% +$466
@@ -1951,7 +1950,41 @@ def cron_push_eligible(setup):
     return priority <= 2
 
 
-def _inject_push_metadata(setups, daily_trend, h1_trend):
+def _parse_entry_price_from_setup(setup, current_price=None):
+    """Machine-readable entry price for paper_trade / backtest seeding."""
+    if setup.get('entry_price') is not None:
+        try:
+            return float(setup['entry_price'])
+        except (TypeError, ValueError):
+            pass
+    trigger = setup.get('entry_trigger', '')
+    if '已突破' in trigger or '已跌穿' in trigger:
+        return float(current_price) if current_price is not None else None
+    if '$' in trigger:
+        import re
+        m = re.search(r'(\d+(?:\.\d+)?)', trigger.split('$')[-1])
+        if m:
+            return float(m.group(1))
+    return None
+
+
+def _setup_seedable(setup):
+    """Whether paper_trade / backtest can seed this setup at analyze time."""
+    if setup.get('seedable') is not None:
+        return bool(setup['seedable'])
+    status = setup.get('entry_status', '')
+    if '🚫' in status:
+        return False
+    mode = setup.get('entry_mode', 'breakout')
+    if mode in ('boundary', 'fib0786'):
+        return True
+    trigger = setup.get('entry_trigger', '')
+    if '已' in trigger:
+        return True
+    return '等待' not in status
+
+
+def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None):
     """Attach counter-trend severity, recommended volume, time quality, and cron gate."""
     tq_level, _ = _time_quality_score()
     for s in setups:
@@ -1962,6 +1995,12 @@ def _inject_push_metadata(setups, daily_trend, h1_trend):
         s['recommended_volume'] = vol
         s['time_quality'] = tq_level
         s['cron_push_eligible'] = cron_push_eligible(s)
+        s['seedable'] = _setup_seedable(s)
+        s['triggered'] = bool(s.get('triggered', s['seedable']))
+        if s['seedable'] and s.get('entry_price') is None:
+            ep = _parse_entry_price_from_setup(s, current_price)
+            if ep is not None:
+                s['entry_price'] = round(ep, 2)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2414,6 +2453,11 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
 
     if side == 'BEARISH':
         swing_label = f"前頂 ${fib['swing_start']:.0f}"
+        seedable = severity != 'SEVERE'
+        entry_status = (
+            _entry_status_bearish(False, aligned, quality, 'fib0786', severity)
+            if not seedable else '📍 0.786 接近觸發 (可入場)'
+        )
         return {
             'direction': '🔴 SELL',
             'priority': setup_priority(side, False, daily_trend, h1_trend, quality),
@@ -2421,9 +2465,12 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
             'confidence': 'MEDIUM',
             'quality': quality,
             'entry_mode': 'fib0786',
-            'entry_status': _entry_status_bearish(False, aligned, quality, 'fib0786', severity),
+            'entry_status': entry_status,
             'entry_zone': f"${entry_level:.0f} - ${entry_level + atr:.0f}",
             'entry_trigger': f"觸及 0.786 Fib (${entry_level:.0f}) 並收市確認回落",
+            'entry_price': round(entry_level, 2),
+            'seedable': seedable,
+            'triggered': seedable,
             'add_position': '-',
             'stop_loss': f"${stop_level:.0f}",
             'stop_rationale': f"前頂 ${fib['swing_start']:.0f} (回調浪最高點) + 1 ATR",
@@ -2438,6 +2485,11 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
         }
 
     swing_label = f"前底 ${fib['swing_start']:.0f}"
+    seedable = severity != 'SEVERE'
+    entry_status = (
+        _entry_status_bullish(False, aligned, quality, 'fib0786', severity)
+        if not seedable else '📍 0.786 接近觸發 (可入場)'
+    )
     return {
         'direction': '🟢 BUY',
         'priority': setup_priority(side, False, daily_trend, h1_trend, quality),
@@ -2445,9 +2497,12 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
         'confidence': 'MEDIUM',
         'quality': quality,
         'entry_mode': 'fib0786',
-        'entry_status': _entry_status_bullish(False, aligned, quality, 'fib0786', severity),
+        'entry_status': entry_status,
         'entry_zone': f"${entry_level - atr:.0f} - ${entry_level:.0f}",
         'entry_trigger': f"觸及 0.786 Fib (${entry_level:.0f}) 並收市確認企穩",
+        'entry_price': round(entry_level, 2),
+        'seedable': seedable,
+        'triggered': seedable,
         'add_position': '-',
         'stop_loss': f"${stop_level:.0f}",
         'stop_rationale': f"前底 ${fib['swing_start']:.0f} (回調浪最低點) - 1 ATR",
@@ -3863,7 +3918,7 @@ def main():
 
     # 7b. Inject K-line confirmation scores into setups (used by paper_trade + cron filtering)
     _inject_kline_scores(setups, candle_m30, candle_day, len(df_m30) - 1, len(df_day) - 1)
-    _inject_push_metadata(setups, daily_trend, h1_trend)
+    _inject_push_metadata(setups, daily_trend, h1_trend, current_price=current)
     
     # 8. Generate report
     report = generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend,
@@ -3887,6 +3942,7 @@ def main():
         tq_level, tq_advice = _time_quality_score()
         json_out = {
             'date': today,
+            'generated_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
             'price': current,
             'data_source': _data_source_label(),
             'intraday_source': DATA_SOURCE,
