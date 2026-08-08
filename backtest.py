@@ -42,6 +42,9 @@ from analyze_v3 import (
     analyze_daily_trend,
     analyze_h1_trend,
     generate_trade_setups,
+    detect_candlestick_patterns,
+    _inject_kline_scores,
+    _inject_push_metadata,
     aligned_with_trends,
     counter_trend_severity,
     _volume_risk_tier,
@@ -421,9 +424,8 @@ def _parse_dollar(val):
 def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend, h1_trend):
     """Convert generate_trade_setups() output into Trade objects.
 
-    Only takes setups that are 'already broken' (market orders) —
-    limit orders that haven't triggered are skipped (can't simulate reliably
-    in bar-by-bar without intrabar entry timing).
+    Only takes setups that are seedable/triggered (entry level actually filled).
+    Unfilled limit orders (boundary/fib0786 waiting for touch) are skipped.
     """
     trades = []
     for s in setups:
@@ -432,26 +434,22 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
         side = 'BUY' if is_buy else 'SELL'
         entry_mode = s.get('entry_mode', 'breakout')
 
-        # ── 2026-08-08 FIX: enforce cron_push_eligible gate (aligned with paper_trade) ──
+        # Require metadata gate + actual fill (seedable/triggered)
         if not s.get('cron_push_eligible', False):
+            continue
+        if not (s.get('seedable') or s.get('triggered')):
             continue
 
         entry_str = s.get('entry_trigger', '')
-        already_broken = '已' in entry_str
-        if not already_broken:
-            if s.get('seedable') or s.get('triggered'):
-                already_broken = True
-            elif entry_mode in ('boundary', 'fib0786'):
-                already_broken = True
-            else:
-                continue
-
         if s.get('entry_price') is not None:
             entry_price = float(s['entry_price'])
-        elif already_broken and entry_mode == 'breakout':
+        elif entry_mode == 'breakout' and '已' in entry_str:
             entry_price = current_price
         else:
-            entry_price = _parse_dollar(entry_str) or current_price
+            # Prefer last $ amount (trigger text often has "0.618 Fib ($3400)")
+            import re
+            m = re.search(r'(\d+(?:\.\d+)?)', entry_str.split('$')[-1]) if '$' in entry_str else None
+            entry_price = float(m.group(1)) if m else current_price
 
         # Parse stop loss
         stop_price = _parse_dollar(s.get('stop_loss', ''))
@@ -646,6 +644,30 @@ def run_backtest(df_bars, df_day, verbose=False):
             continue
 
         if not setups:
+            continue
+
+        # Inject kline + cron/seedable metadata (same path as analyze_v3.main).
+        # Without this, cron_push_eligible is always absent → zero trades.
+        try:
+            candle_m30 = detect_candlestick_patterns(window, lookback=12)
+            daily_window = (
+                df_day[df_day.index.date <= bar_date] if df_day is not None else None
+            )
+            candle_day = (
+                detect_candlestick_patterns(daily_window, lookback=12)
+                if daily_window is not None and len(daily_window) >= 5
+                else []
+            )
+            day_idx = len(daily_window) - 1 if daily_window is not None and len(daily_window) else 0
+            _inject_kline_scores(setups, candle_m30, candle_day, len(window) - 1, day_idx)
+            # Use 'normal' time quality in walk-forward — wall-clock danger hour
+            # must not zero out historical simulations.
+            _inject_push_metadata(
+                setups, daily_trend, h1_trend,
+                current_price=current_price,
+                time_quality_override='normal',
+            )
+        except Exception:
             continue
 
         # Convert setups to trades

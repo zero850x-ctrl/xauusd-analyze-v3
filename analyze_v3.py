@@ -1968,41 +1968,89 @@ def _parse_entry_price_from_setup(setup, current_price=None):
     return None
 
 
-def _setup_seedable(setup):
-    """Whether paper_trade / backtest can seed this setup at analyze time."""
+def _limit_level_touched(side_is_sell, entry_price, current_price):
+    """Whether current price has reached a limit/proximity entry level."""
+    if entry_price is None or current_price is None:
+        return False
+    if side_is_sell:
+        return float(current_price) >= float(entry_price)
+    return float(current_price) <= float(entry_price)
+
+
+def _setup_seedable(setup, current_price=None):
+    """Whether paper_trade / backtest can open this setup now (filled / triggered).
+
+    Limit modes (boundary/fib0786/pullback/fib) are seedable only after the
+    entry level is touched — never solely because the mode exists.
+    """
+    status = setup.get('entry_status', '')
+    if '🚫' in status or '待突破' in status:
+        return False
     if setup.get('seedable') is not None:
         return bool(setup['seedable'])
-    status = setup.get('entry_status', '')
-    if '🚫' in status:
-        return False
+    if setup.get('triggered') is True:
+        return True
     mode = setup.get('entry_mode', 'breakout')
-    if mode in ('boundary', 'fib0786'):
-        return True
     trigger = setup.get('entry_trigger', '')
-    if '已' in trigger:
+    if mode == 'breakout' and '已' in trigger:
         return True
-    return '等待' not in status
+    ep = _parse_entry_price_from_setup(setup, current_price)
+    if ep is not None and current_price is not None and mode in ('boundary', 'fib0786', 'fib', 'pullback'):
+        is_sell = 'SELL' in setup.get('direction', '')
+        return _limit_level_touched(is_sell, ep, current_price)
+    return False
 
 
-def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None):
-    """Attach counter-trend severity, recommended volume, time quality, and cron gate."""
-    tq_level, _ = _time_quality_score()
+def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
+                          time_quality_override=None):
+    """Attach counter-trend severity, recommended volume, time quality, and cron gate.
+
+    time_quality_override: when set (e.g. walk-forward backtest), use this level
+    instead of wall-clock _time_quality_score() so historical bars aren't gated
+    by the hour the script happens to run.
+    """
+    if time_quality_override is not None:
+        tq_level = time_quality_override
+    else:
+        tq_level, _ = _time_quality_score()
     for s in setups:
         side = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
+        is_sell = side == 'BEARISH'
         severity = counter_trend_severity(side, daily_trend, h1_trend)
         vol, _ = _volume_risk_tier(severity)
         s['counter_trend_severity'] = severity
         s['recommended_volume'] = vol
         s['time_quality'] = tq_level
-        s['seedable'] = _setup_seedable(s)
-        s['triggered'] = bool(s.get('triggered', s['seedable']))
-        if s['seedable'] and s.get('entry_price') is None:
+
+        if s.get('entry_price') is None:
             ep = _parse_entry_price_from_setup(s, current_price)
             if ep is not None:
                 s['entry_price'] = round(ep, 2)
-        # 2026-08-08 fix: compute cron_push_eligible AFTER seedable/entry_price
-        # so the gate reflects actual executability, not just pattern quality.
-        s['cron_push_eligible'] = cron_push_eligible(s) and s['seedable']
+
+        mode = s.get('entry_mode', 'breakout')
+        status = s.get('entry_status', '')
+        # triggered = fill/touch only — never default from seedable
+        if '🚫' in status or '待突破' in status:
+            triggered = False
+        elif mode == 'breakout':
+            triggered = '已' in s.get('entry_trigger', '')
+        elif s.get('entry_price') is not None and current_price is not None:
+            triggered = _limit_level_touched(is_sell, s['entry_price'], current_price)
+        else:
+            triggered = bool(s.get('triggered', False))
+        s['triggered'] = triggered
+        s['seedable'] = triggered and '🚫' not in status and '待突破' not in status
+
+        # Quality gate first; executable setups always eligible.
+        # Limit modes with a machine entry_price may also be pushed so Hermes
+        # can place a pending order — paper_trade still requires seedable.
+        base = cron_push_eligible(s)
+        if s['seedable']:
+            s['cron_push_eligible'] = base
+        elif mode in ('boundary', 'fib0786') and s.get('entry_price') is not None:
+            s['cron_push_eligible'] = base
+        else:
+            s['cron_push_eligible'] = False
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2453,28 +2501,32 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
     severity = counter_trend_severity(side, daily_trend, h1_trend)
     aligned = severity == 'ALIGNED'
 
-    # ── 2026-08-08 fix: fib0786 requires price confirmation before seedable ──
-    # The trigger explicitly states "觸及 0.786 Fib ... 並收市確認".
-    # Previously seedable was True for any non-SEVERE setup, causing premature
-    # entries. Now we require current_price to be within 1 ATR of entry_level.
-    price_confirmed = False
-    if current_price is not None:
-        if side == 'BEARISH':
-            # For SELL at 0.786 retracement: price should be near or above entry
-            price_confirmed = current_price >= entry_level - atr
-        else:
-            # For BUY at 0.786 retracement: price should be near or below entry
-            price_confirmed = current_price <= entry_level + atr
-
-    seedable = severity != 'SEVERE' and price_confirmed
+    # ── 2026-08-08 fix: fib0786 fill requires actual touch at/through level ──
+    # Symmetric proximity (abs <= ATR) is for status messaging only.
+    # seedable/triggered require price to have reached the limit:
+    #   SELL @ 0.786 → current >= entry; BUY @ 0.786 → current <= entry.
+    near = (
+        current_price is not None
+        and abs(current_price - entry_level) <= atr
+    )
+    touched = (
+        current_price is not None
+        and (
+            current_price >= entry_level if side == 'BEARISH'
+            else current_price <= entry_level
+        )
+    )
+    seedable = severity != 'SEVERE' and touched
     triggered = seedable
 
     if side == 'BEARISH':
         swing_label = f"前頂 ${fib['swing_start']:.0f}"
-        entry_status = (
-            _entry_status_bearish(False, aligned, quality, 'fib0786', severity)
-            if not seedable else '📍 0.786 已觸及 (可入場)'
-        )
+        if seedable:
+            entry_status = '📍 0.786 已觸及 (可入場)'
+        elif near and severity != 'SEVERE':
+            entry_status = '⏳ 接近 0.786 Fib (待觸及)'
+        else:
+            entry_status = _entry_status_bearish(False, aligned, quality, 'fib0786', severity)
         return {
             'direction': '🔴 SELL',
             'priority': setup_priority(side, False, daily_trend, h1_trend, quality),
@@ -2502,10 +2554,12 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
         }
 
     swing_label = f"前底 ${fib['swing_start']:.0f}"
-    entry_status = (
-        _entry_status_bullish(False, aligned, quality, 'fib0786', severity)
-        if not seedable else '📍 0.786 已觸及 (可入場)'
-    )
+    if seedable:
+        entry_status = '📍 0.786 已觸及 (可入場)'
+    elif near and severity != 'SEVERE':
+        entry_status = '⏳ 接近 0.786 Fib (待觸及)'
+    else:
+        entry_status = _entry_status_bullish(False, aligned, quality, 'fib0786', severity)
     return {
         'direction': '🟢 BUY',
         'priority': setup_priority(side, False, daily_trend, h1_trend, quality),
@@ -2928,6 +2982,9 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         'entry_status': _entry_status_bearish(False, aligned, bd_quality, 'boundary', counter_trend_severity('BEARISH', daily_trend, h1_trend)),
                         'entry_zone': f"${bd_entry - atr * 0.3:.0f} - ${bd_entry + atr * 0.3:.0f}",
                         'entry_trigger': f"限價沽出 @ ${bd_entry:.0f}（形態邊界入場）",
+                        'entry_price': round(bd_entry, 2),
+                        'seedable': False,   # limit above market — not filled yet
+                        'triggered': False,
                         'add_position': f"跌穿 ${pattern.get('neckline', bd_entry - bd_risk):.0f} 加注 {add_vol}",
                         'stop_loss': f"${bd_stop:.0f}",
                         'stop_rationale': bd_sl_rationale,
@@ -3158,6 +3215,9 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                         'entry_status': _entry_status_bullish(False, aligned, bd_quality, 'boundary', counter_trend_severity('BULLISH', daily_trend, h1_trend)),
                         'entry_zone': f"${bd_entry - atr * 0.3:.0f} - ${bd_entry + atr * 0.3:.0f}",
                         'entry_trigger': f"限價買入 @ ${bd_entry:.0f}（形態邊界入場）",
+                        'entry_price': round(bd_entry, 2),
+                        'seedable': False,   # limit below market — not filled yet
+                        'triggered': False,
                         'add_position': f"突破 ${pattern.get('neckline', bd_entry + bd_risk):.0f} 加注 {add_vol}",
                         'stop_loss': f"${bd_stop:.0f}",
                         'stop_rationale': bd_sl_rationale,
