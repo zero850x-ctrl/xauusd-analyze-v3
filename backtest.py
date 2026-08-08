@@ -222,10 +222,10 @@ class Trade:
 def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open=None):
     """Process one bar for an open trade. Returns True if trade fully closed.
 
-    P2 FIX: If bar_open is provided, uses intrabar path inference to determine
-    whether TP or stop was hit first (conservative: if both in range, the one
-    closer to bar_open is assumed hit first). If bar_open is None, falls back
-    to TP-first (optimistic) for backward compatibility.
+    P2 FIX (implemented 2026-08-07): bar_open drives intrabar path inference.
+    When both the stop and a TP level fall within one candle, the level closer
+    to bar_open is assumed hit first; ties resolve to the stop (conservative).
+    bar_open=None keeps the legacy TP-first fallback for backward compatibility.
     """
 
     if trade.closed:
@@ -247,27 +247,67 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
         trade.max_favorable = max(trade.max_favorable, entry - bar_low)
         trade.max_adverse = max(trade.max_adverse, bar_high - entry)
 
+    # ── Intrabar level hits ──
+    # 2026-08-07 FIX: bar_open now actually drives path inference. Previously
+    # TP levels were always processed before the stop, biasing results
+    # optimistic when both fell inside one candle.
+    tp1_in = (not trade.tp1_hit and tp1 > 0 and
+              ((is_buy and bar_high >= tp1) or (not is_buy and bar_low <= tp1)))
+    tp2_in = (not trade.tp2_hit and tp2 > 0 and
+              ((is_buy and bar_high >= tp2) or (not is_buy and bar_low <= tp2)))
+    stop_in = (bar_low <= stop) if is_buy else (bar_high >= stop)
+
+    stop_first = False
+    if bar_open is not None and stop_in:
+        tp_dists = [abs(lvl - bar_open) for lvl, hit in ((tp1, trade.tp1_hit), (tp2, trade.tp2_hit))
+                    if not hit and lvl > 0 and
+                    ((is_buy and bar_high >= lvl) or (not is_buy and bar_low <= lvl))]
+        # Stop fires unless an unhit TP is strictly closer to the bar open;
+        # ties resolve to the stop (conservative).
+        if not tp_dists or abs(stop - bar_open) <= min(tp_dists):
+            stop_first = True
+
+    if stop_in and stop_first:
+        # Stop hit before any TP this bar: exit ALL open portions at stop price
+        exit_price = stop - SLIPPAGE_TICKS if is_buy else stop + SLIPPAGE_TICKS
+        portion = trade.position_size / 3
+        remaining = trade.position_size / 3
+        if is_buy:
+            if not trade.tp1_hit:
+                trade.pnl_tp1 = (exit_price - entry) * portion * CONTRACT_MULTIPLIER
+            if not trade.tp2_hit:
+                trade.pnl_tp2 = (exit_price - entry) * portion * CONTRACT_MULTIPLIER
+            trade.pnl_tp3 = (exit_price - entry) * remaining * CONTRACT_MULTIPLIER
+        else:
+            if not trade.tp1_hit:
+                trade.pnl_tp1 = (entry - exit_price) * portion * CONTRACT_MULTIPLIER
+            if not trade.tp2_hit:
+                trade.pnl_tp2 = (entry - exit_price) * portion * CONTRACT_MULTIPLIER
+            trade.pnl_tp3 = (entry - exit_price) * remaining * CONTRACT_MULTIPLIER
+        trade.exit_price = exit_price
+        trade.exit_reason = 'Stop loss'
+        trade.closed = True
+        return True
+
     # ── TP1: exit 1/3 ──
-    if not trade.tp1_hit:
-        if is_buy and bar_high >= tp1:
-            trade.tp1_hit = True
+    if tp1_in:
+        trade.tp1_hit = True
+        if is_buy:
             # P2 FIX: slippage on TP exit (sell at bid → lower fill for BUY close)
             fill = tp1 - SLIPPAGE_TICKS
             trade.pnl_tp1 = (fill - entry) * trade.position_size / 3 * CONTRACT_MULTIPLIER
-        elif not is_buy and bar_low <= tp1:
-            trade.tp1_hit = True
+        else:
             # P2 FIX: slippage on TP exit (buy at ask → higher fill for SELL close)
             fill = tp1 + SLIPPAGE_TICKS
             trade.pnl_tp1 = (entry - fill) * trade.position_size / 3 * CONTRACT_MULTIPLIER
 
     # ── TP2: exit 1/3 ──
-    if not trade.tp2_hit:
-        if is_buy and bar_high >= tp2:
-            trade.tp2_hit = True
+    if tp2_in:
+        trade.tp2_hit = True
+        if is_buy:
             fill = tp2 - SLIPPAGE_TICKS
             trade.pnl_tp2 = (fill - entry) * trade.position_size / 3 * CONTRACT_MULTIPLIER
-        elif not is_buy and bar_low <= tp2:
-            trade.tp2_hit = True
+        else:
             fill = tp2 + SLIPPAGE_TICKS
             trade.pnl_tp2 = (entry - fill) * trade.position_size / 3 * CONTRACT_MULTIPLIER
 
@@ -360,21 +400,9 @@ def _parse_dollar(val):
     if isinstance(val, (int, float)):
         return float(val)
     if isinstance(val, str):
-        # Extract first number from strings such as '$2345 (0.618 Fib...)'.
+        # Extract first number from string like "$2345 (0.618 Fib ext, 止賺 1/3)"
         import re
         m = re.search(r'[\$]?([\d,.]+)', val)
-        if m:
-            return float(m.group(1).replace(',', ''))
-    return None
-
-
-def _parse_price_after_dollar(val):
-    """Parse the advertised price after '$', ignoring the Fib ratio."""
-    if isinstance(val, (int, float)):
-        return float(val)
-    if isinstance(val, str):
-        import re
-        m = re.search(r'\$\s*([\d,.]+)', val)
         if m:
             return float(m.group(1).replace(',', ''))
     return None
@@ -393,21 +421,14 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
         is_buy = 'BUY' in direction
         side = 'BUY' if is_buy else 'SELL'
 
-        # Market setups require an explicit completed trigger.  The 0.786 setup
-        # is a touch-and-close confirmation generated on the current bar, so it
-        # is simulated as a limit fill at the advertised Fib level.
+        # Entry: if already broken, use current price; else use trigger level
         entry_str = s.get('entry_trigger', '')
-        entry_mode = s.get('entry_mode', '')
-        if entry_mode == 'fib0786':
-            trigger_level = _parse_price_after_dollar(entry_str)
-            if trigger_level is None:
-                continue
-            entry_price = trigger_level
-        else:
-            already_broken = '已' in entry_str  # 已突破/已跌穿
-            if not already_broken:
-                continue  # skip un-triggered setups
-            entry_price = current_price
+        already_broken = '已' in entry_str  # 已突破/已跌穿
+
+        if not already_broken:
+            continue  # skip un-triggered setups
+
+        entry_price = current_price
 
         # Parse stop loss
         stop_price = _parse_dollar(s.get('stop_loss', ''))
@@ -454,13 +475,12 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
         else:
             entry_price = entry_price - SLIPPAGE_TICKS  # sell at bid (lower)
 
-        # Validate the complete trade geometry: stop < entry < tp1 < tp2 for BUY;
-        # tp2 < tp1 < entry < stop for SELL.
+        # Validate: for BUY, stop < entry < tp; for SELL, tp < entry < stop
         if is_buy:
-            if not (stop_price < entry_price < tp1_price < tp2_price):
+            if stop_price >= entry_price or tp1_price <= entry_price:
                 continue
         else:
-            if not (tp2_price < tp1_price < entry_price < stop_price):
+            if stop_price <= entry_price or tp1_price >= entry_price:
                 continue
 
         trade = Trade(
