@@ -151,7 +151,9 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
         if bar_time is None:
             continue
         bar_dt = _parse_dt(bar_time)
-        if seed_dt is not None and bar_dt is not None and bar_dt < seed_dt:
+        # Skip the bar containing seed_dt — it is incomplete and its full
+        # high/low/close would introduce look-ahead bias. Start from the next bar.
+        if seed_dt is not None and bar_dt is not None and bar_dt <= seed_dt:
             continue
         bars_held += 1
 
@@ -194,50 +196,6 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
             tp2_hit = True
             r_tp2 = ((entry - tp2) / risk if is_sell else (tp2 - entry) / risk) / 3.0
 
-        profit = (entry - close_px) if is_sell else (close_px - entry)
-        if tp2_hit or profit >= 2.0 * atr:
-            if is_sell:
-                new_trail = close_px + 1.5 * atr
-                if trail_stop is None or new_trail < trail_stop:
-                    trail_stop = new_trail
-                trail_stop = min(trail_stop, stop)
-            else:
-                new_trail = close_px - 1.5 * atr
-                if trail_stop is None or new_trail > trail_stop:
-                    trail_stop = new_trail
-                trail_stop = max(trail_stop, stop)
-            trail_active = True
-
-        eff_stop = _effective_stop(stop, trail_stop, trail_active, is_sell)
-        if is_sell and high >= eff_stop:
-            r_exit = (entry - eff_stop) / risk
-            portions_open = 3 - (1 if tp1_hit else 0) - (1 if tp2_hit else 0)
-            total_r = r_tp1 + r_tp2 + r_exit * portions_open / 3.0
-            trail_exit = trail_active and trail_stop is not None
-            return {
-                "closed": True,
-                "result": "Trail" if trail_exit else "SL",
-                "pnl_r": round(total_r, 2),
-                "bars_held": bars_held,
-                "close_price": round(eff_stop, 2),
-                "tp1_hit": tp1_hit,
-                "tp2_hit": tp2_hit,
-            }
-        if not is_sell and low <= eff_stop:
-            r_exit = (eff_stop - entry) / risk
-            portions_open = 3 - (1 if tp1_hit else 0) - (1 if tp2_hit else 0)
-            total_r = r_tp1 + r_tp2 + r_exit * portions_open / 3.0
-            trail_exit = trail_active and trail_stop is not None
-            return {
-                "closed": True,
-                "result": "Trail" if trail_exit else "SL",
-                "pnl_r": round(total_r, 2),
-                "bars_held": bars_held,
-                "close_price": round(eff_stop, 2),
-                "tp1_hit": tp1_hit,
-                "tp2_hit": tp2_hit,
-            }
-
         if bars_held >= MAX_BARS_HELD:
             r_exit = (entry - close_px) / risk if is_sell else (close_px - entry) / risk
             portions_open = 3 - (1 if tp1_hit else 0) - (1 if tp2_hit else 0)
@@ -251,6 +209,24 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
                 "tp1_hit": tp1_hit,
                 "tp2_hit": tp2_hit,
             }
+
+        # ── Update trailing stop AFTER all exit checks for this bar ──
+        # The new trail can only take effect from the NEXT bar, avoiding
+        # look-ahead bias (using bar close to set a stop that triggers
+        # within the same bar).
+        profit = (entry - close_px) if is_sell else (close_px - entry)
+        if tp2_hit or profit >= 2.0 * atr:
+            if is_sell:
+                new_trail = close_px + 1.5 * atr
+                if trail_stop is None or new_trail < trail_stop:
+                    trail_stop = new_trail
+                trail_stop = min(trail_stop, stop)
+            else:
+                new_trail = close_px - 1.5 * atr
+                if trail_stop is None or new_trail > trail_stop:
+                    trail_stop = new_trail
+                trail_stop = max(trail_stop, stop)
+            trail_active = True
 
     return {
         "closed": False,
@@ -272,8 +248,11 @@ def load_log():
 
 
 def save_log(log):
-    with open(LOG_PATH, 'w') as f:
+    """Atomic write: temp file + os.replace to avoid corrupt/partial log on crash."""
+    tmp_path = LOG_PATH + ".tmp"
+    with open(tmp_path, 'w') as f:
         json.dump(log, f, indent=2, ensure_ascii=False, default=str)
+    os.replace(tmp_path, LOG_PATH)
 
 
 def _parse_dt(val):
@@ -600,6 +579,9 @@ def check_outcomes(data):
 
     for trade in log["trades"]:
         if trade.get("status") != "LIVE":
+            # Preserve non-LIVE records (e.g. cancelled, partially closed)
+            # rather than silently discarding them.
+            still_live.append(trade)
             continue
 
         entry = trade.get("entry", 0)
@@ -644,7 +626,9 @@ def check_outcomes(data):
         still_live.append(trade)
         print(f"  📊 LIVE: {trade['id']} {trade['direction']} entry={entry:.2f} float={floating:+.2f} ({sim['bars_held']} bars)")
 
-    log["trades"] = [t for t in log["trades"] if t.get("status") == "LIVE"]
+    # Preserve all trades that are still LIVE or non-LIVE (e.g. cancelled).
+    # Only trades that were closed during this run are removed from trades.
+    log["trades"] = [t for t in still_live if t.get("status") == "LIVE"]
     save_log(log)
 
     print(f"\n📊 Check complete: {closed} closed, {len(still_live)} still LIVE")
@@ -758,6 +742,17 @@ def run_backtest(data):
     atr = data.get("atr_30m", 15)
     results = []
 
+    # ── Discipline guards (aligned with seed_trades) ──
+    log = load_log()
+    if _runtime_danger_blocked(data):
+        hour = _broker_hour(data)
+        print(f"🚫 Danger hour {hour:02d}:00 broker — backtest blocked (138-sample hard-block)")
+        return
+    daily_r = _daily_loss_r(log)
+    if daily_r <= -MAX_DAILY_LOSS_R:
+        print(f"🚫 Daily loss limit reached: {daily_r:.1f}R — backtest blocked")
+        return
+
     for s in setups:
         pattern = s.get("pattern", "?")
         direction = s.get("direction", "BUY")
@@ -782,6 +777,13 @@ def run_backtest(data):
             continue
 
         if abs(entry - stop) <= 0:
+            continue
+
+        # ── Per-trade discipline check ──
+        vol = s.get("recommended_volume", 0.01)
+        ok, reason = discipline_check(log, direction, vol, stop, entry, atr)
+        if not ok:
+            print(f"  {reason} ({pattern})")
             continue
 
         sim = _simulate_staged_exit(

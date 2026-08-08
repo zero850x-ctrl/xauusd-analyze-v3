@@ -251,11 +251,17 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
     # 2026-08-07 FIX: bar_open now actually drives path inference. Previously
     # TP levels were always processed before the stop, biasing results
     # optimistic when both fell inside one candle.
+    # 2026-08-08 FIX: use effective stop (trail-aware) for intrabar ordering.
     tp1_in = (not trade.tp1_hit and tp1 > 0 and
               ((is_buy and bar_high >= tp1) or (not is_buy and bar_low <= tp1)))
     tp2_in = (not trade.tp2_hit and tp2 > 0 and
               ((is_buy and bar_high >= tp2) or (not is_buy and bar_low <= tp2)))
-    stop_in = (bar_low <= stop) if is_buy else (bar_high >= stop)
+
+    # Compute effective stop before intrabar ordering so trail is respected.
+    effective_stop = stop
+    if trade.trail_active and trade.trail_stop is not None:
+        effective_stop = trade.trail_stop
+    stop_in = (bar_low <= effective_stop) if is_buy else (bar_high >= effective_stop)
 
     stop_first = False
     if bar_open is not None and stop_in:
@@ -264,12 +270,12 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
                     ((is_buy and bar_high >= lvl) or (not is_buy and bar_low <= lvl))]
         # Stop fires unless an unhit TP is strictly closer to the bar open;
         # ties resolve to the stop (conservative).
-        if not tp_dists or abs(stop - bar_open) <= min(tp_dists):
+        if not tp_dists or abs(effective_stop - bar_open) <= min(tp_dists):
             stop_first = True
 
     if stop_in and stop_first:
         # Stop hit before any TP this bar: exit ALL open portions at stop price
-        exit_price = stop - SLIPPAGE_TICKS if is_buy else stop + SLIPPAGE_TICKS
+        exit_price = effective_stop - SLIPPAGE_TICKS if is_buy else effective_stop + SLIPPAGE_TICKS
         portion = trade.position_size / 3
         remaining = trade.position_size / 3
         if is_buy:
@@ -285,7 +291,7 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
                 trade.pnl_tp2 = (entry - exit_price) * portion * CONTRACT_MULTIPLIER
             trade.pnl_tp3 = (entry - exit_price) * remaining * CONTRACT_MULTIPLIER
         trade.exit_price = exit_price
-        trade.exit_reason = 'Stop loss'
+        trade.exit_reason = 'Trailing stop' if trade.trail_active else 'Stop loss'
         trade.closed = True
         return True
 
@@ -313,18 +319,12 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
 
     # ── Trailing stop for TP3 (last 1/3) ──
     # Activate after 2×ATR profit, trail at 1.5×ATR
+    # 2026-08-08 FIX: trail update moved to end of bar (after all exit checks)
+    # to avoid look-ahead bias. The new trail takes effect from the NEXT bar.
     remaining = trade.position_size / 3  # last 1/3
 
     if is_buy:
-        profit = bar_close - entry
-        if profit >= atr_val * TRAIL_PROFIT_ATR:
-            trade.trail_active = True
-        if trade.trail_active:
-            new_trail = bar_close - atr_val * TRAIL_STOP_ATR
-            if trade.trail_stop is None or new_trail > trade.trail_stop:
-                trade.trail_stop = new_trail
-
-        # Check stop hit (original stop OR trailing stop)
+        # Check stop hit using effective stop (original or trail from PREVIOUS bar)
         effective_stop = trade.trail_stop if trade.trail_active else stop
         if bar_low <= effective_stop:
             # P2 FIX: slippage on stop exit (sell at bid → even lower for BUY stop)
@@ -343,14 +343,6 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
             return True
 
     else:  # SELL
-        profit = entry - bar_close
-        if profit >= atr_val * TRAIL_PROFIT_ATR:
-            trade.trail_active = True
-        if trade.trail_active:
-            new_trail = bar_close + atr_val * TRAIL_STOP_ATR
-            if trade.trail_stop is None or new_trail < trade.trail_stop:
-                trade.trail_stop = new_trail
-
         effective_stop = trade.trail_stop if trade.trail_active else stop
         if bar_high >= effective_stop:
             # P2 FIX: slippage on stop exit (buy at ask → even higher for SELL stop)
@@ -388,6 +380,24 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
         trade.closed = True
         return True
 
+    # ── Update trailing stop AFTER all exit checks (takes effect next bar) ──
+    if is_buy:
+        profit = bar_close - entry
+        if profit >= atr_val * TRAIL_PROFIT_ATR:
+            trade.trail_active = True
+        if trade.trail_active:
+            new_trail = bar_close - atr_val * TRAIL_STOP_ATR
+            if trade.trail_stop is None or new_trail > trade.trail_stop:
+                trade.trail_stop = new_trail
+    else:
+        profit = entry - bar_close
+        if profit >= atr_val * TRAIL_PROFIT_ATR:
+            trade.trail_active = True
+        if trade.trail_active:
+            new_trail = bar_close + atr_val * TRAIL_STOP_ATR
+            if trade.trail_stop is None or new_trail < trade.trail_stop:
+                trade.trail_stop = new_trail
+
     return False
 
 
@@ -421,6 +431,10 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
         is_buy = 'BUY' in direction
         side = 'BUY' if is_buy else 'SELL'
         entry_mode = s.get('entry_mode', 'breakout')
+
+        # ── 2026-08-08 FIX: enforce cron_push_eligible gate (aligned with paper_trade) ──
+        if not s.get('cron_push_eligible', False):
+            continue
 
         entry_str = s.get('entry_trigger', '')
         already_broken = '已' in entry_str

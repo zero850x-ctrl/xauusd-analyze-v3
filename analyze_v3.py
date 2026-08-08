@@ -1994,13 +1994,15 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None):
         s['counter_trend_severity'] = severity
         s['recommended_volume'] = vol
         s['time_quality'] = tq_level
-        s['cron_push_eligible'] = cron_push_eligible(s)
         s['seedable'] = _setup_seedable(s)
         s['triggered'] = bool(s.get('triggered', s['seedable']))
         if s['seedable'] and s.get('entry_price') is None:
             ep = _parse_entry_price_from_setup(s, current_price)
             if ep is not None:
                 s['entry_price'] = round(ep, 2)
+        # 2026-08-08 fix: compute cron_push_eligible AFTER seedable/entry_price
+        # so the gate reflects actual executability, not just pattern quality.
+        s['cron_push_eligible'] = cron_push_eligible(s) and s['seedable']
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2436,7 +2438,7 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
 
 
 def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp3_trail,
-                           daily_trend, h1_trend, atr):
+                           daily_trend, h1_trend, atr, current_price=None):
     """Build 0.786 deep retracement setup — derived from HK stock Fib 0.786 playbook.
 
     Strategy: When price retraces deeply to 0.786 Fib level (deep wash-out),
@@ -2451,12 +2453,27 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
     severity = counter_trend_severity(side, daily_trend, h1_trend)
     aligned = severity == 'ALIGNED'
 
+    # ── 2026-08-08 fix: fib0786 requires price confirmation before seedable ──
+    # The trigger explicitly states "觸及 0.786 Fib ... 並收市確認".
+    # Previously seedable was True for any non-SEVERE setup, causing premature
+    # entries. Now we require current_price to be within 1 ATR of entry_level.
+    price_confirmed = False
+    if current_price is not None:
+        if side == 'BEARISH':
+            # For SELL at 0.786 retracement: price should be near or above entry
+            price_confirmed = current_price >= entry_level - atr
+        else:
+            # For BUY at 0.786 retracement: price should be near or below entry
+            price_confirmed = current_price <= entry_level + atr
+
+    seedable = severity != 'SEVERE' and price_confirmed
+    triggered = seedable
+
     if side == 'BEARISH':
         swing_label = f"前頂 ${fib['swing_start']:.0f}"
-        seedable = severity != 'SEVERE'
         entry_status = (
             _entry_status_bearish(False, aligned, quality, 'fib0786', severity)
-            if not seedable else '📍 0.786 接近觸發 (可入場)'
+            if not seedable else '📍 0.786 已觸及 (可入場)'
         )
         return {
             'direction': '🔴 SELL',
@@ -2470,7 +2487,7 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
             'entry_trigger': f"觸及 0.786 Fib (${entry_level:.0f}) 並收市確認回落",
             'entry_price': round(entry_level, 2),
             'seedable': seedable,
-            'triggered': seedable,
+            'triggered': triggered,
             'add_position': '-',
             'stop_loss': f"${stop_level:.0f}",
             'stop_rationale': f"前頂 ${fib['swing_start']:.0f} (回調浪最高點) + 1 ATR",
@@ -2485,10 +2502,9 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
         }
 
     swing_label = f"前底 ${fib['swing_start']:.0f}"
-    seedable = severity != 'SEVERE'
     entry_status = (
         _entry_status_bullish(False, aligned, quality, 'fib0786', severity)
-        if not seedable else '📍 0.786 接近觸發 (可入場)'
+        if not seedable else '📍 0.786 已觸及 (可入場)'
     )
     return {
         'direction': '🟢 BUY',
@@ -2502,7 +2518,7 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
         'entry_trigger': f"觸及 0.786 Fib (${entry_level:.0f}) 並收市確認企穩",
         'entry_price': round(entry_level, 2),
         'seedable': seedable,
-        'triggered': seedable,
+        'triggered': triggered,
         'add_position': '-',
         'stop_loss': f"${stop_level:.0f}",
         'stop_rationale': f"前底 ${fib['swing_start']:.0f} (回調浪最低點) - 1 ATR",
@@ -3351,6 +3367,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                     setups.append(_build_fib_0786_setup(
                         'BEARISH', fib, entry_0786, stop_0786, risk_0786,
                         tp1_0786, tp2_0786, tp3_trail, daily_trend, h1_trend, atr,
+                        current_price=current_price,
                     ))
             else:
                 entry_0786 = fib['0.786']
@@ -3361,6 +3378,7 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
                     setups.append(_build_fib_0786_setup(
                         'BULLISH', fib, entry_0786, stop_0786, risk_0786,
                         tp1_0786, tp2_0786, tp3_trail, daily_trend, h1_trend, atr,
+                        current_price=current_price,
                     ))
 
     setups.sort(key=lambda s: (s['priority'], -s.get('rr_tp1', 0)))
