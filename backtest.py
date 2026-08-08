@@ -420,15 +420,24 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
         direction = s['direction']
         is_buy = 'BUY' in direction
         side = 'BUY' if is_buy else 'SELL'
+        entry_mode = s.get('entry_mode', 'breakout')
 
-        # Entry: if already broken, use current price; else use trigger level
         entry_str = s.get('entry_trigger', '')
-        already_broken = '已' in entry_str  # 已突破/已跌穿
-
+        already_broken = '已' in entry_str
         if not already_broken:
-            continue  # skip un-triggered setups
+            if s.get('seedable') or s.get('triggered'):
+                already_broken = True
+            elif entry_mode in ('boundary', 'fib0786'):
+                already_broken = True
+            else:
+                continue
 
-        entry_price = current_price
+        if s.get('entry_price') is not None:
+            entry_price = float(s['entry_price'])
+        elif already_broken and entry_mode == 'breakout':
+            entry_price = current_price
+        else:
+            entry_price = _parse_dollar(entry_str) or current_price
 
         # Parse stop loss
         stop_price = _parse_dollar(s.get('stop_loss', ''))
