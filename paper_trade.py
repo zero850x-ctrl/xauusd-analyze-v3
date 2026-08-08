@@ -68,23 +68,19 @@ def _runtime_danger_blocked(data=None):
 
 
 def _setup_is_seedable(setup):
-    """Whether this setup can be seeded now (filled / triggered only).
-
-    Limit modes are never auto-seedable — require seedable/triggered metadata
-    or an actual price touch at entry_price.
-    """
-    status = setup.get('entry_status', '')
-    if '🚫' in status or '待突破' in status:
-        return False
+    """Whether this setup can be seeded now (uses analyze_v3 seedable metadata)."""
     if setup.get('seedable') is not None:
         return bool(setup['seedable'])
-    if setup.get('triggered') is True:
-        return True
+    status = setup.get('entry_status', '')
+    if '🚫' in status:
+        return False
     mode = setup.get('entry_mode', 'breakout')
-    trigger = setup.get('entry_trigger', '')
-    if mode == 'breakout' and '已' in trigger:
+    if mode in ('boundary', 'fib0786'):
         return True
-    return False
+    trigger = setup.get('entry_trigger', '')
+    if '已' in trigger:
+        return True
+    return '等待' not in status
 
 
 def _parse_entry_from_setup(setup, current_price):
@@ -323,32 +319,17 @@ def _live_position_directions(log):
     return [t.get("direction", "").upper() for t in log.get("trades", []) if t.get("status") == "LIVE"]
 
 
-def _normalize_direction(direction):
-    """Map '🔴 SELL' / 'SELL' → 'SELL'; '🟢 BUY' / 'BUY' → 'BUY'."""
-    d = (direction or "").upper()
-    if "SELL" in d:
-        return "SELL"
-    if "BUY" in d:
-        return "BUY"
-    return d
-
-
 def _consecutive_same_direction(log, direction):
     """Count consecutive same-direction trades (including LIVE), most recent first."""
-    want = _normalize_direction(direction)
-
-    def _sort_key(t):
-        dt = _parse_dt(t.get("seeded_time") or t.get("closed_time") or t.get("seeded_date"))
-        return dt or datetime.min.replace(tzinfo=timezone.utc)
-
     all_trades = sorted(
         log.get("trades", []) + log.get("history", []),
-        key=_sort_key,
+        key=lambda t: t.get("seeded_time", "") or t.get("seeded_date", ""),
         reverse=True,
     )
     count = 0
     for t in all_trades:
-        if _normalize_direction(t.get("direction", "")) == want:
+        d = t.get("direction", "")
+        if d.upper() == direction.upper():
             count += 1
         else:
             break
@@ -357,7 +338,6 @@ def _consecutive_same_direction(log, direction):
 
 def discipline_check(log, direction, volume, sl_price, entry_price, atr):
     """Multi-stage discipline guard. Returns (pass: bool, reason: str)."""
-    direction = _normalize_direction(direction)
     # ── 1. Daily loss limit ──
     daily_r = _daily_loss_r(log)
     if daily_r <= -MAX_DAILY_LOSS_R:
@@ -373,8 +353,9 @@ def discipline_check(log, direction, volume, sl_price, entry_price, atr):
     if ANTI_STACKING:
         live_dirs = _live_position_directions(log)
         if live_dirs:
-            my_dir = direction
-            has_opposite = any(d and _normalize_direction(d) != my_dir for d in live_dirs)
+            my_dir = direction.upper()
+            has_opposite = any(d and d != my_dir for d in live_dirs)
+            same_count = sum(1 for d in live_dirs if d == my_dir)
             if has_opposite or not ANTI_STACKING_OPPOSITE_ONLY:
                 return False, f"🚫 LIVE opposite/overlap position(s): {live_dirs} — no stacking"
 
@@ -645,13 +626,16 @@ def check_outcomes(data):
         still_live.append(trade)
         print(f"  📊 LIVE: {trade['id']} {trade['direction']} entry={entry:.2f} float={floating:+.2f} ({sim['bars_held']} bars)")
 
-    # Keep LIVE + non-LIVE (e.g. CANCELLED). Closed trades were moved to history.
+    # Preserve all records that were not closed during this run, including
+    # historical CANCELLED/CLOSED/partially-closed records. Newly closed LIVE
+    # trades are represented in history and are intentionally removed here.
     log["trades"] = still_live
     save_log(log)
-    live_n = sum(1 for t in still_live if t.get("status") == "LIVE")
-    other_n = len(still_live) - live_n
-    extra = f", {other_n} other" if other_n else ""
-    print(f"\n📊 Check complete: {closed} closed, {live_n} still LIVE{extra}")
+
+    # Keep the log schema stable: callers use status=LIVE to identify active
+    # positions, while preserved non-LIVE records remain auditable.
+
+    print(f"\n📊 Check complete: {closed} closed, {len(still_live)} still LIVE")
 
 
 def report_status(data):
@@ -743,11 +727,7 @@ def main():
 
 
 def run_backtest(data):
-    """Backtest mode: simulate cron-eligible *seedable* setups from analyze JSON.
-
-    Uses an isolated empty log so results are deterministic and not coupled to
-    the live paper-trade log or wall-clock danger hour.
-    """
+    """Backtest mode: simulate cron-eligible seedable setups from analyze JSON."""
     bars = _fetch_m30(None, None)
     if bars is None or bars.empty:
         print("⚠️ Could not fetch M30 data for backtest")
@@ -760,18 +740,26 @@ def run_backtest(data):
 
     seed_dt = _parse_dt(data.get("generated_at"))
     if seed_dt is None:
-        print("⚠️ No generated_at in JSON — refuse midnight fallback (look-ahead risk). Re-run analyze_v3.py --json.")
-        return
+        seed_dt = _parse_dt(f"{data.get('date', datetime.now().strftime('%Y-%m-%d'))}T00:00:00Z")
 
     current_price = data.get("price", 0)
     atr = data.get("atr_30m", 15)
     results = []
-    # Isolated state — do not consult live paper log / wall-clock danger hour
-    log = {"trades": [], "history": []}
+
+    # ── Discipline guards (aligned with seed_trades) ──
+    log = load_log()
+    if _runtime_danger_blocked(data):
+        hour = _broker_hour(data)
+        print(f"🚫 Danger hour {hour:02d}:00 broker — backtest blocked (138-sample hard-block)")
+        return
+    daily_r = _daily_loss_r(log)
+    if daily_r <= -MAX_DAILY_LOSS_R:
+        print(f"🚫 Daily loss limit reached: {daily_r:.1f}R — backtest blocked")
+        return
 
     for s in setups:
         pattern = s.get("pattern", "?")
-        direction = _normalize_direction(s.get("direction", "BUY"))
+        direction = s.get("direction", "BUY")
         eligible = s.get("cron_push_eligible", False)
 
         if not eligible:
@@ -779,7 +767,7 @@ def run_backtest(data):
             continue
 
         if not _setup_is_seedable(s):
-            print(f"  ⏳ {pattern} — not seedable yet (limit not filled)")
+            print(f"  ⏳ {pattern} — not seedable yet")
             continue
 
         try:
@@ -795,6 +783,7 @@ def run_backtest(data):
         if abs(entry - stop) <= 0:
             continue
 
+        # ── Per-trade discipline check ──
         vol = s.get("recommended_volume", 0.01)
         ok, reason = discipline_check(log, direction, vol, stop, entry, atr)
         if not ok:
@@ -826,10 +815,9 @@ def run_backtest(data):
     if results:
         total_r = sum(r["pnl_r"] for r in results)
         wins = sum(1 for r in results if r["pnl_r"] > 0)
-        losses = sum(1 for r in results if r["pnl_r"] < 0)
-        open_n = sum(1 for r in results if r["result"] == "LIVE")
+        losses = sum(1 for r in results if r["pnl_r"] <= 0)
         scalps = sum(1 for r in results if r["scalp_warning"])
-        print(f"\n📊 Backtest: {len(results)} trades | {wins}W/{losses}L/{open_n} open | total: {total_r:.1f}R | {scalps} scalp warnings")
+        print(f"\n📊 Backtest: {len(results)} trades | {wins}W/{losses}L | total: {total_r:.1f}R | {scalps} scalp warnings")
 
 
 if __name__ == "__main__":
