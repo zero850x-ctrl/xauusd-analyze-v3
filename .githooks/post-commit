@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+repo_root=$(git rev-parse --show-toplevel)
+commit=$(git rev-parse --short HEAD)
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+out="/tmp/xauusd-analyze-${stamp}-${commit}.tar.gz"
+files=$(git ls-files | grep -Ev '(^|/)(\.env|.*credential.*|.*secret.*|.*token.*|.*\.pem$|.*\.key$|reports|logs?|cache|data)/' || true)
+[ -n "$files" ] || exit 0
+tar -czf "$out" -C "$repo_root" $files
+rclone copyto "$out" "gdrive:xauusd-analyze/${stamp}-${commit}.tar.gz"
+rclone size "gdrive:xauusd-analyze/${stamp}-${commit}.tar.gz"
+rm -f "$out"
