@@ -72,6 +72,9 @@ def _runtime_danger_blocked(data=None):
 
 def _setup_is_seedable(setup):
     """Whether this setup can be seeded now (uses analyze_v3 seedable metadata)."""
+    # Never revive an explicitly rejected setup from legacy fallbacks.
+    if setup.get('cron_push_eligible') is False:
+        return False
     if setup.get('seedable') is not None:
         return bool(setup['seedable'])
     status = setup.get('entry_status', '')
@@ -212,7 +215,7 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
                 "result": f"Timeout ({MAX_BARS_HELD} bars)",
                 "pnl_r": round(total_r, 2),
                 "bars_held": bars_held,
-                "close_price": round(close_px, 2),
+                "close_price": round(fill, 2),
                 "tp1_hit": tp1_hit,
                 "tp2_hit": tp2_hit,
             }
@@ -397,7 +400,7 @@ def discipline_check(log, direction, volume, sl_price, entry_price, atr):
 def seed_trades(data, setups=None):
     """Create paper trades from analyze_v3 JSON setups (only cron_push_eligible ones)."""
     if setups is None:
-        setups = [s for s in data.get("setups", []) if s.get("cron_push_eligible")]
+        setups = [s for s in data.get("setups", []) if s.get("cron_push_eligible") is True]
 
     if not setups:
         print("⏳ No cron_push_eligible setups to seed")
@@ -453,7 +456,17 @@ def seed_trades(data, setups=None):
             tp2 = float(s["tp2"].split("$")[1].split(" ")[0]) if "tp2" in s else 0
 
             risk = abs(entry - stop)
-            rr_tp1 = abs(entry - tp1) / risk if risk > 0 else 0
+            if risk <= 0:
+                continue
+            # Reject a stale setup if the latest report price has already
+            # crossed its protective stop.
+            report_price = float(current_price) if current_price else None
+            if report_price is not None and ((is_sell and report_price >= stop) or
+                                              (not is_sell and report_price <= stop)):
+                skipped += 1
+                print(f"  ⏭️  Skip {s.get('pattern', '?')} — current price crossed stop")
+                continue
+            rr_tp1 = abs(entry - tp1) / risk
         except (IndexError, ValueError, AttributeError):
             continue
 
@@ -508,6 +521,7 @@ def seed_trades(data, setups=None):
             "time_quality": s.get("time_quality", "?"),
             "entry_mode": s.get("entry_mode", "breakout"),
             "atr": atr,  # 2026-08-07: needed for trailing-stop simulation in check_outcomes
+            "signal_price": float(current_price) if current_price else None,
         }
         log["trades"].append(trade)
         new_count += 1
@@ -580,7 +594,8 @@ def _fetch_m30(start, end):
 def check_outcomes(data):
     """Check all LIVE paper trades against latest bars — hit SL or TP?"""
     log = load_log()
-    if not log.get("trades"):
+    live_trades = [t for t in log.get("trades", []) if t.get("status") == "LIVE"]
+    if not live_trades:
         print("⏳ No paper trades to check")
         return
 
@@ -592,7 +607,7 @@ def check_outcomes(data):
     still_live = []
     closed = 0
 
-    for trade in log["trades"]:
+    for trade in log.get("trades", []):
         if trade.get("status") != "LIVE":
             # Preserve non-LIVE records (e.g. cancelled, partially closed)
             # rather than silently discarding them.
