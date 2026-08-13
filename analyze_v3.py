@@ -2988,6 +2988,392 @@ def _enforce_tp2_beyond_tp1(tp1, tp2, entry, risk, side):
     return tp2
 
 
+def _trade_order(side):
+    return 'SELL' if side == 'BEARISH' else 'BUY'
+
+
+def _pattern_trigger_level(pattern, side, nearest_high, nearest_low):
+    if side == 'BEARISH':
+        for key in ('support', 'breakout_level', 'neckline'):
+            if key in pattern:
+                return pattern[key]
+        return nearest_low['price']
+    for key in ('resistance', 'breakout_level', 'neckline'):
+        if key in pattern:
+            return pattern[key]
+    return nearest_high['price']
+
+
+def _staged_targets(order, pattern, entry, risk):
+    """TP1/TP2 + R:R + quality for a filled or pending entry."""
+    fib_tp, fib_ext = _compute_tp1(pattern, entry, risk, order)
+    if order == 'SELL':
+        rr_tp = entry - risk
+        tp1 = max(fib_tp, rr_tp)
+        tp2_rr = entry - risk * 2
+    else:
+        rr_tp = entry + risk
+        tp1 = min(fib_tp, rr_tp)
+        tp2_rr = entry + risk * 2
+    tp2, tp2_fib = _compute_tp2(pattern, entry, risk, order, fib_ext)
+    tp2 = _enforce_tp2_beyond_tp1(tp1, tp2, entry, risk, order)
+    rr1 = abs(entry - tp1) / risk if risk else 0
+    rr2 = abs(entry - tp2) / risk if risk else 0
+    return {
+        'fib_tp': fib_tp, 'fib_ext': fib_ext, 'rr_tp': rr_tp,
+        'tp1': tp1, 'tp2': tp2, 'tp2_fib': tp2_fib, 'tp2_rr': tp2_rr,
+        'rr1': rr1, 'rr2': rr2,
+        'quality': _quality_from_rr(rr1, rr2),
+    }
+
+
+def _make_setup(side, pattern, daily_trend, h1_trend, tp3_trail, *,
+                already_broken, quality, entry_mode, entry_zone, entry_trigger,
+                add_position, stop_loss, stop_rationale, targets, risk,
+                entry_price=None, seedable=None, triggered=None, note=None,
+                priority_broken=None):
+    """Shared setup dict for boundary / breakout / pullback emitters."""
+    order = _trade_order(side)
+    severity = counter_trend_severity(side, daily_trend, h1_trend)
+    aligned = severity == 'ALIGNED'
+    status_fn = _entry_status_bearish if side == 'BEARISH' else _entry_status_bullish
+    broken_for_priority = already_broken if priority_broken is None else priority_broken
+    if note is None:
+        note = '' if aligned else _counter_trend_note(side, daily_trend, h1_trend)
+    rec = {
+        'direction': '🔴 SELL' if order == 'SELL' else '🟢 BUY',
+        'priority': setup_priority(side, broken_for_priority, daily_trend, h1_trend, quality),
+        'pattern': pattern['type'],
+        'confidence': pattern.get('confidence', 'MEDIUM'),
+        'quality': quality,
+        'entry_mode': entry_mode,
+        'entry_status': status_fn(already_broken, aligned, quality, entry_mode, severity),
+        'entry_zone': entry_zone,
+        'entry_trigger': entry_trigger,
+        'add_position': add_position,
+        'stop_loss': f"${stop_loss:.0f}",
+        'stop_rationale': stop_rationale,
+        'tp1': f"${targets['tp1']:.0f} ({_tp_method_label(pattern, targets['tp1'], targets['fib_tp'], targets['rr_tp'])}, 止賺 1/3)",
+        'tp2': f"${targets['tp2']:.0f} ({_tp_method_label(pattern, targets['tp2'], targets['fib_tp'], targets['rr_tp'], targets['tp2_fib'], targets['tp2_rr'])}, 止賺 1/3)",
+        'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+        'risk_amount': round(risk, 1),
+        'rr_tp1': round(targets['rr1'], 1),
+        'rr_tp2': round(targets['rr2'], 1),
+        'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
+        'note': note,
+    }
+    if entry_price is not None:
+        rec['entry_price'] = round(entry_price, 2)
+    if seedable is not None:
+        rec['seedable'] = seedable
+    if triggered is not None:
+        rec['triggered'] = triggered
+    return rec
+
+
+def _emit_boundary(side, pattern, current_price, atr, daily_trend, h1_trend,
+                   tp3_trail, add_vol, aligned):
+    """Limit entry at pattern boundary. None if not fillable / risk too wide."""
+    order = _trade_order(side)
+    bd_entry = _boundary_entry_level(pattern, order)
+    if not bd_entry:
+        return None
+    if order == 'SELL' and not (bd_entry > current_price):
+        return None
+    if order == 'BUY' and not (bd_entry < current_price):
+        return None
+    bd_stop = _boundary_entry_sl(pattern, order, atr, current_price)
+    bd_risk = (bd_stop - bd_entry) if order == 'SELL' else (bd_entry - bd_stop)
+    max_risk = _max_boundary_risk(atr, current_price)
+    if not (bd_risk > 0 and bd_risk <= max_risk):
+        return None
+    targets = _staged_targets(order, pattern, bd_entry, bd_risk)
+    ptype = pattern.get('type', '')
+    if 'Double' in ptype:
+        bd_sl_rationale = (
+            f"雙頂頂部 ${bd_entry:.0f} + 0.5 ATR" if order == 'SELL'
+            else f"雙底底部 ${bd_entry:.0f} - 0.5 ATR"
+        )
+    elif 'Wedge' in ptype:
+        bd_sl_rationale = (
+            f"楔形阻力 ${bd_entry:.0f} + 0.5 ATR" if order == 'SELL'
+            else f"楔形支持 ${bd_entry:.0f} - 0.5 ATR"
+        )
+    else:
+        bd_sl_rationale = (
+            f"形態邊界 ${bd_entry:.0f} + 0.5 ATR" if order == 'SELL'
+            else f"形態邊界 ${bd_entry:.0f} - 0.5 ATR"
+        )
+    add_default = (bd_entry - bd_risk) if order == 'SELL' else (bd_entry + bd_risk)
+    add_level = pattern.get('neckline', add_default)
+    add_position = (
+        f"跌穿 ${add_level:.0f} 加注 {add_vol}" if order == 'SELL'
+        else f"突破 ${add_level:.0f} 加注 {add_vol}"
+    )
+    if aligned:
+        note = (
+            '📍 形態邊界入場 — 不等待跌穿，較佳R:R' if order == 'SELL'
+            else '📍 形態邊界入場 — 不等待突破，較佳R:R'
+        )
+    else:
+        note = _counter_trend_note(
+            side, daily_trend, h1_trend,
+            prefix='邊界沽' if order == 'SELL' else '邊界買',
+        )
+    return _make_setup(
+        side, pattern, daily_trend, h1_trend, tp3_trail,
+        already_broken=False,
+        quality=targets['quality'],
+        entry_mode='boundary',
+        entry_zone=f"${bd_entry - atr * 0.3:.0f} - ${bd_entry + atr * 0.3:.0f}",
+        entry_trigger=(
+            f"限價沽出 @ ${bd_entry:.0f}（形態邊界入場）" if order == 'SELL'
+            else f"限價買入 @ ${bd_entry:.0f}（形態邊界入場）"
+        ),
+        add_position=add_position,
+        stop_loss=bd_stop,
+        stop_rationale=bd_sl_rationale,
+        targets=targets,
+        risk=bd_risk,
+        entry_price=bd_entry,
+        seedable=False,
+        triggered=False,
+        note=note,
+        priority_broken=False,
+    )
+
+
+def _breakout_stop(order, pattern, current_price, atr, nearest_high, nearest_low, actual_entry):
+    """Structure-first stop; cap 2 ATR (struct) / 3 ATR (swing) from current."""
+    struct_stop, has_struct = pattern_structure_stop(pattern, order, atr)
+    stop_swing = pattern_stop_swing(pattern, order, nearest_high, nearest_low)
+    if order == 'SELL':
+        if has_struct:
+            stop_level = min(struct_stop, current_price + atr * 2)
+        else:
+            stop_level = min(stop_swing + atr, current_price + atr * 3)
+        risk = stop_level - actual_entry
+    else:
+        if has_struct:
+            stop_level = max(struct_stop, current_price - atr * 2)
+        else:
+            stop_level = max(stop_swing - atr, current_price - atr * 3)
+        risk = actual_entry - stop_level
+    return stop_level, stop_swing, has_struct, risk
+
+
+def _breakout_stop_rationale(order, pattern, atr, stop_level, stop_swing, has_struct):
+    ptype = pattern.get('type', '')
+    is_wedge = 'Wedge' in ptype or '楔形' in ptype
+    if order == 'SELL':
+        if has_struct:
+            flag_high = pattern.get('flag_high', 0)
+            if 'resistance' in pattern and is_wedge:
+                flag_high = pattern['resistance']
+                return f"旗面結構止損 (resistance ${flag_high:.0f} + 0.5 ATR)"
+            return f"旗面結構止損 (flag_high ${flag_high:.0f} + 0.5 ATR)"
+        if stop_level == stop_swing + atr:
+            return f"前頂 ${stop_swing:.0f} + 1 ATR (${atr:.0f})"
+        return f"3 ATR 封頂 (前頂 ${stop_swing:.0f} 太遠)"
+    if has_struct:
+        flag_low = pattern.get('flag_low', 0)
+        if 'support' in pattern and is_wedge:
+            flag_low = pattern['support']
+            return f"旗面結構止損 (support ${flag_low:.0f} - 0.5 ATR)"
+        return f"旗面結構止損 (flag_low ${flag_low:.0f} - 0.5 ATR)"
+    if stop_level == stop_swing - atr:
+        return f"前底 ${stop_swing:.0f} - 1 ATR (${atr:.0f})"
+    return f"3 ATR 封底 (前底 ${stop_swing:.0f} 太遠)"
+
+
+def _emit_breakout(side, pattern, current_price, atr, daily_trend, h1_trend,
+                   tp3_trail, trigger_level, already_broken, add_vol,
+                   nearest_high, nearest_low, points):
+    """Breakout / breakdown setup. None if risk is non-positive.
+
+    Asymmetry preserved: bearish entry zone tightens after a break; bullish
+    zone is always trigger .. trigger+0.5 ATR. Broken-trigger copy also differs.
+    """
+    order = _trade_order(side)
+    actual_entry = current_price if already_broken else trigger_level
+    if order == 'SELL':
+        if already_broken:
+            entry_low = current_price - atr * 0.3
+            entry_high = min(current_price + atr * 0.3, trigger_level)
+        else:
+            entry_low = trigger_level - atr * 0.5
+            entry_high = trigger_level
+        entry_trigger = (
+            f"跌穿 ${trigger_level:.0f} 入場" if not already_broken
+            else f"已跌穿 ${trigger_level:.0f}，現價 ${current_price:.0f} 入場"
+        )
+        add_verb = '跌穿'
+    else:
+        entry_low = trigger_level
+        entry_high = trigger_level + atr * 0.5
+        entry_trigger = (
+            f"突破 ${trigger_level:.0f}" if not already_broken
+            else f"已突破 ${trigger_level:.0f}"
+        )
+        add_verb = '突破'
+
+    stop_level, stop_swing, has_struct, risk = _breakout_stop(
+        order, pattern, current_price, atr, nearest_high, nearest_low, actual_entry,
+    )
+    if risk <= 0:
+        return None
+    targets = _staged_targets(order, pattern, actual_entry, risk)
+    quality = targets['quality']
+    if quality in ('OK', 'GOOD') and already_broken and not _pattern_breakout_confirmed(pattern):
+        quality = 'UNCONFIRMED'
+    add_level = pattern_add_level(pattern, order, points, trigger_level)
+    return _make_setup(
+        side, pattern, daily_trend, h1_trend, tp3_trail,
+        already_broken=already_broken,
+        quality=quality,
+        entry_mode='breakout',
+        entry_zone=f"${entry_low:.0f} - ${entry_high:.0f}",
+        entry_trigger=entry_trigger,
+        add_position=f"{add_verb} ${add_level:.0f} 加注 {add_vol}",
+        stop_loss=stop_level,
+        stop_rationale=_breakout_stop_rationale(
+            order, pattern, atr, stop_level, stop_swing, has_struct,
+        ),
+        targets=targets,
+        risk=risk,
+    ), add_level
+
+
+def _emit_pullback(side, pattern, current_price, atr, daily_trend, h1_trend,
+                   tp3_trail, already_broken, add_vol, add_level, aligned):
+    """Flag/wedge pullback while still inside the consolidation. None if ineligible."""
+    if already_broken:
+        return None
+    ptype = pattern.get('type', '')
+    is_flag = 'Flag' in ptype
+    is_wedge = 'Wedge' in ptype or '楔形' in ptype
+    if not (is_flag or is_wedge):
+        return None
+    if not _pullback_consolidation_ok(pattern, atr, is_flag, is_wedge):
+        return None
+
+    order = _trade_order(side)
+    flag_high = pattern.get('flag_high')
+    if flag_high is None and 'resistance' in pattern:
+        flag_high = pattern['resistance']
+    flag_low = pattern.get('flag_low')
+    if flag_low is None and 'support' in pattern:
+        flag_low = pattern['support']
+
+    if order == 'SELL':
+        if flag_high is None:
+            return None
+        near = abs(current_price - flag_high) <= atr * 0.3
+        in_zone = flag_low is not None and flag_low <= current_price <= flag_high + atr * 0.3
+        if not (near or in_zone):
+            return None
+        pb_entry = current_price
+        pb_stop, _ = pattern_structure_stop(pattern, 'SELL', atr)
+        if pb_stop is None:
+            pb_stop = flag_high + atr * 0.5
+        pb_stop = min(pb_stop, current_price + atr * 2)
+        pb_risk = pb_stop - pb_entry
+        pb_stop_rationale = f"旗面結構止損 (flag_high ${flag_high:.1f} + 0.5 ATR)"
+        if 'resistance' in pattern and is_wedge:
+            pb_stop_rationale = (
+                f"旗面結構止損 (resistance ${pattern['resistance']:.1f} + 0.5 ATR)"
+            )
+        add_position = f"跌穿 ${add_level:.0f} 加注 {add_vol}"
+    else:
+        if flag_low is None:
+            return None
+        near = abs(current_price - flag_low) <= atr * 0.3
+        in_zone = flag_high is not None and flag_low - atr * 0.3 <= current_price <= flag_high
+        if not (near or in_zone):
+            return None
+        pb_entry = current_price
+        pb_stop, _ = pattern_structure_stop(pattern, 'BUY', atr)
+        if pb_stop is None:
+            pb_stop = flag_low - atr * 0.5
+        pb_stop = max(pb_stop, current_price - atr * 2)
+        pb_risk = pb_entry - pb_stop
+        pb_stop_rationale = f"旗面結構止損 (flag_low ${flag_low:.1f} - 0.5 ATR)"
+        if 'support' in pattern and is_wedge:
+            pb_stop_rationale = (
+                f"旗面結構止損 (support ${pattern['support']:.1f} - 0.5 ATR)"
+            )
+        add_position = f"突破 ${add_level:.0f} 加注 {add_vol}"
+
+    if pb_risk <= 0:
+        return None
+    targets = _staged_targets(order, pattern, pb_entry, pb_risk)
+    if aligned:
+        note = '🎯 反彈入場 — 旗面內縮倉，待突破追加'
+    else:
+        note = _counter_trend_note(side, daily_trend, h1_trend, prefix='反彈')
+    return _make_setup(
+        side, pattern, daily_trend, h1_trend, tp3_trail,
+        already_broken=False,
+        quality=targets['quality'],
+        entry_mode='pullback',
+        entry_zone=f"${pb_entry - atr * 0.3:.0f} - ${pb_entry + atr * 0.3:.0f}",
+        entry_trigger=f"旗面反彈入場 @ ${pb_entry:.0f}",
+        add_position=add_position,
+        stop_loss=pb_stop,
+        stop_rationale=pb_stop_rationale,
+        targets=targets,
+        risk=pb_risk,
+        note=note,
+        priority_broken=False,
+    )
+
+
+def _emit_pattern_setups(side, pattern, current_price, atr, daily_trend, h1_trend,
+                         tp3_trail, nearest_high, nearest_low, points, seen_trigger_keys):
+    """One pattern → 0–2 setups (boundary XOR breakout[+pullback])."""
+    trigger_level = _pattern_trigger_level(pattern, side, nearest_high, nearest_low)
+    if any(abs(trigger_level - tk) < atr * 0.5 for tk in seen_trigger_keys):
+        return []
+    seen_trigger_keys.add(trigger_level)
+
+    already_broken = _setup_breakout_triggered(side, current_price, trigger_level, pattern)
+    severity = counter_trend_severity(side, daily_trend, h1_trend)
+    aligned = severity == 'ALIGNED'
+    add_vol = _volume_risk_tier(severity)[0]
+    out = []
+
+    if not already_broken and _is_boundary_reversal(pattern):
+        bd = _emit_boundary(
+            side, pattern, current_price, atr, daily_trend, h1_trend,
+            tp3_trail, add_vol, aligned,
+        )
+        if bd:
+            return [bd]
+
+    if side == 'BEARISH':
+        if current_price > trigger_level + atr * 2:
+            return out
+    elif current_price < trigger_level - atr * 2:
+        return out
+
+    emitted = _emit_breakout(
+        side, pattern, current_price, atr, daily_trend, h1_trend,
+        tp3_trail, trigger_level, already_broken, add_vol,
+        nearest_high, nearest_low, points,
+    )
+    if emitted is None:
+        return out
+    bo, add_level = emitted
+    out.append(bo)
+    pb = _emit_pullback(
+        side, pattern, current_price, atr, daily_trend, h1_trend,
+        tp3_trail, already_broken, add_vol, add_level, aligned,
+    )
+    if pb:
+        out.append(pb)
+    return out
+
+
 def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, atr, h1_trend=None):
     """Generate trade setups following user's methodology."""
     setups = []
@@ -3013,458 +3399,15 @@ def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, 
 
     seen_trigger_keys = set()
     tp3_trail = trail_stop_text(atr)
-
+    ctx = dict(
+        current_price=current_price, atr=atr, daily_trend=daily_trend,
+        h1_trend=h1_trend, tp3_trail=tp3_trail, nearest_high=nearest_high,
+        nearest_low=nearest_low, points=points, seen_trigger_keys=seen_trigger_keys,
+    )
     for pattern in bearish_p:
-        if 'support' in pattern:
-            trigger_level = pattern['support']
-        elif 'breakout_level' in pattern:
-            trigger_level = pattern['breakout_level']
-        elif 'neckline' in pattern:
-            trigger_level = pattern['neckline']
-        else:
-            trigger_level = nearest_low['price']
-
-        if any(abs(trigger_level - tk) < atr * 0.5 for tk in seen_trigger_keys):
-            continue
-        seen_trigger_keys.add(trigger_level)
-
-        # --- Boundary entry for reversal patterns (check BEFORE continue) ---
-        already_broken = _setup_breakout_triggered('BEARISH', current_price, trigger_level, pattern)
-        severity = counter_trend_severity('BEARISH', daily_trend, h1_trend)
-        aligned = severity == 'ALIGNED'
-        add_vol = _volume_risk_tier(severity)[0]
-        boundary_emitted = False
-        if not already_broken and _is_boundary_reversal(pattern):
-            bd_entry = _boundary_entry_level(pattern, 'SELL')
-            if bd_entry and bd_entry > current_price:
-                bd_stop = _boundary_entry_sl(pattern, 'SELL', atr, current_price)
-                bd_risk = bd_stop - bd_entry
-                max_risk = _max_boundary_risk(atr, current_price)
-                if bd_risk > 0 and bd_risk <= max_risk:
-                    bd_fib_tp, bd_fib_ext = _compute_tp1(pattern, bd_entry, bd_risk, 'SELL')
-                    bd_rr_tp = bd_entry - bd_risk
-                    bd_tp1 = max(bd_fib_tp, bd_rr_tp)
-                    bd_tp2, bd_tp2_fib = _compute_tp2(pattern, bd_entry, bd_risk, 'SELL', bd_fib_ext)
-                    bd_tp2 = _enforce_tp2_beyond_tp1(bd_tp1, bd_tp2, bd_entry, bd_risk, 'SELL')
-                    bd_tp2_rr = bd_entry - bd_risk * 2  # 2:1 RR
-                    bd_rr1 = abs(bd_entry - bd_tp1) / bd_risk
-                    bd_rr2 = abs(bd_entry - bd_tp2) / bd_risk
-                    bd_quality = _quality_from_rr(bd_rr1, bd_rr2)
-                    if 'Double' in pattern.get('type', ''):
-                        bd_sl_rationale = f"雙頂頂部 ${bd_entry:.0f} + 0.5 ATR"
-                    elif 'Wedge' in pattern.get('type', ''):
-                        bd_sl_rationale = f"楔形阻力 ${bd_entry:.0f} + 0.5 ATR"
-                    else:
-                        bd_sl_rationale = f"形態邊界 ${bd_entry:.0f} + 0.5 ATR"
-                    setups.append({
-                        'direction': '🔴 SELL',
-                        'priority': setup_priority('BEARISH', False, daily_trend, h1_trend, bd_quality),
-                        'pattern': pattern['type'],
-                        'confidence': pattern.get('confidence', 'MEDIUM'),
-                        'quality': bd_quality,
-                        'entry_mode': 'boundary',
-                        'entry_status': _entry_status_bearish(False, aligned, bd_quality, 'boundary', counter_trend_severity('BEARISH', daily_trend, h1_trend)),
-                        'entry_zone': f"${bd_entry - atr * 0.3:.0f} - ${bd_entry + atr * 0.3:.0f}",
-                        'entry_trigger': f"限價沽出 @ ${bd_entry:.0f}（形態邊界入場）",
-                        'entry_price': round(bd_entry, 2),
-                        'seedable': False,   # limit above market — not filled yet
-                        'triggered': False,
-                        'add_position': f"跌穿 ${pattern.get('neckline', bd_entry - bd_risk):.0f} 加注 {add_vol}",
-                        'stop_loss': f"${bd_stop:.0f}",
-                        'stop_rationale': bd_sl_rationale,
-                        'tp1': f"${bd_tp1:.0f} ({_tp_method_label(pattern, bd_tp1, bd_fib_tp, bd_rr_tp)}, 止賺 1/3)",
-                        'tp2': f"${bd_tp2:.0f} ({_tp_method_label(pattern, bd_tp2, bd_fib_tp, bd_rr_tp, bd_tp2_fib, bd_tp2_rr)}, 止賺 1/3)",
-                        'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
-                        'risk_amount': round(bd_risk, 1),
-                        'rr_tp1': round(bd_rr1, 1),
-                        'rr_tp2': round(bd_rr2, 1),
-                        'daily_alignment': daily_alignment_str('BEARISH', daily_trend, h1_trend),
-                        'note': '📍 形態邊界入場 — 不等待跌穿，較佳R:R' if aligned else _counter_trend_note('BEARISH', daily_trend, h1_trend, prefix='邊界沽'),
-                    })
-                    boundary_emitted = True
-
-        if boundary_emitted and not already_broken:
-            continue
-
-        # Breakout: price must be below trigger (ignore stale pattern.broken if recovered)
-        already_broken = _setup_breakout_triggered('BEARISH', current_price, trigger_level, pattern)
-        if current_price > trigger_level + atr * 2:
-            continue
-
-        actual_entry = current_price if already_broken else trigger_level
-        aligned = severity == 'ALIGNED'
-
-        if already_broken:
-            entry_low = current_price - atr * 0.3
-            entry_high = min(current_price + atr * 0.3, trigger_level)
-        else:
-            entry_low = trigger_level - atr * 0.5
-            entry_high = trigger_level
-
-        # --- SL calculation: structure stop priority for flags/wedges ---
-        struct_stop, has_struct = pattern_structure_stop(pattern, 'SELL', atr)
-        stop_swing = pattern_stop_swing(pattern, 'SELL', nearest_high, nearest_low)
-        if has_struct:
-            # Use structure stop as primary, cap at 2*ATR above current price
-            stop_level = min(struct_stop, current_price + atr * 2)
-            stop_used_struct = True
-        else:
-            raw_stop = stop_swing + atr
-            max_stop = current_price + atr * 3
-            stop_level = min(raw_stop, max_stop)
-            stop_used_struct = False
-        risk = stop_level - actual_entry
-        if risk <= 0:
-            continue
-
-        fib_tp, fib_ext = _compute_tp1(pattern, actual_entry, risk, 'SELL')
-        rr_tp = actual_entry - risk  # 1:1 RR base target
-        # TP1 = closer target (higher price for SELL, first to exit)
-        tp1 = max(fib_tp, rr_tp)
-        # TP2 = further target using 1.0 Fib ext or 2:1 RR (closer of the two)
-        tp2, tp2_fib = _compute_tp2(pattern, actual_entry, risk, 'SELL', fib_ext)
-        tp2 = _enforce_tp2_beyond_tp1(tp1, tp2, actual_entry, risk, 'SELL')
-        tp2_rr = actual_entry - risk * 2  # 2:1 RR
-        rr_tp1 = abs(actual_entry - tp1) / risk
-        rr_tp2 = abs(actual_entry - tp2) / risk
-
-        quality = _quality_from_rr(rr_tp1, rr_tp2)
-        # UNCONFIRMED: breakout triggered but not confirmed by retest/volume
-        if quality in ('OK', 'GOOD') and already_broken and not _pattern_breakout_confirmed(pattern):
-            quality = 'UNCONFIRMED'
-
-        add_level = pattern_add_level(pattern, 'SELL', points, trigger_level)
-
-        # --- Build stop rationale ---
-        if stop_used_struct:
-            flag_high = pattern.get('flag_high', 0)
-            if 'resistance' in pattern and ('Wedge' in pattern.get('type', '') or '\u6954\u5f62' in pattern.get('type', '')):
-                flag_high = pattern['resistance']
-                stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (resistance ${flag_high:.0f} + 0.5 ATR)"
-            else:
-                stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (flag_high ${flag_high:.0f} + 0.5 ATR)"
-        else:
-            stop_rationale = (
-                f"\u524d\u9802 ${stop_swing:.0f} + 1 ATR (${atr:.0f})"
-                if stop_level == stop_swing + atr
-                else f"3 ATR \u5c01\u9802 (\u524d\u9802 ${stop_swing:.0f} \u592a\u9060)"
-            )
-
-        # --- Generate breakout setup ---
-        setups.append({
-            'direction': '\U0001f534 SELL',
-            'priority': setup_priority('BEARISH', already_broken, daily_trend, h1_trend, quality),
-            'pattern': pattern['type'],
-            'confidence': pattern.get('confidence', 'MEDIUM'),
-            'quality': quality,
-            'entry_mode': 'breakout',
-            'entry_status': _entry_status_bearish(already_broken, aligned, quality, 'breakout', counter_trend_severity('BEARISH', daily_trend, h1_trend)),
-            'entry_zone': f"${entry_low:.0f} - ${entry_high:.0f}",
-            'entry_trigger': (
-                f"\u8dcc\u7a7f ${trigger_level:.0f} \u5165\u5834" if not already_broken
-                else f"\u5df2\u8dcc\u7a7f ${trigger_level:.0f}\uff0c\u73fe\u50f9 ${current_price:.0f} \u5165\u5834"
-            ),
-            'add_position': f"\u8dcc\u7a7f ${add_level:.0f} \u52a0\u6ce8 {add_vol}",
-            'stop_loss': f"${stop_level:.0f}",
-            'stop_rationale': stop_rationale,
-            'tp1': f"${tp1:.0f} ({_tp_method_label(pattern, tp1, fib_tp, rr_tp)}, \u6b62\u8cfa 1/3)",
-            'tp2': f"${tp2:.0f} ({_tp_method_label(pattern, tp2, fib_tp, rr_tp, tp2_fib, tp2_rr)}, \u6b62\u8cfa 1/3)",
-            'tp3': f"\u653e\u98db + {tp3_trail} (\u5c3e\u5009 1/3)",
-            'risk_amount': round(risk, 1),
-            'rr_tp1': round(rr_tp1, 1),
-            'rr_tp2': round(rr_tp2, 1),
-            'daily_alignment': (
-                daily_alignment_str('BEARISH', daily_trend, h1_trend)
-            ),
-            'note': '' if aligned else _counter_trend_note('BEARISH', daily_trend, h1_trend),
-        })
-
-        # --- Pullback entry for flags/wedges (not broken, decent consolidation quality) ---
-        ptype = pattern.get('type', '')
-        is_flag = 'Flag' in ptype
-        is_wedge = 'Wedge' in ptype or '\u6954\u5f62' in ptype
-        if (is_flag or is_wedge) and not already_broken:
-            if _pullback_consolidation_ok(pattern, atr, is_flag, is_wedge):
-                # Pullback entry: current price within the flag/wedge zone (within 0.3 ATR of flag_high)
-                flag_high = pattern.get('flag_high')
-                if flag_high is None and 'resistance' in pattern:
-                    flag_high = pattern['resistance']
-                flag_low = pattern.get('flag_low')
-                if flag_low is None and 'support' in pattern:
-                    flag_low = pattern['support']
-
-                if flag_high is not None:
-                    # Current price must be inside or near the consolidation zone
-                    near_high = abs(current_price - flag_high) <= atr * 0.3
-                    in_zone = (flag_low is not None and flag_low <= current_price <= flag_high + atr * 0.3)
-                    if near_high or in_zone:
-                        pb_entry = current_price
-                        pb_stop, _ = pattern_structure_stop(pattern, 'SELL', atr)
-                        if pb_stop is None:
-                            pb_stop = flag_high + atr * 0.5
-                        pb_stop = min(pb_stop, current_price + atr * 2)
-                        pb_risk = pb_stop - pb_entry
-                        if pb_risk > 0:
-                            pb_fib_tp, pb_fib_ext = _compute_tp1(pattern, pb_entry, pb_risk, 'SELL')
-                            pb_rr_tp = pb_entry - pb_risk
-                            pb_tp1 = max(pb_fib_tp, pb_rr_tp)
-                            pb_tp2, pb_tp2_fib = _compute_tp2(pattern, pb_entry, pb_risk, 'SELL', pb_fib_ext)
-                            pb_tp2 = _enforce_tp2_beyond_tp1(pb_tp1, pb_tp2, pb_entry, pb_risk, 'SELL')
-                            pb_tp2_rr = pb_entry - pb_risk * 2  # 2:1 RR
-                            pb_rr1 = abs(pb_entry - pb_tp1) / pb_risk
-                            pb_rr2 = abs(pb_entry - pb_tp2) / pb_risk
-                            pb_quality = _quality_from_rr(pb_rr1, pb_rr2)
-
-                            pb_stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (flag_high ${flag_high:.1f} + 0.5 ATR)"
-                            if 'resistance' in pattern and is_wedge:
-                                pb_stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (resistance ${pattern['resistance']:.1f} + 0.5 ATR)"
-
-                            setups.append({
-                                'direction': '\U0001f534 SELL',
-                                'priority': setup_priority('BEARISH', False, daily_trend, h1_trend, pb_quality),
-                                'pattern': pattern['type'],
-                                'confidence': pattern.get('confidence', 'MEDIUM'),
-                                'quality': pb_quality,
-                                'entry_mode': 'pullback',
-                                'entry_status': _entry_status_bearish(False, aligned, pb_quality, 'pullback', counter_trend_severity('BEARISH', daily_trend, h1_trend)),
-                                'entry_zone': f"${pb_entry - atr * 0.3:.0f} - ${pb_entry + atr * 0.3:.0f}",
-                                'entry_trigger': f"\u65d7\u9762\u53cd\u5f48\u5165\u5834 @ ${pb_entry:.0f}",
-                                'add_position': f"\u8dcc\u7a7f ${add_level:.0f} \u52a0\u6ce8 {add_vol}",
-                                'stop_loss': f"${pb_stop:.0f}",
-                                'stop_rationale': pb_stop_rationale,
-                                'tp1': f"${pb_tp1:.0f} ({_tp_method_label(pattern, pb_tp1, pb_fib_tp, pb_rr_tp)}, \u6b62\u8cfa 1/3)",
-                                'tp2': f"${pb_tp2:.0f} ({_tp_method_label(pattern, pb_tp2, pb_fib_tp, pb_rr_tp, pb_tp2_fib, pb_tp2_rr)}, \u6b62\u8cfa 1/3)",
-                                'tp3': f"\u653e\u98db + {tp3_trail} (\u5c3e\u5009 1/3)",
-                                'risk_amount': round(pb_risk, 1),
-                                'rr_tp1': round(pb_rr1, 1),
-                                'rr_tp2': round(pb_rr2, 1),
-                                'daily_alignment': (
-                                    daily_alignment_str('BEARISH', daily_trend, h1_trend)
-                                ),
-                                'note': '🎯 反彈入場 — 旗面內縮倉，待突破追加' if aligned else _counter_trend_note('BEARISH', daily_trend, h1_trend, prefix='反彈'),
-                            })
-
+        setups.extend(_emit_pattern_setups('BEARISH', pattern, **ctx))
     for pattern in bullish_p:
-        if 'resistance' in pattern:
-            entry_trigger_level = pattern['resistance']
-        elif 'breakout_level' in pattern:
-            entry_trigger_level = pattern['breakout_level']
-        elif 'neckline' in pattern:
-            entry_trigger_level = pattern['neckline']
-        else:
-            entry_trigger_level = nearest_high['price']
-
-        if any(abs(entry_trigger_level - tk) < atr * 0.5 for tk in seen_trigger_keys):
-            continue
-        seen_trigger_keys.add(entry_trigger_level)
-
-        already_broken = _setup_breakout_triggered('BULLISH', current_price, entry_trigger_level, pattern)
-        severity = counter_trend_severity('BULLISH', daily_trend, h1_trend)
-        aligned = severity == 'ALIGNED'
-        add_vol = _volume_risk_tier(severity)[0]
-
-        # --- Boundary entry for reversal patterns (check BEFORE continue) ---
-        boundary_emitted = False
-        if not already_broken and _is_boundary_reversal(pattern):
-            bd_entry = _boundary_entry_level(pattern, 'BUY')
-            if bd_entry and bd_entry < current_price:
-                bd_stop = _boundary_entry_sl(pattern, 'BUY', atr, current_price)
-                bd_risk = bd_entry - bd_stop
-                max_risk = _max_boundary_risk(atr, current_price)
-                if bd_risk > 0 and bd_risk <= max_risk:
-                    bd_fib_tp, bd_fib_ext = _compute_tp1(pattern, bd_entry, bd_risk, 'BUY')
-                    bd_rr_tp = bd_entry + bd_risk
-                    bd_tp1 = min(bd_fib_tp, bd_rr_tp)
-                    bd_tp2, bd_tp2_fib = _compute_tp2(pattern, bd_entry, bd_risk, 'BUY', bd_fib_ext)
-                    bd_tp2 = _enforce_tp2_beyond_tp1(bd_tp1, bd_tp2, bd_entry, bd_risk, 'BUY')
-                    bd_tp2_rr = bd_entry + bd_risk * 2  # 2:1 RR
-                    bd_rr1 = abs(bd_tp1 - bd_entry) / bd_risk
-                    bd_rr2 = abs(bd_tp2 - bd_entry) / bd_risk
-                    bd_quality = _quality_from_rr(bd_rr1, bd_rr2)
-
-                    if 'Double' in pattern.get('type', ''):
-                        bd_sl_rationale = f"雙底底部 ${bd_entry:.0f} - 0.5 ATR"
-                    elif 'Wedge' in pattern.get('type', ''):
-                        bd_sl_rationale = f"楔形支持 ${bd_entry:.0f} - 0.5 ATR"
-                    else:
-                        bd_sl_rationale = f"形態邊界 ${bd_entry:.0f} - 0.5 ATR"
-
-                    setups.append({
-                        'direction': '🟢 BUY',
-                        'priority': setup_priority('BULLISH', False, daily_trend, h1_trend, bd_quality),
-                        'pattern': pattern['type'],
-                        'confidence': pattern.get('confidence', 'MEDIUM'),
-                        'quality': bd_quality,
-                        'entry_mode': 'boundary',
-                        'entry_status': _entry_status_bullish(False, aligned, bd_quality, 'boundary', counter_trend_severity('BULLISH', daily_trend, h1_trend)),
-                        'entry_zone': f"${bd_entry - atr * 0.3:.0f} - ${bd_entry + atr * 0.3:.0f}",
-                        'entry_trigger': f"限價買入 @ ${bd_entry:.0f}（形態邊界入場）",
-                        'entry_price': round(bd_entry, 2),
-                        'seedable': False,   # limit below market — not filled yet
-                        'triggered': False,
-                        'add_position': f"突破 ${pattern.get('neckline', bd_entry + bd_risk):.0f} 加注 {add_vol}",
-                        'stop_loss': f"${bd_stop:.0f}",
-                        'stop_rationale': bd_sl_rationale,
-                        'tp1': f"${bd_tp1:.0f} ({_tp_method_label(pattern, bd_tp1, bd_fib_tp, bd_rr_tp)}, 止賺 1/3)",
-                        'tp2': f"${bd_tp2:.0f} ({_tp_method_label(pattern, bd_tp2, bd_fib_tp, bd_rr_tp, bd_tp2_fib, bd_tp2_rr)}, 止賺 1/3)",
-                        'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
-                        'risk_amount': round(bd_risk, 1),
-                        'rr_tp1': round(bd_rr1, 1),
-                        'rr_tp2': round(bd_rr2, 1),
-                        'daily_alignment': daily_alignment_str('BULLISH', daily_trend, h1_trend),
-                        'note': '📍 形態邊界入場 — 不等待突破，較佳R:R' if aligned else _counter_trend_note('BULLISH', daily_trend, h1_trend, prefix='邊界買'),
-                    })
-                    boundary_emitted = True
-
-        if boundary_emitted and not already_broken:
-            continue
-
-        if current_price < entry_trigger_level - atr * 2:
-            continue
-
-        actual_entry = current_price if already_broken else entry_trigger_level
-
-        entry_low = entry_trigger_level
-        entry_high = entry_trigger_level + atr * 0.5
-
-        # --- SL calculation: structure stop priority for flags/wedges ---
-        struct_stop, has_struct = pattern_structure_stop(pattern, 'BUY', atr)
-        stop_swing = pattern_stop_swing(pattern, 'BUY', nearest_high, nearest_low)
-        if has_struct:
-            # Use structure stop as primary, cap at 2*ATR below current price
-            stop_level = max(struct_stop, current_price - atr * 2)
-            stop_used_struct = True
-        else:
-            raw_stop = stop_swing - atr
-            min_stop = current_price - atr * 3
-            stop_level = max(raw_stop, min_stop)
-            stop_used_struct = False
-        risk = actual_entry - stop_level
-        if risk <= 0:
-            continue
-
-        fib_tp, fib_ext = _compute_tp1(pattern, actual_entry, risk, 'BUY')
-        rr_tp = actual_entry + risk  # 1:1 RR base target
-        # TP1 = closer target (lower price for BUY, first to exit)
-        tp1 = min(fib_tp, rr_tp)
-        # TP2 = further target using 1.0 Fib ext or 2:1 RR (closer of the two)
-        tp2, tp2_fib = _compute_tp2(pattern, actual_entry, risk, 'BUY', fib_ext)
-        tp2 = _enforce_tp2_beyond_tp1(tp1, tp2, actual_entry, risk, 'BUY')
-        tp2_rr = actual_entry + risk * 2  # 2:1 RR
-        rr_tp1 = abs(tp1 - actual_entry) / risk
-        rr_tp2 = abs(tp2 - actual_entry) / risk
-
-        quality = _quality_from_rr(rr_tp1, rr_tp2)
-        # UNCONFIRMED: breakout triggered but not confirmed by retest/volume
-        if quality in ('OK', 'GOOD') and already_broken and not _pattern_breakout_confirmed(pattern):
-            quality = 'UNCONFIRMED'
-
-        add_level = pattern_add_level(pattern, 'BUY', points, entry_trigger_level)
-
-        # --- Build stop rationale ---
-        if stop_used_struct:
-            flag_low = pattern.get('flag_low', 0)
-            if 'support' in pattern and ('Wedge' in pattern.get('type', '') or '\u6954\u5f62' in pattern.get('type', '')):
-                flag_low = pattern['support']
-                stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (support ${flag_low:.0f} - 0.5 ATR)"
-            else:
-                stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (flag_low ${flag_low:.0f} - 0.5 ATR)"
-        else:
-            stop_rationale = (
-                f"\u524d\u5e95 ${stop_swing:.0f} - 1 ATR (${atr:.0f})"
-                if stop_level == stop_swing - atr
-                else f"3 ATR \u5c01\u5e95 (\u524d\u5e95 ${stop_swing:.0f} \u592a\u9060)"
-            )
-
-        # --- Generate breakout setup ---
-        setups.append({
-            'direction': '\U0001f7e2 BUY',
-            'priority': setup_priority('BULLISH', already_broken, daily_trend, h1_trend, quality),
-            'pattern': pattern['type'],
-            'confidence': pattern.get('confidence', 'MEDIUM'),
-            'quality': quality,
-            'entry_mode': 'breakout',
-            'entry_status': _entry_status_bullish(already_broken, aligned, quality, 'breakout', counter_trend_severity('BULLISH', daily_trend, h1_trend)),
-            'entry_zone': f"${entry_low:.0f} - ${entry_high:.0f}",
-            'entry_trigger': (
-                f"\u7a81\u7834 ${entry_trigger_level:.0f}" if not already_broken
-                else f"\u5df2\u7a81\u7834 ${entry_trigger_level:.0f}"
-            ),
-            'add_position': f"\u7a81\u7834 ${add_level:.0f} \u52a0\u6ce8 {add_vol}",
-            'stop_loss': f"${stop_level:.0f}",
-            'stop_rationale': stop_rationale,
-            'tp1': f"${tp1:.0f} ({_tp_method_label(pattern, tp1, fib_tp, rr_tp)}, \u6b62\u8cfa 1/3)",
-            'tp2': f"${tp2:.0f} ({_tp_method_label(pattern, tp2, fib_tp, rr_tp, tp2_fib, tp2_rr)}, \u6b62\u8cfa 1/3)",
-            'tp3': f"\u653e\u98db + {tp3_trail} (\u5c3e\u5009 1/3)",
-            'risk_amount': round(risk, 1),
-            'rr_tp1': round(rr_tp1, 1),
-            'rr_tp2': round(rr_tp2, 1),
-            'daily_alignment': daily_alignment_str('BULLISH', daily_trend, h1_trend),
-            'note': '' if aligned else _counter_trend_note('BULLISH', daily_trend, h1_trend),
-        })
-
-        # --- Pullback entry for flags/wedges (not broken, decent consolidation quality) ---
-        ptype = pattern.get('type', '')
-        is_flag = 'Flag' in ptype
-        is_wedge = 'Wedge' in ptype or '\u6954\u5f62' in ptype
-        if (is_flag or is_wedge) and not already_broken:
-            if _pullback_consolidation_ok(pattern, atr, is_flag, is_wedge):
-                # Pullback entry: current price within the flag/wedge zone (within 0.3 ATR of flag_low)
-                flag_low = pattern.get('flag_low')
-                if flag_low is None and 'support' in pattern:
-                    flag_low = pattern['support']
-                flag_high = pattern.get('flag_high')
-                if flag_high is None and 'resistance' in pattern:
-                    flag_high = pattern['resistance']
-
-                if flag_low is not None:
-                    # Current price must be inside or near the consolidation zone
-                    near_low = abs(current_price - flag_low) <= atr * 0.3
-                    in_zone = (flag_high is not None and flag_low - atr * 0.3 <= current_price <= flag_high)
-                    if near_low or in_zone:
-                        pb_entry = current_price
-                        pb_stop, _ = pattern_structure_stop(pattern, 'BUY', atr)
-                        if pb_stop is None:
-                            pb_stop = flag_low - atr * 0.5
-                        pb_stop = max(pb_stop, current_price - atr * 2)
-                        pb_risk = pb_entry - pb_stop
-                        if pb_risk > 0:
-                            pb_fib_tp, pb_fib_ext = _compute_tp1(pattern, pb_entry, pb_risk, 'BUY')
-                            pb_rr_tp = pb_entry + pb_risk
-                            pb_tp1 = min(pb_fib_tp, pb_rr_tp)
-                            pb_tp2, pb_tp2_fib = _compute_tp2(pattern, pb_entry, pb_risk, 'BUY', pb_fib_ext)
-                            pb_tp2 = _enforce_tp2_beyond_tp1(pb_tp1, pb_tp2, pb_entry, pb_risk, 'BUY')
-                            pb_tp2_rr = pb_entry + pb_risk * 2  # 2:1 RR
-                            pb_rr1 = abs(pb_tp1 - pb_entry) / pb_risk
-                            pb_rr2 = abs(pb_tp2 - pb_entry) / pb_risk
-                            pb_quality = _quality_from_rr(pb_rr1, pb_rr2)
-
-                            pb_stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (flag_low ${flag_low:.1f} - 0.5 ATR)"
-                            if 'support' in pattern and is_wedge:
-                                pb_stop_rationale = f"\u65d7\u9762\u7d50\u69cb\u6b62\u640d (support ${pattern['support']:.1f} - 0.5 ATR)"
-
-                            setups.append({
-                                'direction': '\U0001f7e2 BUY',
-                                'priority': setup_priority('BULLISH', False, daily_trend, h1_trend, pb_quality),
-                                'pattern': pattern['type'],
-                                'confidence': pattern.get('confidence', 'MEDIUM'),
-                                'quality': pb_quality,
-                                'entry_mode': 'pullback',
-                                'entry_status': _entry_status_bullish(False, aligned, pb_quality, 'pullback', counter_trend_severity('BULLISH', daily_trend, h1_trend)),
-                                'entry_zone': f"${pb_entry - atr * 0.3:.0f} - ${pb_entry + atr * 0.3:.0f}",
-                                'entry_trigger': f"\u65d7\u9762\u53cd\u5f48\u5165\u5834 @ ${pb_entry:.0f}",
-                                'add_position': f"\u7a81\u7834 ${add_level:.0f} \u52a0\u6ce8 {add_vol}",
-                                'stop_loss': f"${pb_stop:.0f}",
-                                'stop_rationale': pb_stop_rationale,
-                                'tp1': f"${pb_tp1:.0f} ({_tp_method_label(pattern, pb_tp1, pb_fib_tp, pb_rr_tp)}, \u6b62\u8cfa 1/3)",
-                                'tp2': f"${pb_tp2:.0f} ({_tp_method_label(pattern, pb_tp2, pb_fib_tp, pb_rr_tp, pb_tp2_fib, pb_tp2_rr)}, \u6b62\u8cfa 1/3)",
-                                'tp3': f"\u653e\u98db + {tp3_trail} (\u5c3e\u5009 1/3)",
-                                'risk_amount': round(pb_risk, 1),
-                                'rr_tp1': round(pb_rr1, 1),
-                                'rr_tp2': round(pb_rr2, 1),
-                                'daily_alignment': daily_alignment_str('BULLISH', daily_trend, h1_trend),
-                                'note': '🎯 反彈入場 — 旗面內縮倉，待突破追加' if aligned else _counter_trend_note('BULLISH', daily_trend, h1_trend, prefix='反彈'),
-                            })
+        setups.extend(_emit_pattern_setups('BULLISH', pattern, **ctx))
 
     trend_dir = daily_trend['trend']
     if trend_dir in ('BEARISH', 'BULLISH'):
