@@ -75,9 +75,13 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - default → ~/.hermes/reports/xauusd_v3_<date>.md (full report with M15 section)
   - Designed for downstream execution via paper_trade.py (in-repo companion module)
   - cron_push_eligible on each setup (JSON): kline confirmed + OK/GOOD quality +
-    ALIGNED counter-trend + NOT danger hour (07/18 broker) + has TP +
-    priority≤2 (breakout) or ≤3 (pullback/boundary/fib/fib0786)
-  - JSON also includes time_quality (session), counter_trend_severity, recommended_volume
+    ALIGNED counter-trend + NOT danger hour (07/18 broker) + has TP + SL +
+    priority≤2 (breakout) or ≤3 (pullback/boundary/fib/fib0786) +
+    seedable (filled) OR limit mode (boundary/fib0786) with entry_price for pending.
+    Also blocked when mixed spot M30 vs futures daily basis exceeds max($15, 0.5×ATR).
+  - K-line confirmation does NOT change ranking/stops/size; it IS a cron push hard gate.
+  - JSON also includes time_quality (session), counter_trend_severity, recommended_volume,
+    generated_at (UTC), date (UTC), broker_date, and spot-futures basis when mixed.
 
 🚫 DISCIPLINE GUARDS (based on 138-trade combined sample through 2026-07-30)
   - Time gates: 07:00 + 18:00 broker hard-block (danger); 04-06/08 advisory; 17:00 golden
@@ -95,7 +99,8 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - Direction bias: counter_trend_severity == ALIGNED prevents all-counter-trend days
   - Max holding benefit: >4h hold = 66.7% win, +$608 (18 trades, 138-sample); 1-4h = 70% +$466
 
-Data sources: TradingView (OANDA:XAUUSD M30/H1/M15) + Yahoo Finance (GC=F daily)
+Data sources: TradingView spot (OANDA:XAUUSD) preferred for M30/H1/M15/daily;
+Yahoo Finance GC=F is fallback. Mixed spot+futures daily is labelled and may block cron.
 
 Architecture: fetch_data → add_indicators → find_swings → detect patterns
 → detect candlesticks → volume confirm → generate setups (breakout + pullback)
@@ -103,7 +108,7 @@ Architecture: fetch_data → add_indicators → find_swings → detect patterns
 """
 
 import os, json, argparse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -123,8 +128,16 @@ TV_SYMBOL = "OANDA:XAUUSD"
 TV_EXCHANGE = "OANDA"
 YF_TICKER = "GC=F"
 DATA_SOURCE = "TradingView (OANDA:XAUUSD)"  # updated at runtime (M30/H1 intraday)
-DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"  # daily bars always from futures
+DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"  # daily bars; prefer TV spot when available
+# Mixed-venue basis (spot M30 close vs futures daily close). None = same venue.
+SPOT_FUTURES_BASIS = None
+BASIS_CRON_BLOCKED = False
+BASIS_NOTE = ""
 REQUIRED_COLS = ['Open', 'High', 'Low', 'Close', 'Volume']
+TV_OHLC_MAP = {
+    'open': 'Open', 'high': 'High', 'low': 'Low',
+    'close': 'Close', 'volume': 'Volume',
+}
 MIN_BARS = {'m30': 50, 'h1': 30, 'm15': 30, 'day': 20}
 TRAIL_PROFIT_ATR = float(os.environ.get('TRAIL_PROFIT_ATR', '2.0'))
 TRAIL_STOP_ATR = float(os.environ.get('TRAIL_STOP_ATR', '1.5'))
@@ -165,6 +178,79 @@ def volume_usable(df):
     if 'Volume' not in df.columns or len(df) < 5:
         return False
     return float(df['Volume'].sum()) > 0
+
+
+def _last_valid_float(series, label):
+    """Last non-NaN float, or SystemExit if the series is all NaN."""
+    s = pd.Series(series, dtype='float64').dropna()
+    if s.empty:
+        raise SystemExit(f"Error: {label} has no valid values (all NaN).")
+    return float(s.iloc[-1])
+
+
+def _normalize_tv_ohlc(df):
+    """Capitalize TV ohlc columns and ensure REQUIRED_COLS exist."""
+    if df is None or df.empty:
+        return None
+    df = df.rename(columns=TV_OHLC_MAP)
+    for c in ['symbol', 'symbol.1']:
+        if c in df.columns:
+            df = df.drop(columns=[c])
+    for col in REQUIRED_COLS:
+        if col not in df.columns:
+            df[col] = np.nan
+    return df
+
+
+def _resample_h1_from_m30(df_m30):
+    """Resample M30 → H1 with consistent bar alignment (label/closed right)."""
+    return df_m30.resample('1h', label='right', closed='right').agg({
+        'Open': 'first',
+        'High': 'max',
+        'Low': 'min',
+        'Close': 'last',
+        'Volume': 'sum',
+    }).dropna(subset=['Close'])
+
+
+def _yf_ohlc(ticker, period, interval):
+    df = yf.download(ticker, period=period, interval=interval, progress=False)
+    if df is None or df.empty:
+        return None
+    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+    return df
+
+
+def _evaluate_spot_futures_basis(spot_close, daily_close, atr):
+    """If M30 and daily come from different venues, measure basis and maybe block cron.
+
+    Gold spot vs GC=F is normally a few dollars. Block only on large dislocation:
+    max($15, 0.5×ATR).
+    """
+    global SPOT_FUTURES_BASIS, BASIS_CRON_BLOCKED, BASIS_NOTE
+    SPOT_FUTURES_BASIS = None
+    BASIS_CRON_BLOCKED = False
+    BASIS_NOTE = ""
+    if DATA_SOURCE == DAILY_DATA_SOURCE:
+        return
+    if spot_close is None or daily_close is None or atr is None:
+        return
+    if not (np.isfinite(spot_close) and np.isfinite(daily_close) and np.isfinite(atr) and atr > 0):
+        return
+    basis = abs(float(spot_close) - float(daily_close))
+    SPOT_FUTURES_BASIS = round(basis, 2)
+    threshold = max(15.0, 0.5 * float(atr))
+    if basis > threshold:
+        BASIS_CRON_BLOCKED = True
+        BASIS_NOTE = (
+            f"現貨 M30 vs 期貨日線 basis ${basis:.2f} > ${threshold:.2f} "
+            f"— cron 暫停（趨勢門檻可能錯）"
+        )
+    else:
+        BASIS_NOTE = (
+            f"現貨 M30 vs 期貨日線 basis ${basis:.2f} "
+            f"（門檻 ${threshold:.2f}，cron 仍允許）"
+        )
 
 
 def trail_stop_text(atr):
@@ -339,95 +425,98 @@ def _volume_spike(df, idx=None, window=5, multiplier=1.3):
 # ═══════════════════════════════════════════════════════════
 
 def fetch_data():
-    """Fetch XAUUSD data. Primary: TradingView (spot), fallback: yfinance (futures)."""
+    """Fetch XAUUSD data. Primary: TradingView (spot), fallback: yfinance (futures).
+
+    When M30 is spot, H1 is resampled from that same M30 (never mixed with GC=F H1).
+    Daily prefers TV spot; GC=F daily is fallback and is labelled for basis checks.
+    """
     global DATA_SOURCE, DAILY_DATA_SOURCE
 
     df_m30 = df_h1 = df_day = None
+    DATA_SOURCE = "TradingView (OANDA:XAUUSD)"
     DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"
+    m30_is_spot = False
 
     # --- TradingView (spot XAUUSD) ---
     if _TV_AVAILABLE:
         _log("[*] Fetching TradingView (OANDA:XAUUSD)...")
         try:
             df_m30 = _tv.get_hist(TV_SYMBOL, TV_EXCHANGE, interval=TVInterval.in_30_minute, n_bars=300)
-            if df_m30 is not None and not df_m30.empty:
-                # Normalize columns: lowercase -> Capitalized
-                col_map = {
-                    'open': 'Open', 'high': 'High', 'low': 'Low',
-                    'close': 'Close', 'volume': 'Volume'
-                }
-                df_m30 = df_m30.rename(columns=col_map)
-                # Drop any extra TV columns
-                for c in ['symbol', 'symbol.1']:
-                    if c in df_m30.columns:
-                        df_m30 = df_m30.drop(columns=[c])
-                # Ensure all required cols exist
-                for col in REQUIRED_COLS:
-                    if col not in df_m30.columns:
-                        df_m30[col] = np.nan
+            df_m30 = _normalize_tv_ohlc(df_m30)
+            if df_m30 is not None:
                 _log(f"   TV M30: {len(df_m30)} bars")
-            else:
-                df_m30 = None
+                m30_is_spot = True
         except Exception as e:
             _log(f"   TV M30 failed: {e}")
             df_m30 = None
 
         if df_m30 is not None:
-            # Resample H1 from M30
             try:
-                df_h1 = df_m30.resample('1h').agg({
-                    'Open': 'first',
-                    'High': 'max',
-                    'Low': 'min',
-                    'Close': 'last',
-                    'Volume': 'sum'
-                }).dropna()
-                _log(f"   TV H1 (resampled): {len(df_h1)} bars")
+                df_h1 = _resample_h1_from_m30(df_m30)
+                if df_h1 is None or df_h1.empty:
+                    df_h1 = None
+                else:
+                    _log(f"   TV H1 (resampled): {len(df_h1)} bars")
             except Exception as e:
                 _log(f"   TV H1 resample failed: {e}")
                 df_h1 = None
 
-    # --- Fallback: yfinance (GC=F futures) ---
+    # --- Fallback: yfinance (GC=F futures) for M30 ---
     if df_m30 is None:
         _log("[*] TradingView unavailable, falling back to Yahoo Finance GC=F...")
         DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"
         DAILY_DATA_SOURCE = DATA_SOURCE
-        df_m30 = yf.download(YF_TICKER, period='30d', interval='30m', progress=False)
-        df_h1 = yf.download(YF_TICKER, period='60d', interval='60m', progress=False)
-        for df in [df_m30, df_h1]:
-            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        m30_is_spot = False
+        df_m30 = _yf_ohlc(YF_TICKER, '30d', '30m')
+        df_h1 = _yf_ohlc(YF_TICKER, '60d', '60m')
 
-    # --- H1 fallback when M30 OK but H1 resample failed ---
+    # --- H1 fallback: same venue only ---
     if df_m30 is not None and (df_h1 is None or df_h1.empty):
-        _log("[*] H1 missing — trying independent fallback...")
+        _log("[*] H1 missing — retrying M30 resample (same venue)...")
         try:
-            df_h1 = yf.download(YF_TICKER, period='60d', interval='60m', progress=False)
-            df_h1.columns = [c[0] if isinstance(c, tuple) else c for c in df_h1.columns]
+            df_h1 = _resample_h1_from_m30(df_m30)
             if df_h1 is not None and not df_h1.empty:
-                _log(f"   YF H1 fallback: {len(df_h1)} bars")
+                _log(f"   M30→H1 resample: {len(df_h1)} bars")
             else:
                 df_h1 = None
         except Exception as e:
-            _log(f"   YF H1 fallback failed: {e}")
+            _log(f"   H1 resample retry failed: {e}")
             df_h1 = None
-        if df_h1 is None:
+        # Futures H1 only when M30 is already futures — never mix GC=F H1 with spot M30
+        if (df_h1 is None or df_h1.empty) and not m30_is_spot:
             try:
-                df_h1 = df_m30.resample('1h', label='right', closed='right').agg({
-                    'Open': 'first', 'High': 'max', 'Low': 'min',
-                    'Close': 'last', 'Volume': 'sum',
-                }).dropna(subset=['Close'])
+                df_h1 = _yf_ohlc(YF_TICKER, '60d', '60m')
                 if df_h1 is not None and not df_h1.empty:
-                    _log(f"   M30→H1 retry resample: {len(df_h1)} bars")
+                    _log(f"   YF H1 fallback: {len(df_h1)} bars")
                 else:
                     df_h1 = None
             except Exception as e:
-                _log(f"   H1 retry resample failed: {e}")
+                _log(f"   YF H1 fallback failed: {e}")
                 df_h1 = None
 
-    # --- Daily data (always from yfinance — TV daily bars limited) ---
-    _log("[*] Fetching daily (yfinance)...")
-    df_day = yf.download(YF_TICKER, period='6mo', interval='1d', progress=False)
-    df_day.columns = [c[0] if isinstance(c, tuple) else c for c in df_day.columns]
+    # --- Daily: prefer spot TV when M30 is spot; else / fallback GC=F ---
+    if m30_is_spot and _TV_AVAILABLE:
+        try:
+            daily_iv = getattr(TVInterval, 'in_daily', None)
+            if daily_iv is not None:
+                _log("[*] Fetching daily (TradingView spot)...")
+                df_tv_day = _tv.get_hist(TV_SYMBOL, TV_EXCHANGE, interval=daily_iv, n_bars=180)
+                df_tv_day = _normalize_tv_ohlc(df_tv_day)
+                if df_tv_day is not None and len(df_tv_day) >= MIN_BARS['day']:
+                    df_day = df_tv_day
+                    DAILY_DATA_SOURCE = DATA_SOURCE
+                    _log(f"   TV Daily: {len(df_day)} bars")
+        except Exception as e:
+            _log(f"   TV Daily failed: {e}")
+            df_day = None
+
+    if df_day is None or df_day.empty:
+        _log("[*] Fetching daily (yfinance GC=F)...")
+        df_day = _yf_ohlc(YF_TICKER, '6mo', '1d')
+        if m30_is_spot:
+            DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"
+        else:
+            DAILY_DATA_SOURCE = DATA_SOURCE
 
     # Validate
     validate_dataframe(df_m30, 'M30', MIN_BARS['m30'])
@@ -443,21 +532,9 @@ def fetch_data():
     if _TV_AVAILABLE:
         try:
             df_m15 = _tv.get_hist(TV_SYMBOL, TV_EXCHANGE, interval=TVInterval.in_15_minute, n_bars=500)
-            if df_m15 is not None and not df_m15.empty:
-                col_map = {
-                    'open': 'Open', 'high': 'High', 'low': 'Low',
-                    'close': 'Close', 'volume': 'Volume'
-                }
-                df_m15 = df_m15.rename(columns=col_map)
-                for c in ['symbol', 'symbol.1']:
-                    if c in df_m15.columns:
-                        df_m15 = df_m15.drop(columns=[c])
-                for col in REQUIRED_COLS:
-                    if col not in df_m15.columns:
-                        df_m15[col] = np.nan
+            df_m15 = _normalize_tv_ohlc(df_m15)
+            if df_m15 is not None:
                 _log(f"   TV M15: {len(df_m15)} bars")
-            else:
-                df_m15 = None
         except Exception as e:
             _log(f"   TV M15 failed: {e}")
             df_m15 = None
@@ -465,8 +542,7 @@ def fetch_data():
     if df_m15 is None:
         try:
             _log("[*] M15 fallback: Yahoo Finance 15m...")
-            df_m15 = yf.download(YF_TICKER, period='5d', interval='15m', progress=False)
-            df_m15.columns = [c[0] if isinstance(c, tuple) else c for c in df_m15.columns]
+            df_m15 = _yf_ohlc(YF_TICKER, '5d', '15m')
             if df_m15 is not None and not df_m15.empty:
                 _log(f"   YF M15: {len(df_m15)} bars")
             else:
@@ -1415,16 +1491,21 @@ def add_volume_to_patterns(patterns, df, points):
 
 def analyze_daily_trend(df_day):
     """Determine daily trend strength and direction."""
-    if len(df_day) < 30:
+    if df_day is None or len(df_day) < 30:
         return _neutral_trend(df_day)
     
     close = df_day['Close'].values
+    last_close = close[-1]
+    if np.isnan(last_close) or last_close <= 0:
+        return _neutral_trend(df_day)
+
     ma20 = ta.trend.sma_indicator(df_day['Close'], window=20).values
     ma50 = ta.trend.sma_indicator(df_day['Close'], window=50).values
     
-    last_close = close[-1]
     last_ma20 = ma20[-1]
-    last_ma50 = ma50[-1]
+    raw_ma50 = ma50[-1]
+    last_ma20 = float(last_ma20) if not np.isnan(last_ma20) else float(last_close)
+    last_ma50 = float(raw_ma50) if not np.isnan(raw_ma50) else last_ma20
     
     # Trend determination
     if last_close > last_ma20 > last_ma50:
@@ -1443,8 +1524,8 @@ def analyze_daily_trend(df_day):
         trend = 'NEUTRAL'
         strength = 0
     
-    # Check RSI
     rsi = ta.momentum.RSIIndicator(df_day['Close'], window=14).rsi().values[-1]
+    rsi_val = 50.0 if np.isnan(rsi) else float(rsi)
     
     return {
         'trend': trend,
@@ -1452,7 +1533,7 @@ def analyze_daily_trend(df_day):
         'close': round(float(last_close), 2),
         'ma20': round(float(last_ma20), 2),
         'ma50': round(float(last_ma50), 2),
-        'rsi': round(float(rsi), 1),
+        'rsi': round(rsi_val, 1),
     }
 
 def analyze_h1_trend(df_h1):
@@ -1925,7 +2006,10 @@ def cron_push_eligible(setup):
       [Note: 138-sample shows no-SL 51.4% win vs SL-set 36.9% — SL-mandatory
        is a RISK MANAGEMENT guard, not a statistical edge signal.]
     - breakout: priority ≤ 2; pullback/boundary/fib/fib0786: priority ≤ 3
+    - NOT blocked by mixed spot/futures basis (see _evaluate_spot_futures_basis)
     """
+    if BASIS_CRON_BLOCKED:
+        return False
     if not setup.get('kline_confirmed'):
         return False
     if setup.get('quality') not in ('OK', 'GOOD'):
@@ -2550,7 +2634,7 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
             'rr_tp1': round(rr_tp1, 1),
             'rr_tp2': round(rr_tp2, 1),
             'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
-            'note': '0.786 深度回調 — 港股 playbook 驗證: 19 例平均 +50%' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='0.786 Fib'),
+            'note': '0.786 深度回調 — 實驗性（港股 playbook；未經 XAUUSD 138-sample 驗證）' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='0.786 Fib'),
         }
 
     swing_label = f"前底 ${fib['swing_start']:.0f}"
@@ -2583,7 +2667,7 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
         'rr_tp1': round(rr_tp1, 1),
         'rr_tp2': round(rr_tp2, 1),
         'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
-        'note': '0.786 深度回調 — 港股 playbook 驗證: 19 例平均 +50%' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='0.786 Fib'),
+        'note': '0.786 深度回調 — 實驗性（港股 playbook；未經 XAUUSD 138-sample 驗證）' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='0.786 Fib'),
     }
 
 
@@ -3496,8 +3580,14 @@ def ascii_chart(points, current_price, width=40, height=12):
 
 def _data_source_label():
     if DAILY_DATA_SOURCE != DATA_SOURCE:
-        return f"{DATA_SOURCE}（M30/H1）| 日線: {DAILY_DATA_SOURCE}"
-    return DATA_SOURCE
+        label = f"{DATA_SOURCE}（M30/H1）| 日線: {DAILY_DATA_SOURCE}"
+    else:
+        label = DATA_SOURCE
+    if SPOT_FUTURES_BASIS is not None:
+        label += f" | basis ${SPOT_FUTURES_BASIS:.2f}"
+        if BASIS_CRON_BLOCKED:
+            label += " 🚫 cron 暫停"
+    return label
 
 
 def _quality_report_label(quality):
@@ -3520,17 +3610,17 @@ def _entry_mode_report_label(mode):
 
 
 def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend=None,
-                    candle_m30=None, candle_day=None, m15_result=None):
+                    candle_m30=None, candle_day=None, m15_result=None, report_date=None):
     """Generate comprehensive Markdown report."""
     candle_m30 = candle_m30 or []
     candle_day = candle_day or []
 
     current = float(df_m30['Close'].iloc[-1])
-    today = datetime.now().strftime('%Y-%m-%d')
+    today = report_date or datetime.now(timezone.utc).strftime('%Y-%m-%d')
     
     # Indicators
-    atr_m30 = float(df_m30['ATR'].iloc[-1])
-    rsi_m30 = float(df_m30['RSI'].iloc[-1])
+    atr_m30 = _last_valid_float(df_m30['ATR'], 'M30 ATR')
+    rsi_m30 = _last_valid_float(df_m30['RSI'], 'M30 RSI')
     rsi_daily = daily_trend['rsi']
     h1 = h1_trend or _neutral_trend(df_h1 if df_h1 is not None and len(df_h1) else df_m30)
     rsi_h1 = h1.get('rsi', '-')
@@ -3784,13 +3874,15 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
     if tq_advice:
         time_quality_line += f"\n| | {tq_advice} | - | - |"
 
+    basis_header = f"**Basis:** {BASIS_NOTE}  \n" if BASIS_NOTE else ""
+
     report = f"""# 🔥 XAUUSD 圖表形態深度分析 v3
 
-**日期:** {today}  
+**日期:** {today} (UTC)  
 **框架:** M30 (主要) / H1 / 日線  
 **當前價格:** **${current:.2f}**  
 **數據源:** {_data_source_label()}  
-**日線趨勢:** {'🔴 **BEARISH**' if daily_trend['trend'] == 'BEARISH' else '🟢 **BULLISH**' if daily_trend['trend'] == 'BULLISH' else '🟡 **NEUTRAL**'} (強度: {daily_trend['strength']}/2)
+{basis_header}**日線趨勢:** {'🔴 **BEARISH**' if daily_trend['trend'] == 'BEARISH' else '🟢 **BULLISH**' if daily_trend['trend'] == 'BULLISH' else '🟡 **NEUTRAL**'} (強度: {daily_trend['strength']}/2)
 
 ---
 
@@ -3821,7 +3913,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 
 ## 🕯️ 四-B、K 線形態 (Candlestick Patterns)
 
-> ℹ️ **K 線確認僅供參考**，不影響信號排序、止損或倉位建議。
+> ℹ️ **K 線確認不改變信號排序、止損或倉位**，但是 cron/Hermes 推送硬門檻：未確認則 `cron_push_eligible=false`。
 
 ### M30 (最近 12 根)
 {candle_m30_text}
@@ -3840,7 +3932,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 📍 加注 | 突破前底/前頂（或跌穿 neckline） |
 | 🛑 止損 | 前頂之上 / 前底之下 + 1 ATR (必設!) |
 | 🎯 TP1 (1/3) | 1:1 RR 或 0.618 Fib ext (取較近) |
-| 🔄 0.786 深度回調 | 港股 playbook 驗證: 19 例平均 +50%, SL=回調浪極端, TP1=0.618, TP2=浪頂/底 |
+| 🔄 0.786 深度回調 | 實驗性（港股 playbook，**未經 XAUUSD 138-sample 驗證**）; SL=回調浪極端, TP1=0.618, TP2=浪頂/底 |
 | 🎯 TP2 (1/3) | 2:1 RR 或 1.0 Fib ext (取較遠，比 TP1 更遠) |
 | 🎯 TP3 (1/3) | 放飛 + 追蹤止損 |
 | ⏰ 最佳時段 | 17:00 (broker time) — 138-sample 64.3% 勝, +$340 (n=14) |
@@ -3960,8 +4052,15 @@ def main():
     _log(f"[*] Swing points: {len(points)} (highs: {sum(1 for p in points if p['type']=='high')}, lows: {sum(1 for p in points if p['type']=='low')})")
     
     # 4. Current price & ATR (needed for pattern detection)
-    current = float(df_m30['Close'].iloc[-1])
-    atr = float(df_m30['ATR'].iloc[-1])
+    current = _last_valid_float(df_m30['Close'], 'M30 Close')
+    atr = _last_valid_float(df_m30['ATR'], 'M30 ATR')
+    if pd.isna(df_m30['ATR'].iloc[-1]):
+        _log(f"[!] Last M30 ATR is NaN — using last valid ATR ${atr:.2f}")
+
+    daily_close = _last_valid_float(df_day['Close'], 'Daily Close')
+    _evaluate_spot_futures_basis(current, daily_close, atr)
+    if BASIS_NOTE:
+        _log(f"[*] {BASIS_NOTE}")
 
     # 5. Detect patterns
     patterns = detect_all_patterns(df_m30, points, atr=atr)
@@ -3998,13 +4097,17 @@ def main():
     _inject_kline_scores(setups, candle_m30, candle_day, len(df_m30) - 1, len(df_day) - 1)
     _inject_push_metadata(setups, daily_trend, h1_trend, current_price=current)
     
+    utc_now = datetime.now(timezone.utc)
+    today = utc_now.strftime('%Y-%m-%d')
+    broker_dt = utc_now + timedelta(hours=BROKER_UTC_OFFSET_HOURS)
+    broker_date = broker_dt.strftime('%Y-%m-%d')
+
     # 8. Generate report
     report = generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend,
                              candle_m30=candle_m30, candle_day=candle_day,
-                             m15_result=m15_result)
+                             m15_result=m15_result, report_date=today)
     
-    # 9. Save
-    today = datetime.now().strftime('%Y-%m-%d')
+    # 9. Save — date is UTC to match generated_at (avoids local-midnight filename drift)
     if args.output:
         output_path = args.output
     else:
@@ -4020,11 +4123,15 @@ def main():
         tq_level, tq_advice = _time_quality_score()
         json_out = {
             'date': today,
-            'generated_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'broker_date': broker_date,
+            'generated_at': utc_now.strftime('%Y-%m-%dT%H:%M:%SZ'),
             'price': current,
             'data_source': _data_source_label(),
             'intraday_source': DATA_SOURCE,
             'daily_source': DAILY_DATA_SOURCE,
+            'spot_futures_basis': SPOT_FUTURES_BASIS,
+            'basis_cron_blocked': BASIS_CRON_BLOCKED,
+            'basis_note': BASIS_NOTE or None,
             'atr_30m': round(atr, 2),
             'daily_trend': daily_trend,
             'h1_trend': h1_trend,
