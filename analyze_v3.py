@@ -2989,7 +2989,11 @@ def _enforce_tp2_beyond_tp1(tp1, tp2, entry, risk, side):
 
 
 def _trade_order(side):
-    return 'SELL' if side == 'BEARISH' else 'BUY'
+    if side == 'BEARISH':
+        return 'SELL'
+    if side == 'BULLISH':
+        return 'BUY'
+    raise ValueError(f'unrecognised side: {side!r}')
 
 
 def _pattern_trigger_level(pattern, side, nearest_high, nearest_low):
@@ -2998,14 +3002,20 @@ def _pattern_trigger_level(pattern, side, nearest_high, nearest_low):
             if key in pattern:
                 return pattern[key]
         return nearest_low['price']
-    for key in ('resistance', 'breakout_level', 'neckline'):
-        if key in pattern:
-            return pattern[key]
-    return nearest_high['price']
+    if side == 'BULLISH':
+        for key in ('resistance', 'breakout_level', 'neckline'):
+            if key in pattern:
+                return pattern[key]
+        return nearest_high['price']
+    raise ValueError(f'unrecognised side: {side!r}')
 
 
-def _staged_targets(order, pattern, entry, risk):
-    """TP1/TP2 + R:R + quality for a filled or pending entry."""
+def _staged_targets(pattern, entry, risk, order):
+    """TP1/TP2 + R:R + quality. Argument order matches `_compute_tp1`."""
+    if risk <= 0:
+        raise ValueError(f'risk must be positive, got {risk}')
+    if order not in ('SELL', 'BUY'):
+        raise ValueError(f'unrecognised order: {order!r}')
     fib_tp, fib_ext = _compute_tp1(pattern, entry, risk, order)
     if order == 'SELL':
         rr_tp = entry - risk
@@ -3017,8 +3027,8 @@ def _staged_targets(order, pattern, entry, risk):
         tp2_rr = entry + risk * 2
     tp2, tp2_fib = _compute_tp2(pattern, entry, risk, order, fib_ext)
     tp2 = _enforce_tp2_beyond_tp1(tp1, tp2, entry, risk, order)
-    rr1 = abs(entry - tp1) / risk if risk else 0
-    rr2 = abs(entry - tp2) / risk if risk else 0
+    rr1 = abs(entry - tp1) / risk
+    rr2 = abs(entry - tp2) / risk
     return {
         'fib_tp': fib_tp, 'fib_ext': fib_ext, 'rr_tp': rr_tp,
         'tp1': tp1, 'tp2': tp2, 'tp2_fib': tp2_fib, 'tp2_rr': tp2_rr,
@@ -3087,7 +3097,7 @@ def _emit_boundary(side, pattern, current_price, atr, daily_trend, h1_trend,
     max_risk = _max_boundary_risk(atr, current_price)
     if not (bd_risk > 0 and bd_risk <= max_risk):
         return None
-    targets = _staged_targets(order, pattern, bd_entry, bd_risk)
+    targets = _staged_targets(pattern, bd_entry, bd_risk, order)
     ptype = pattern.get('type', '')
     if 'Double' in ptype:
         bd_sl_rationale = (
@@ -3144,25 +3154,37 @@ def _emit_boundary(side, pattern, current_price, atr, daily_trend, h1_trend,
 
 
 def _breakout_stop(order, pattern, current_price, atr, nearest_high, nearest_low, actual_entry):
-    """Structure-first stop; cap 2 ATR (struct) / 3 ATR (swing) from current."""
+    """Structure-first stop; cap 2 ATR (struct) / 3 ATR (swing) from current.
+
+    ``capped`` is True when the swing stop was replaced by the 3 ATR bound.
+    """
+    if order not in ('SELL', 'BUY'):
+        raise ValueError(f'unrecognised order: {order!r}')
     struct_stop, has_struct = pattern_structure_stop(pattern, order, atr)
     stop_swing = pattern_stop_swing(pattern, order, nearest_high, nearest_low)
+    capped = False
     if order == 'SELL':
         if has_struct:
             stop_level = min(struct_stop, current_price + atr * 2)
         else:
-            stop_level = min(stop_swing + atr, current_price + atr * 3)
+            swing_stop = stop_swing + atr
+            stop_level = min(swing_stop, current_price + atr * 3)
+            capped = stop_level is not swing_stop
         risk = stop_level - actual_entry
     else:
         if has_struct:
             stop_level = max(struct_stop, current_price - atr * 2)
         else:
-            stop_level = max(stop_swing - atr, current_price - atr * 3)
+            swing_stop = stop_swing - atr
+            stop_level = max(swing_stop, current_price - atr * 3)
+            capped = stop_level is not swing_stop
         risk = actual_entry - stop_level
-    return stop_level, stop_swing, has_struct, risk
+    return stop_level, stop_swing, has_struct, risk, capped
 
 
-def _breakout_stop_rationale(order, pattern, atr, stop_level, stop_swing, has_struct):
+def _breakout_stop_rationale(order, pattern, atr, stop_swing, has_struct, capped):
+    if order not in ('SELL', 'BUY'):
+        raise ValueError(f'unrecognised order: {order!r}')
     ptype = pattern.get('type', '')
     is_wedge = 'Wedge' in ptype or '楔形' in ptype
     if order == 'SELL':
@@ -3172,7 +3194,7 @@ def _breakout_stop_rationale(order, pattern, atr, stop_level, stop_swing, has_st
                 flag_high = pattern['resistance']
                 return f"旗面結構止損 (resistance ${flag_high:.0f} + 0.5 ATR)"
             return f"旗面結構止損 (flag_high ${flag_high:.0f} + 0.5 ATR)"
-        if stop_level == stop_swing + atr:
+        if not capped:
             return f"前頂 ${stop_swing:.0f} + 1 ATR (${atr:.0f})"
         return f"3 ATR 封頂 (前頂 ${stop_swing:.0f} 太遠)"
     if has_struct:
@@ -3181,7 +3203,7 @@ def _breakout_stop_rationale(order, pattern, atr, stop_level, stop_swing, has_st
             flag_low = pattern['support']
             return f"旗面結構止損 (support ${flag_low:.0f} - 0.5 ATR)"
         return f"旗面結構止損 (flag_low ${flag_low:.0f} - 0.5 ATR)"
-    if stop_level == stop_swing - atr:
+    if not capped:
         return f"前底 ${stop_swing:.0f} - 1 ATR (${atr:.0f})"
     return f"3 ATR 封底 (前底 ${stop_swing:.0f} 太遠)"
 
@@ -3217,12 +3239,12 @@ def _emit_breakout(side, pattern, current_price, atr, daily_trend, h1_trend,
         )
         add_verb = '突破'
 
-    stop_level, stop_swing, has_struct, risk = _breakout_stop(
+    stop_level, stop_swing, has_struct, risk, capped = _breakout_stop(
         order, pattern, current_price, atr, nearest_high, nearest_low, actual_entry,
     )
     if risk <= 0:
         return None
-    targets = _staged_targets(order, pattern, actual_entry, risk)
+    targets = _staged_targets(pattern, actual_entry, risk, order)
     quality = targets['quality']
     if quality in ('OK', 'GOOD') and already_broken and not _pattern_breakout_confirmed(pattern):
         quality = 'UNCONFIRMED'
@@ -3237,7 +3259,7 @@ def _emit_breakout(side, pattern, current_price, atr, daily_trend, h1_trend,
         add_position=f"{add_verb} ${add_level:.0f} 加注 {add_vol}",
         stop_loss=stop_level,
         stop_rationale=_breakout_stop_rationale(
-            order, pattern, atr, stop_level, stop_swing, has_struct,
+            order, pattern, atr, stop_swing, has_struct, capped,
         ),
         targets=targets,
         risk=risk,
@@ -3306,7 +3328,7 @@ def _emit_pullback(side, pattern, current_price, atr, daily_trend, h1_trend,
 
     if pb_risk <= 0:
         return None
-    targets = _staged_targets(order, pattern, pb_entry, pb_risk)
+    targets = _staged_targets(pattern, pb_entry, pb_risk, order)
     if aligned:
         note = '🎯 反彈入場 — 旗面內縮倉，待突破追加'
     else:
@@ -3353,8 +3375,11 @@ def _emit_pattern_setups(side, pattern, current_price, atr, daily_trend, h1_tren
     if side == 'BEARISH':
         if current_price > trigger_level + atr * 2:
             return out
-    elif current_price < trigger_level - atr * 2:
-        return out
+    elif side == 'BULLISH':
+        if current_price < trigger_level - atr * 2:
+            return out
+    else:
+        raise ValueError(f'unrecognised side: {side!r}')
 
     emitted = _emit_breakout(
         side, pattern, current_price, atr, daily_trend, h1_trend,
