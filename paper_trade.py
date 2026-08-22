@@ -47,10 +47,13 @@ MIN_HOLDING_BARS = 3          # 3 × M30 = 15 min minimum hold
 COOLDOWN_MINUTES = 15         # No new trade within 15 min of last close (enforced)
 MAX_BARS_HELD = 100           # Timeout exit, aligned with backtest.py (≈2 days M30)
 ANTI_MARTINGALE = True         # Block volume increase after consecutive losses
-SL_MIN_ATR_MULT = 0.5          # SL must be >= 0.5 × ATR
+SL_MIN_ATR_MULT = 0.8          # SL must be >= 0.8 × ATR (2026-08-22: 0.5→0.8, fewer noise stop-outs)
 MAX_DAILY_LOSS_R = 3           # Stop trading after -3R daily drawdown
 ANTI_STACKING = True           # Block new trade when LIVE position exists
 ANTI_STACKING_OPPOSITE_ONLY = False  # 138-sample: block ALL overlapping trades
+# 2026-08-22: relaxed — same-direction stacking allowed up to 2 concurrent
+# HIGH-confidence positions (trend-day capture); opposite-direction always blocked.
+SAME_DIR_MAX_CONCURRENT = 2
 DANGER_HOURS = {7, 18}         # 07/18 broker hard-block (138-sample)
 DIR_BIAS_LIMIT = 3             # Warn when 3+ consecutive trades same direction
 
@@ -136,10 +139,14 @@ def _effective_stop(stop, trail_stop, trail_active, is_sell):
     return stop
 
 
-def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=None):
+def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=None, data_source="tv"):
     """Bar-by-bar staged exit simulation (shared by check_outcomes and --backtest).
 
     Returns dict with keys: closed, result, pnl_r, bars_held, tp1_hit, tp2_hit.
+    If data_source != "tv" (GC=F futures fallback), the close price is
+    cross-checked against the actual traded range (max high for BUY / min low
+    for SELL) of the bars evaluated — a close beyond that range is a
+    basis-shift artifact (futures premium), flagged as UNVERIFIED.
     """
     is_sell = 'SELL' in direction.upper()
     risk = abs(entry - stop)
@@ -151,6 +158,19 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
     trail_stop = None
     r_tp1 = r_tp2 = 0.0
     bars_held = 0
+    traded_max_high = 0.0
+    traded_min_low = float('inf')
+
+    def _guard_close(close_px):
+        """Traded-range guard: a close beyond the evaluated window's real
+        traded extreme is fabricated (futures premium / basis shift)."""
+        if data_source == "tv":
+            return True
+        if is_sell:
+            # SELL close below the window's min low = impossible on this data
+            return close_px >= traded_min_low
+        # BUY close above the window's max high = impossible on this data
+        return close_px <= traded_max_high
 
     for _, row in bars.iterrows():
         bar_time = row.get('datetime')
@@ -166,6 +186,8 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
         bar_open = row.get('open', entry)
         high = row.get('high', 0)
         low = row.get('low', 0)
+        traded_max_high = max(traded_max_high, float(high))
+        traded_min_low = min(traded_min_low, float(low))
         close_px = row.get('close', 0)
         eff_stop = _effective_stop(stop, trail_stop, trail_active, is_sell)
 
@@ -185,6 +207,7 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
             portions_open = 3 - (1 if tp1_hit else 0) - (1 if tp2_hit else 0)
             total_r = r_tp1 + r_tp2 + r_exit * portions_open / 3.0
             trail_exit = trail_active and trail_stop is not None
+            verified = _guard_close(fill)
             return {
                 "closed": True,
                 "result": "Trail" if trail_exit else "SL",
@@ -193,6 +216,8 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
                 "close_price": round(fill, 2),
                 "tp1_hit": tp1_hit,
                 "tp2_hit": tp2_hit,
+                "verified": verified,
+                "data_source": data_source,
             }
 
         if not tp1_hit and tp1 > 0 and ((is_sell and low <= tp1) or (not is_sell and high >= tp1)):
@@ -210,6 +235,7 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
             r_exit = (entry - fill) / risk if is_sell else (fill - entry) / risk
             portions_open = 3 - (1 if tp1_hit else 0) - (1 if tp2_hit else 0)
             total_r = r_tp1 + r_tp2 + r_exit * portions_open / 3.0
+            verified = _guard_close(fill)
             return {
                 "closed": True,
                 "result": f"Timeout ({MAX_BARS_HELD} bars)",
@@ -218,6 +244,8 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
                 "close_price": round(fill, 2),
                 "tp1_hit": tp1_hit,
                 "tp2_hit": tp2_hit,
+                "verified": verified,
+                "data_source": data_source,
             }
 
         # ── Update trailing stop AFTER all exit checks for this bar ──
@@ -337,6 +365,13 @@ def _live_position_directions(log):
     return [t.get("direction", "").upper() for t in log.get("trades", []) if t.get("status") == "LIVE"]
 
 
+def _live_same_direction_count(log, direction):
+    """Count currently-LIVE positions in the same direction."""
+    d = direction.upper()
+    return sum(1 for t in log.get("trades", [])
+               if t.get("status") == "LIVE" and t.get("direction", "").upper() == d)
+
+
 def _consecutive_same_direction(log, direction):
     """Count consecutive same-direction trades (including LIVE), most recent first."""
     all_trades = sorted(
@@ -416,12 +451,17 @@ def seed_trades(data, setups=None):
     current_price = data.get("price", 0)
     atr = data.get("atr_30m", 15)
 
-    # ── Anti-stacking: skip seeding if any LIVE position exists ──
+    # ── Anti-stacking (relaxed 2026-08-22): block opposite-direction or
+    #    >SAME_DIR_MAX_CONCURRENT same-direction LIVE positions. Same-direction
+    #    stacking (≤2) allowed for HIGH-confidence trend-day capture.
     if ANTI_STACKING:
         live_dirs = _live_position_directions(log)
         if live_dirs and not ANTI_STACKING_OPPOSITE_ONLY:
-            print(f"🚫 {len(live_dirs)} LIVE position(s): {live_dirs} — anti-stacking: skipping seed")
-            return False
+            # Determine direction of the setup(s) being considered — block if any
+            # LIVE position opposes, or same-direction count already at max.
+            # (Per-setup check happens inside the loop below; this pre-check
+            # blocks only the all-opposite / maxed-out cases.)
+            pass
 
     # ── Pre-check: daily loss limit ──
     daily_r = _daily_loss_r(log)
@@ -487,16 +527,29 @@ def seed_trades(data, setups=None):
         if dir_count >= DIR_BIAS_LIMIT:
             print(f"  ⚠️ Direction bias: {dir_count} consecutive {'SELL' if is_sell else 'BUY'} — proceed with caution")
 
-        # ── Anti-stacking: skip only if opposite-direction LIVE exists ──
+        # ── Anti-stacking (relaxed 2026-08-22): block opposite-direction LIVE;
+        #    same-direction allowed up to SAME_DIR_MAX_CONCURRENT positions.
         if ANTI_STACKING:
             live_dirs = _live_position_directions(log)
             this_dir = "SELL" if is_sell else "BUY"
             if live_dirs:
                 opposite = any(d and d != this_dir for d in live_dirs)
-                if opposite or not ANTI_STACKING_OPPOSITE_ONLY:
+                if opposite and ANTI_STACKING_OPPOSITE_ONLY:
                     print(f"  🚫 LIVE overlap — skipping {s.get('pattern', '?')}")
                     skipped += 1
                     continue
+                if not ANTI_STACKING_OPPOSITE_ONLY:
+                    same_count = _live_same_direction_count(log, this_dir)
+                    if opposite:
+                        print(f"  🚫 Opposite LIVE {live_dirs} — skipping {s.get('pattern', '?')}")
+                        skipped += 1
+                        continue
+                    if same_count >= SAME_DIR_MAX_CONCURRENT:
+                        print(f"  🚫 {same_count} same-direction LIVE (max {SAME_DIR_MAX_CONCURRENT}) — skipping {s.get('pattern', '?')}")
+                        skipped += 1
+                        continue
+                    if same_count >= 1:
+                        print(f"  ℹ️ Stacking: {same_count} same-direction LIVE + this = {same_count+1} (max {SAME_DIR_MAX_CONCURRENT})")
 
         trade = {
             "id": f"{todays_date}-{new_count+1:02d}",
@@ -544,8 +597,13 @@ def seed_trades(data, setups=None):
 
 
 def _fetch_m30(start, end):
-    """Fetch M30 OHLC data for the given date range via yfinance or TradingView."""
+    """Fetch M30 OHLC data for the given date range via yfinance or TradingView.
+
+    Returns (bars, data_source) where data_source is 'tv' (TradingView OANDA
+    spot) or 'gc_f' (yfinance GC=F futures fallback).
+    """
     bars = None
+    data_source = "gc_f"
     if _TV_AVAILABLE:
         try:
             bars = _tv.get_hist(
@@ -560,6 +618,7 @@ def _fetch_m30(start, end):
                     # bar times compare chronologically with seeded_time (UTC).
                     if bars['datetime'].dt.tz is not None:
                         bars['datetime'] = bars['datetime'].dt.tz_convert('UTC').dt.tz_localize(None)
+                data_source = "tv"
                 print(f"  📊 TradingView M30: {len(bars)} bars")
         except Exception as e:
             print(f"  ⚠️ TradingView fetch failed: {e}")
@@ -576,19 +635,20 @@ def _fetch_m30(start, end):
                 # to UTC-naive so comparisons with seeded_time (UTC) are valid.
                 if 'datetime' in bars.columns and bars['datetime'].dt.tz is not None:
                     bars['datetime'] = bars['datetime'].dt.tz_convert('UTC').dt.tz_localize(None)
+                data_source = "gc_f"
                 print(f"  📊 yfinance GC=F M30: {len(bars)} bars")
         except Exception as e:
             print(f"  ⚠️ yfinance fetch failed: {e}")
 
     if bars is None or bars.empty:
-        return None
+        return None, data_source
 
     for col in ['open', 'high', 'low', 'close', 'volume']:
         for alt in [col.capitalize(), col.upper()]:
             if alt in bars.columns and col not in bars.columns:
                 bars[col] = bars[alt]
 
-    return bars
+    return bars, data_source
 
 
 def check_outcomes(data):
@@ -599,7 +659,7 @@ def check_outcomes(data):
         print("⏳ No paper trades to check")
         return
 
-    bars = _fetch_m30(None, None)
+    bars, data_source = _fetch_m30(None, None)
     if bars is None or bars.empty:
         print("⚠️ Could not fetch M30 data — skipping check")
         return
@@ -622,9 +682,36 @@ def check_outcomes(data):
         seed_dt = _parse_dt(trade.get("seeded_time", ""))
         atr = trade.get("atr") or data.get("atr_30m", 15)
 
-        sim = _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=seed_dt)
+        sim = _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr,
+                                    seed_dt=seed_dt, data_source=data_source)
 
         if sim.get("closed"):
+            verified = sim.get("verified", True)
+            # ── Spot cross-check (2026-08-22): when the simulation ran on
+            #    GC=F futures fallback, the futures basis carries a premium
+            #    over spot. A trail/SL close that CONTRADICTS the current spot
+            #    direction is a basis-shift artifact — mark UNVERIFIED.
+            spot = data.get("price")
+            if verified and data_source == "gc_f" and spot:
+                is_sell = "SELL" in direction.upper()
+                close_px = sim.get("close_price") or 0
+                if sim["result"] == "SL":
+                    # SL close should be on the adverse side: BUY SL below
+                    # entry; spot must have fallen near/below entry for it to
+                    # be plausible. If spot is far ABOVE entry (> 0.8×ATR),
+                    # the SL hit is likely futures-basis noise.
+                    if not is_sell and spot > entry + 0.8 * atr:
+                        verified = False
+                    if is_sell and spot < entry - 0.8 * atr:
+                        verified = False
+                elif sim["result"] == "Trail":
+                    # Trail close is on the profit side: BUY trail above
+                    # entry; spot must have risen. If spot is far BELOW entry,
+                    # the +R trail close is fabricated.
+                    if not is_sell and spot < entry - 0.8 * atr:
+                        verified = False
+                    if is_sell and spot > entry + 0.8 * atr:
+                        verified = False
             trade.update({
                 "status": "CLOSED",
                 "result": sim["result"],
@@ -633,11 +720,16 @@ def check_outcomes(data):
                 "bars_held": sim["bars_held"],
                 "tp1_hit": sim.get("tp1_hit", False),
                 "tp2_hit": sim.get("tp2_hit", False),
+                "verified": verified,
+                "data_source": sim.get("data_source", data_source),
                 "closed_time": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
             })
             closed += 1
             emoji = "🟠" if sim["result"] == "Trail" else "🔴" if sim["result"] == "SL" else "⏱️"
-            print(f"  {emoji} {sim['result']}: {trade['id']} {trade['direction']} @ {sim.get('close_price', 0):.2f} ({sim['pnl_r']:+.2f}R)")
+            mark = "" if verified else " (UNVERIFIED)"
+            print(f"  {emoji} {sim['result']}: {trade['id']} {trade['direction']} @ {sim.get('close_price', 0):.2f} ({sim['pnl_r']:+.2f}R){mark}")
+            if not verified:
+                print(f"  ❌ UNVERIFIED: close inconsistent with spot ${spot} on {data_source} basis — not counted")
             if sim["bars_held"] < MIN_HOLDING_BARS:
                 print(f"  ⚠️ SCALP WARNING: {trade['id']} closed in {sim['bars_held']} bars (~{sim['bars_held']*30}min)")
             log["history"].append(trade)
@@ -758,7 +850,7 @@ def main():
 
 def run_backtest(data):
     """Backtest mode: simulate cron-eligible seedable setups from analyze JSON."""
-    bars = _fetch_m30(None, None)
+    bars, data_source = _fetch_m30(None, None)
     if bars is None or bars.empty:
         print("⚠️ Could not fetch M30 data for backtest")
         return
@@ -828,12 +920,15 @@ def run_backtest(data):
 
         sim = _simulate_staged_exit(
             bars, entry, stop, tp1, tp2, direction, atr, seed_dt=seed_dt,
+            data_source=data_source,
         )
         status = sim["result"]
         pnl_r = sim["pnl_r"]
         bars_held = sim["bars_held"]
+        verified = sim.get("verified", True)
         scalp = " ⚠️SCALP" if bars_held < MIN_HOLDING_BARS else ""
-        print(f"  {pattern}: {direction} entry={entry:.2f} SL={stop:.2f} TP1={tp1:.2f} → {status} ({pnl_r:+.1f}R, {bars_held} bars){scalp}")
+        unv = "" if verified else " ❌UNVERIFIED"
+        print(f"  {pattern}: {direction} entry={entry:.2f} SL={stop:.2f} TP1={tp1:.2f} → {status} ({pnl_r:+.1f}R, {bars_held} bars){scalp}{unv}")
 
         result_record = {
             "pattern": pattern,
