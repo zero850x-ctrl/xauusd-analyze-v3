@@ -1,66 +1,51 @@
 # Paper Trade Guards Improvement (2026-08-22)
 
 Context: user compared the system's paper trading vs a mentor's weekly trades
-(30 trades, 37% win, +$152, RR 1.69 — small size 0.01-0.02, cut losses fast,
-let winners run). Three improvements applied on branch `improve/paper-trade-guards`.
+(30 trades, 37% win, +$152, RR 1.69). Guards live on `improve/paper-trade-guards`.
+Review Act-on (2026-08-22) fixed the first landing, which documented the
+policy but did not actually apply stacking / UNVERIFIED accounting.
 
-## 1. Traded-range guard in `_simulate_staged_exit` (P1 — fake close root fix)
+## 1. GC=F fake-close integrity
 
-**Problem**: when TradingView fails, `_fetch_m30` falls back to yfinance GC=F
-(futures, ~$15-25 premium over spot, balloons to $40-60+ after rollover).
-Simulated closes on futures basis fabricate TP/SL hits that never happened on
-spot (28+ incidents, $4378.31/$4398.22 saga, see trading-data-source-integrity).
+**Problem**: TradingView fallback to yfinance GC=F (~$15–60 premium) fabricates
+SL/trail/timeout fills that never traded on spot.
 
 **Fix**:
-- `_fetch_m30` now returns `(bars, data_source)` — `'tv'` or `'gc_f'`.
-- `_simulate_staged_exit(..., data_source='tv')` tracks the evaluated window's
-  real `max(high)` / `min(low)`. On close (SL/trail/timeout), if
-  `data_source != 'tv'`, the close price is checked against that range:
-  BUY close above `max(high)` or SELL close below `min(low)` → impossible →
-  `verified=False`.
-- `check_outcomes` adds a **spot cross-check**: when the sim ran on GC=F, the
-  close direction is compared to the analyze JSON's spot `price`. BUY SL close
-  while spot is >0.8×ATR above entry (or BUY trail close while spot is
-  >0.8×ATR below entry, mirrored for SELL) → futures-basis artifact →
-  `verified=False`.
-- CLOSED trades now carry `verified` + `data_source`; console prints
-  `(UNVERIFIED)` and the reason. Cron reports should not count UNVERIFIED R.
+- `_fetch_m30` returns `(bars, data_source)` — `'tv'` or `'gc_f'`.
+- `_simulate_staged_exit` tracks `[min low, max high]` of finite OHLC only
+  (no `high=0` / `low=0` defaults). On GC=F, the fill must lie inside that
+  range ± slippage. This is a sanity check only: basis shifts fill and range
+  together, so it cannot be the sole detector.
+- `check_outcomes` / `--backtest` then require `|close − JSON spot| ≤
+  SPOT_VERIFY_ATR_MULT × ATR` (SL, Trail, **and Timeout**). Missing spot,
+  non-finite prices, or JSON `intraday_source` that is itself GC=F/futures
+  → fail closed (`verified=False`).
+- **UNVERIFIED stays LIVE** (audit note on `last_unverified`). It is not
+  written CLOSED, not appended to `history`, and `_counts_toward_r` excludes
+  `verified is False` from daily R, consecutive-loss, cooldown, and
+  `report_status` totals.
 
-## 2. Relaxed anti-stacking (P1 — more trades on trend days)
+## 2. Relaxed anti-stacking (now in `discipline_check`)
 
-**Problem**: `ANTI_STACKING=True` blocked ALL overlapping positions → 0-1
-trades/day even on strong trend days. Mentor did 7.5 trades/day.
+**Problem**: blanket overlap block → 0–1 trades/day. Mentor did ~7.5/day.
+138-sample overlap pairs were net negative, so opposite-direction stays blocked.
 
-**Fix** (data-aware, not blind loosening — 138-sample showed 13 overlap pairs
-net -$85, so opposite-direction stacking stays blocked):
-- New `SAME_DIR_MAX_CONCURRENT = 2`: same-direction stacking allowed up to 2
-  concurrent HIGH-confidence positions; opposite-direction LIVE always blocks.
-- New helper `_live_same_direction_count(log, direction)`.
-- Per-setup check inside the seed loop (replaces the blanket pre-check):
-  opposite LIVE → skip; same-direction count ≥ 2 → skip; 1 same-direction →
-  log "ℹ️ Stacking" info line.
+**Fix** (the gate that `seed_trades` / `--backtest` actually call):
+- Opposite LIVE → block.
+- Same-direction LIVE ≥ `SAME_DIR_MAX_CONCURRENT` (2) → block.
+- Removed the `pass` pre-check and the “one trade at a time” `break`.
+- `_norm_dir()` so `'🔴 SELL'` and `'SELL'` compare equal.
 
-## 3. SL floor 0.5 → 0.8 × ATR (P2 — fewer noise stop-outs)
+## 3. SL floor 0.5 → 0.8 × ATR
 
-**Problem**: 138-sample showed trades where SL was NOT hit made +$323 vs
-SL-hit trades -$524 — tight SLs get swept by noise. Mentor's avg SL distance
-~$14.5 ≈ 1 ATR.
+Setups with SL tighter than 0.8×ATR are rejected at seed time via
+`discipline_check` (also used by `--backtest`).
 
-**Fix**: `SL_MIN_ATR_MULT = 0.5 → 0.8`. Setups with SL tighter than 0.8×ATR are
-rejected at seed time.
+## Tests
 
-## Backtest note
-
-`backtest.py` is independent of `paper_trade.py` (imports only analyze_v3
-detection). Its 60-day result is unchanged (44 trades, 81.8% win, PF 4.83,
-$2250.74) — expected: these guards gate LIVE seeding/checking, not the
-historical simulator. Verify with unit tests + live-path runs instead.
-
-## Unit tests
-
-`/tmp/test_improvements.py` covers: (1) in-range SL close verified; (2) GC=F
-trail close contradicting spot → UNVERIFIED; (3) spot-aligned trail close →
-verified; (4) constants + helper. All pass.
+`python scripts/test_paper_trade_guards.py` — direction parse, spot-vs-close,
+UNVERIFIED R exclusion, stacking gate, range guard, missing-OHLC defaults.
 
 ## Files
-- `paper_trade.py` — 110 insertions / 15 deletions
+- `paper_trade.py`
+- `scripts/test_paper_trade_guards.py`
