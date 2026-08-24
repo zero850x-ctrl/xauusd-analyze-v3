@@ -16,6 +16,9 @@ Discipline Guards (updated 2026-08-22, based on 138-trade combined sample):
   - Danger hour re-check: block seed at 07/18 broker even if JSON was analyzed earlier
   - Min holding: warn on close < 15 bars (scalping = poor expectancy in 138-sample)
   - Direction bias log: warn when 3+ consecutive trades same direction
+  - Seed dedup: LIVE same pattern+direction+entry_mode (any day) or CLOSED
+    same key today → skip (keep existing fill). IDs from max suffix in
+    trades+history.
 
 Usage:
   python3 paper_trade.py                    # Run full cycle: seed trades + check prior
@@ -161,6 +164,88 @@ def _norm_dir(direction):
     if "BUY" in s:
         return "BUY"
     return ""
+
+
+def _calendar_date(val):
+    """Return YYYY-MM-DD or None. Rejects empty / timestamp-suffix matches."""
+    if val is None:
+        return None
+    s = str(val).strip()[:10]
+    if len(s) != 10 or s[4] != "-" or s[7] != "-":
+        return None
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return s
+
+
+def _report_date(data):
+    """UTC report date from analyze JSON; fall back to UTC today if invalid."""
+    parsed = _calendar_date((data or {}).get("date"))
+    return parsed or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _signal_key(pattern, direction, entry_mode="breakout"):
+    """Stable seed identity. None if pattern is missing / '?' (not mergeable)."""
+    p = (pattern or "").strip()
+    if not p or p == "?":
+        return None
+    d = _norm_dir(direction)
+    if not d:
+        return None
+    mode = (entry_mode or "breakout").strip() or "breakout"
+    return (p, d, mode)
+
+
+def _trade_signal_key(trade):
+    return _signal_key(
+        trade.get("pattern"),
+        trade.get("direction"),
+        trade.get("entry_mode", "breakout"),
+    )
+
+
+def _format_entry(px):
+    v = _finite_px(px)
+    return f"{v:.2f}" if v is not None else "?"
+
+
+def _iter_log_records(log):
+    for t in list(log.get("trades") or []) + list(log.get("history") or []):
+        yield t
+
+
+def _existing_signal(log, key, today):
+    """LIVE same key (any seeded_date) or CLOSED same key seeded today."""
+    if key is None:
+        return None
+    for t in _iter_log_records(log):
+        if _trade_signal_key(t) != key:
+            continue
+        if t.get("status") == "LIVE":
+            return t
+        if t.get("status") == "CLOSED" and _calendar_date(t.get("seeded_date")) == today:
+            return t
+    return None
+
+
+def _next_trade_id(log, today):
+    """Next {date}-NN using max numeric suffix across trades and history."""
+    prefix = f"{today}-"
+    max_n = 0
+    for t in _iter_log_records(log):
+        tid = str(t.get("id") or "")
+        if not tid.startswith(prefix):
+            continue
+        suffix = tid[len(prefix):]
+        try:
+            n = int(suffix)
+        except ValueError:
+            continue
+        if n > max_n:
+            max_n = n
+    return f"{today}-{max_n + 1:02d}"
 
 
 def _json_price_is_spot(data):
@@ -522,7 +607,7 @@ def seed_trades(data, setups=None):
         return False
 
     log = load_log()
-    todays_date = data.get("date", datetime.now().strftime('%Y-%m-%d'))
+    todays_date = _report_date(data)
     current_price = data.get("price", 0)
     atr = data.get("atr_30m", 15)
 
@@ -573,31 +658,47 @@ def seed_trades(data, setups=None):
         except (IndexError, ValueError, AttributeError):
             continue
 
+        pattern = s.get("pattern", "?")
+        my_dir = "SELL" if is_sell else "BUY"
+        entry_mode = s.get("entry_mode", "breakout")
+        sig_key = _signal_key(pattern, my_dir, entry_mode)
+
+        # ── Dedup before discipline so logs name the real reason ──
+        # LIVE same key any day, or CLOSED same key today → skip, keep fill.
+        prev = _existing_signal(log, sig_key, todays_date)
+        if prev:
+            skipped += 1
+            prev_status = prev.get("status", "?")
+            why = "already LIVE" if prev_status == "LIVE" else "already CLOSED today"
+            print(f"  ⏭️  Skip {pattern} {entry_mode} — {why} "
+                  f"({prev.get('id')} @ {_format_entry(prev.get('entry'))}); keep existing fill")
+            continue
+
         # ── Discipline guards ──
         vol = s.get("recommended_volume", 0.01)
-        ok, reason = discipline_check(log, "SELL" if is_sell else "BUY", vol, stop, entry, atr)
+        ok, reason = discipline_check(log, my_dir, vol, stop, entry, atr)
         if not ok:
             skipped += 1
-            print(f"  {reason} ({s.get('pattern', '?')})")
+            print(f"  {reason} ({pattern})")
             continue
 
         # ── Direction bias log ──
-        dir_count = _consecutive_same_direction(log, "SELL" if is_sell else "BUY")
+        dir_count = _consecutive_same_direction(log, my_dir)
         if dir_count >= DIR_BIAS_LIMIT:
-            print(f"  ⚠️ Direction bias: {dir_count} consecutive {'SELL' if is_sell else 'BUY'} — proceed with caution")
+            print(f"  ⚠️ Direction bias: {dir_count} consecutive {my_dir} — proceed with caution")
 
         if ANTI_STACKING:
-            same_count = _live_same_direction_count(log, "SELL" if is_sell else "BUY")
+            same_count = _live_same_direction_count(log, my_dir)
             if same_count >= 1:
                 print(f"  ℹ️ Stacking: {same_count} same-direction LIVE + this = {same_count+1} (max {SAME_DIR_MAX_CONCURRENT})")
 
         trade = {
-            "id": f"{todays_date}-{new_count+1:02d}",
+            "id": _next_trade_id(log, todays_date),
             "seeded_date": todays_date,
             "seeded_time": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
             "status": "LIVE",
-            "direction": "SELL" if is_sell else "BUY",
-            "pattern": s.get("pattern", "?"),
+            "direction": my_dir,
+            "pattern": pattern,
             "confidence": s.get("confidence", "?"),
             "quality": s.get("quality", "?"),
             "entry": round(entry, 2),
@@ -612,7 +713,7 @@ def seed_trades(data, setups=None):
             "priority": s.get("priority", 99),
             "counter_trend_severity": s.get("counter_trend_severity", "?"),
             "time_quality": s.get("time_quality", "?"),
-            "entry_mode": s.get("entry_mode", "breakout"),
+            "entry_mode": entry_mode,
             "atr": atr,  # 2026-08-07: needed for trailing-stop simulation in check_outcomes
             "signal_price": float(current_price) if current_price else None,
         }
