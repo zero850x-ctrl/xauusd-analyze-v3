@@ -734,11 +734,19 @@ def seed_trades(data, setups=None):
 def _fetch_m30(start, end):
     """Fetch M30 OHLC data for the given date range via yfinance or TradingView.
 
-    Returns (bars, data_source) where data_source is 'tv' (TradingView OANDA
-    spot) or 'gc_f' (yfinance GC=F futures fallback).
+    Returns (bars, data_source) where data_source is:
+      'tv'   — TradingView OANDA spot (primary, trusted)
+      'paxg' — yfinance PAXG-USD (spot-anchored token; 1 PAXG = 1 oz London
+               Good Delivery — tracks spot within a few $, far tighter than
+               GC=F futures premium; added 2026-08-24 after GC=F pushed a
+               fake Bull Flag with $52 premium)
+      'gc_f' — yfinance GC=F futures (last resort; premium $15-52, needs
+               spot-vs-close verification in check_outcomes)
     """
     bars = None
     data_source = "gc_f"
+
+    # ── Primary: TradingView OANDA spot ──
     if _TV_AVAILABLE:
         try:
             bars = _tv.get_hist(
@@ -758,6 +766,23 @@ def _fetch_m30(start, end):
         except Exception as e:
             print(f"  ⚠️ TradingView fetch failed: {e}")
 
+    # ── Fallback 2: yfinance PAXG-USD (spot-anchored) ──
+    if bars is None or bars.empty:
+        try:
+            ticker = yf.Ticker("PAXG-USD")
+            bars = ticker.history(period="5d", interval="30m")
+            if not bars.empty:
+                bars = bars.reset_index()
+                if 'Datetime' in bars.columns:
+                    bars.rename(columns={'Datetime': 'datetime'}, inplace=True)
+                if 'datetime' in bars.columns and bars['datetime'].dt.tz is not None:
+                    bars['datetime'] = bars['datetime'].dt.tz_convert('UTC').dt.tz_localize(None)
+                data_source = "paxg"
+                print(f"  📊 yfinance PAXG-USD M30: {len(bars)} bars")
+        except Exception as e:
+            print(f"  ⚠️ yfinance PAXG fetch failed: {e}")
+
+    # ── Fallback 3 (last resort): yfinance GC=F futures ──
     if bars is None or bars.empty:
         try:
             ticker = yf.Ticker("GC=F")
