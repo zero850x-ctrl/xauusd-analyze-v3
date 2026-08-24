@@ -581,6 +581,24 @@ def seed_trades(data, setups=None):
             print(f"  {reason} ({s.get('pattern', '?')})")
             continue
 
+        # ── Dedup (2026-08-24): same pattern + direction already LIVE today
+        #    = the SAME signal re-computed on a newer bar → skip, don't re-seed.
+        pattern = s.get("pattern", "?")
+        my_dir = "SELL" if is_sell else "BUY"
+        live_same = [
+            t for t in log.get("trades", [])
+            if t.get("status") == "LIVE"
+            and t.get("pattern") == pattern
+            and _norm_dir(t.get("direction", "")) == my_dir
+            and str(t.get("seeded_date", "")).startswith(todays_date)
+        ]
+        if live_same:
+            prev = live_same[0]
+            skipped += 1
+            print(f"  ⏭️  Skip {pattern} — same signal already LIVE "
+                  f"({prev.get('id')} @ {prev.get('entry'):.2f}); update, not re-seed")
+            continue
+
         # ── Direction bias log ──
         dir_count = _consecutive_same_direction(log, "SELL" if is_sell else "BUY")
         if dir_count >= DIR_BIAS_LIMIT:
@@ -591,8 +609,16 @@ def seed_trades(data, setups=None):
             if same_count >= 1:
                 print(f"  ℹ️ Stacking: {same_count} same-direction LIVE + this = {same_count+1} (max {SAME_DIR_MAX_CONCURRENT})")
 
+        # ── Unique ID: count today's existing trades (any status) so IDs
+        #    never collide across runs (2026-08-24 fix: was new_count+1,
+        #    which reset to -01 on every run and produced duplicate IDs).
+        today_ids = [t.get("id", "") for t in log.get("trades", [])
+                     if str(t.get("id", "")).startswith(todays_date)]
+        next_num = len(today_ids) + 1
+        while f"{todays_date}-{next_num:02d}" in today_ids:
+            next_num += 1
         trade = {
-            "id": f"{todays_date}-{new_count+1:02d}",
+            "id": f"{todays_date}-{next_num:02d}",
             "seeded_date": todays_date,
             "seeded_time": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
             "status": "LIVE",
