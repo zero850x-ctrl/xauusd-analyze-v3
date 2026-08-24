@@ -100,7 +100,8 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - Max holding benefit: >4h hold = 66.7% win, +$608 (18 trades, 138-sample); 1-4h = 70% +$466
 
 Data sources: TradingView spot (OANDA:XAUUSD) preferred for M30/H1/M15/daily;
-Yahoo Finance GC=F is fallback. Mixed spot+futures daily is labelled and may block cron.
+then Yahoo PAXG-USD (spot-anchored); GC=F last. Mixed-venue daily is labelled
+and may block cron. TV daily only when M30 is TV; GC=F M30 stays on GC=F daily.
 
 Architecture: fetch_data → add_indicators → find_swings → detect patterns
 → detect candlesticks → volume confirm → generate setups (breakout + pullback)
@@ -426,11 +427,17 @@ def _volume_spike(df, idx=None, window=5, multiplier=1.3):
 # DATA
 # ═══════════════════════════════════════════════════════════
 
-def fetch_data():
-    """Fetch XAUUSD data. Primary: TradingView (spot), fallback: yfinance (futures).
+def _frame_ok(df, min_bars):
+    return df is not None and not getattr(df, 'empty', True) and len(df) >= min_bars
 
-    When M30 is spot, H1 is resampled from that same M30 (never mixed with GC=F H1).
-    Daily prefers TV spot; GC=F daily is fallback and is labelled for basis checks.
+
+def fetch_data():
+    """Fetch XAUUSD data. Primary: TradingView spot; then PAXG-USD; GC=F last.
+
+    H1 is same-venue as M30 (resample, never mix GC=F H1 onto spot M30).
+    TV daily is only used when M30 itself came from TV. PAXG daily is only
+    used when M30 is spot-anchored. GC=F M30 stays on GC=F daily so labels
+    match bars and mixed-venue basis checks still run.
     """
     global DATA_SOURCE, DAILY_DATA_SOURCE
 
@@ -438,6 +445,7 @@ def fetch_data():
     DATA_SOURCE = "TradingView (OANDA:XAUUSD)"
     DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"
     m30_is_spot = False
+    m30_from_tv = False
 
     # --- TradingView (spot XAUUSD) ---
     if _TV_AVAILABLE:
@@ -448,6 +456,7 @@ def fetch_data():
             if df_m30 is not None:
                 _log(f"   TV M30: {len(df_m30)} bars")
                 m30_is_spot = True
+                m30_from_tv = True
         except Exception as e:
             _log(f"   TV M30 failed: {e}")
             df_m30 = None
@@ -465,23 +474,25 @@ def fetch_data():
 
     # --- Fallback: PAXG-USD (spot-anchored) then GC=F (futures) for M30 ---
     if df_m30 is None:
-        paxg_ok = False
         try:
             _log("[*] TradingView unavailable, trying PAXG-USD (spot-anchored)...")
             df_paxg = _yf_ohlc(PAXG_TICKER, '30d', '30m')
-            if df_paxg is not None and len(df_paxg) >= MIN_BARS['m30']:
+            if _frame_ok(df_paxg, MIN_BARS['m30']):
+                # Commit M30 before H1 — an H1 failure must not downgrade to GC=F.
                 df_m30 = df_paxg
-                df_h1 = _yf_ohlc(PAXG_TICKER, '60d', '60m')
                 DATA_SOURCE = PAXG_DATA_SOURCE
-                DAILY_DATA_SOURCE = DATA_SOURCE
-                m30_is_spot = True   # PAXG = spot-anchored (~1:1), safe to mix with spot daily
-                paxg_ok = True
+                DAILY_DATA_SOURCE = PAXG_DATA_SOURCE
+                m30_is_spot = True
                 _log(f"   PAXG-USD M30: {len(df_m30)} bars")
+                try:
+                    df_h1 = _yf_ohlc(PAXG_TICKER, '60d', '60m')
+                except Exception as e:
+                    _log(f"   PAXG H1 fetch failed: {e}")
+                    df_h1 = None
         except Exception as e:
             _log(f"   PAXG fetch failed: {e}")
-            df_paxg = None
 
-        if not paxg_ok:
+        if df_m30 is None:
             _log("[*] PAXG unavailable, falling back to Yahoo Finance GC=F...")
             DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"
             DAILY_DATA_SOURCE = DATA_SOURCE
@@ -513,15 +524,15 @@ def fetch_data():
                 _log(f"   YF H1 fallback failed: {e}")
                 df_h1 = None
 
-    # --- Daily: prefer spot TV when M30 is spot; else / fallback GC=F ---
-    if m30_is_spot and _TV_AVAILABLE:
+    # --- Daily: TV only when M30 is TV; PAXG daily only when M30 is spot ---
+    if m30_from_tv and _TV_AVAILABLE:
         try:
             daily_iv = getattr(TVInterval, 'in_daily', None)
             if daily_iv is not None:
                 _log("[*] Fetching daily (TradingView spot)...")
                 df_tv_day = _tv.get_hist(TV_SYMBOL, TV_EXCHANGE, interval=daily_iv, n_bars=180)
                 df_tv_day = _normalize_tv_ohlc(df_tv_day)
-                if df_tv_day is not None and len(df_tv_day) >= MIN_BARS['day']:
+                if _frame_ok(df_tv_day, MIN_BARS['day']):
                     df_day = df_tv_day
                     DAILY_DATA_SOURCE = DATA_SOURCE
                     _log(f"   TV Daily: {len(df_day)} bars")
@@ -530,20 +541,24 @@ def fetch_data():
             df_day = None
 
     if df_day is None or df_day.empty:
-        _log("[*] Fetching daily (yfinance PAXG-USD)...")
-        df_day = _yf_ohlc(PAXG_TICKER, '6mo', '1d')
-        if df_day is not None and len(df_day) >= MIN_BARS['day']:
-            if m30_is_spot:
+        if m30_is_spot:
+            _log("[*] Fetching daily (yfinance PAXG-USD)...")
+            try:
+                df_day = _yf_ohlc(PAXG_TICKER, '6mo', '1d')
+            except Exception as e:
+                _log(f"   PAXG daily failed: {e}")
+                df_day = None
+            if _frame_ok(df_day, MIN_BARS['day']):
                 DAILY_DATA_SOURCE = PAXG_DATA_SOURCE
+                _log(f"   PAXG daily: {len(df_day)} bars")
             else:
-                DAILY_DATA_SOURCE = DATA_SOURCE
-        else:
-            _log("   PAXG daily insufficient, falling back to GC=F...")
-            df_day = _yf_ohlc(YF_TICKER, '6mo', '1d')
-            if m30_is_spot:
+                _log("   PAXG daily insufficient, falling back to GC=F...")
+                df_day = _yf_ohlc(YF_TICKER, '6mo', '1d')
                 DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"
-            else:
-                DAILY_DATA_SOURCE = DATA_SOURCE
+        else:
+            _log("[*] Fetching daily (yfinance GC=F, same venue as M30)...")
+            df_day = _yf_ohlc(YF_TICKER, '6mo', '1d')
+            DAILY_DATA_SOURCE = DATA_SOURCE
 
     # Validate
     validate_dataframe(df_m30, 'M30', MIN_BARS['m30'])
