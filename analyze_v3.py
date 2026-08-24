@@ -126,7 +126,9 @@ except Exception:
 OUTPUT_DIR = os.path.expanduser("~/.hermes/reports")
 TV_SYMBOL = "OANDA:XAUUSD"
 TV_EXCHANGE = "OANDA"
-YF_TICKER = "GC=F"
+YF_TICKER = "GC=F"          # last-resort futures fallback (premium $15-52)
+PAXG_TICKER = "PAXG-USD"    # spot-anchored token fallback (1 PAXG = 1 oz; tracks spot within ~$7)
+PAXG_DATA_SOURCE = "Yahoo Finance PAXG-USD (現貨錨定)"
 DATA_SOURCE = "TradingView (OANDA:XAUUSD)"  # updated at runtime (M30/H1 intraday)
 DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"  # daily bars; prefer TV spot when available
 # Mixed-venue basis (spot M30 close vs futures daily close). None = same venue.
@@ -461,14 +463,31 @@ def fetch_data():
                 _log(f"   TV H1 resample failed: {e}")
                 df_h1 = None
 
-    # --- Fallback: yfinance (GC=F futures) for M30 ---
+    # --- Fallback: PAXG-USD (spot-anchored) then GC=F (futures) for M30 ---
     if df_m30 is None:
-        _log("[*] TradingView unavailable, falling back to Yahoo Finance GC=F...")
-        DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"
-        DAILY_DATA_SOURCE = DATA_SOURCE
-        m30_is_spot = False
-        df_m30 = _yf_ohlc(YF_TICKER, '30d', '30m')
-        df_h1 = _yf_ohlc(YF_TICKER, '60d', '60m')
+        paxg_ok = False
+        try:
+            _log("[*] TradingView unavailable, trying PAXG-USD (spot-anchored)...")
+            df_paxg = _yf_ohlc(PAXG_TICKER, '30d', '30m')
+            if df_paxg is not None and len(df_paxg) >= MIN_BARS['m30']:
+                df_m30 = df_paxg
+                df_h1 = _yf_ohlc(PAXG_TICKER, '60d', '60m')
+                DATA_SOURCE = PAXG_DATA_SOURCE
+                DAILY_DATA_SOURCE = DATA_SOURCE
+                m30_is_spot = True   # PAXG = spot-anchored (~1:1), safe to mix with spot daily
+                paxg_ok = True
+                _log(f"   PAXG-USD M30: {len(df_m30)} bars")
+        except Exception as e:
+            _log(f"   PAXG fetch failed: {e}")
+            df_paxg = None
+
+        if not paxg_ok:
+            _log("[*] PAXG unavailable, falling back to Yahoo Finance GC=F...")
+            DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"
+            DAILY_DATA_SOURCE = DATA_SOURCE
+            m30_is_spot = False
+            df_m30 = _yf_ohlc(YF_TICKER, '30d', '30m')
+            df_h1 = _yf_ohlc(YF_TICKER, '60d', '60m')
 
     # --- H1 fallback: same venue only ---
     if df_m30 is not None and (df_h1 is None or df_h1.empty):
@@ -511,12 +530,20 @@ def fetch_data():
             df_day = None
 
     if df_day is None or df_day.empty:
-        _log("[*] Fetching daily (yfinance GC=F)...")
-        df_day = _yf_ohlc(YF_TICKER, '6mo', '1d')
-        if m30_is_spot:
-            DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"
+        _log("[*] Fetching daily (yfinance PAXG-USD)...")
+        df_day = _yf_ohlc(PAXG_TICKER, '6mo', '1d')
+        if df_day is not None and len(df_day) >= MIN_BARS['day']:
+            if m30_is_spot:
+                DAILY_DATA_SOURCE = PAXG_DATA_SOURCE
+            else:
+                DAILY_DATA_SOURCE = DATA_SOURCE
         else:
-            DAILY_DATA_SOURCE = DATA_SOURCE
+            _log("   PAXG daily insufficient, falling back to GC=F...")
+            df_day = _yf_ohlc(YF_TICKER, '6mo', '1d')
+            if m30_is_spot:
+                DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"
+            else:
+                DAILY_DATA_SOURCE = DATA_SOURCE
 
     # Validate
     validate_dataframe(df_m30, 'M30', MIN_BARS['m30'])
