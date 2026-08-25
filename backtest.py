@@ -118,7 +118,53 @@ def fetch_backtest_data(days=60):
 
     print(f"   {interval} bars: {len(df_bars)} | Daily bars: {len(df_day) if df_day is not None else 0}")
     print(f"   Date range: {df_bars.index[0]} → {df_bars.index[-1]}")
+    _warn_futures_premium(df_bars)
     return df_bars, df_day
+
+
+def _live_spot_price():
+    """Fresh XAU spot from gold-api.com (tracks spot within ~$2). None on failure."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.gold-api.com/price/XAU",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            payload = json.loads(resp.read().decode())
+        px = float(payload.get("price"))
+        return px if px > 0 else None
+    except Exception as e:
+        print(f"   ⚠️ gold-api live spot unavailable: {e}")
+        return None
+
+
+def _warn_futures_premium(df_bars):
+    """Warn when the GC=F series is dislocated from real spot.
+
+    2026-08-25: the 60/120/365/730-day backtests all ran on GC=F with no
+    basis check — during contract rollover (premium $40-65) pattern levels,
+    ATR and simulated fills are all shifted, so historical win rates are
+    overstated for those windows. This banner makes that visible; it does
+    not change any simulation logic.
+    """
+    try:
+        last_close = float(df_bars['Close'].iloc[-1])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return
+    spot = _live_spot_price()
+    if spot is None:
+        print("   ⚠️ Basis check skipped (no live spot reference)")
+        return
+    premium = last_close - spot
+    if abs(premium) > 40:
+        print(f"\n   🚨 GC=F PREMIUM ALERT: futures ${last_close:.2f} vs spot ${spot:.2f} "
+              f"= ${premium:+.2f} dislocation (rollover suspected).")
+        print("      Pattern levels/ATR/fills on this series are shifted vs spot;")
+        print("      historical results for this period are NOT directly comparable")
+        print("      to spot-based live trading.\n")
+    elif abs(premium) > 25:
+        print(f"   ⚠️ GC=F premium: ${premium:+.2f} vs spot (elevated; normal $15-25)")
 
 
 # ═══════════════════════════════════════════════════════════
