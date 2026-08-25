@@ -40,7 +40,7 @@ TradingView OANDA spot  →  PAXG-USD (yfinance, 現貨錨定, 差 ~$7)  →  GC
 ## Paper Trade Guards
 
 - **Traded-range 驗證**：GC=F close 超出實際 OHLC traded range → 標記 `UNVERIFIED`，唔計入績效
-- **Spot-vs-close cross-check**：`SPOT_VERIFY_ATR_MULT=0.8`，不符 → 保持 LIVE
+- **Series-basis 驗證**：GC=F 最新 close vs spot 超過 `GC_F_BASIS_FAIL_USD=40` → `UNVERIFIED`，保持 LIVE
 - **Anti-stacking**：相反方向禁止；同方向最多 `SAME_DIR_MAX_CONCURRENT=2`（2026-08-22 放寬）
 - **SL floor**：`SL_MIN_ATR_MULT=0.8`（2026-08-22 由 0.5 提高，減少 noise stop-out）
 - **Seed dedup**（2026-08-24 / PR #28）：同 pattern+direction+entry_mode 已 LIVE（任何日）或今日 CLOSED → skip；trade ID 用 trades+history max suffix +1

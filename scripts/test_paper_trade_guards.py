@@ -31,11 +31,36 @@ def test_spot_close_verified():
     atr = 20.0
     data = {"intraday_source": "TradingView (OANDA:XAUUSD)", "price": 3390}
     assert pt._spot_close_verified(3392, 3390, atr, "tv", data) is True
-    assert pt._spot_close_verified(3392, 3390, atr, "gc_f", data) is True
-    assert pt._spot_close_verified(3480, 3390, atr, "gc_f", data) is False
-    assert pt._spot_close_verified(3392, None, atr, "gc_f", data) is False
+    assert pt._spot_close_verified(
+        3392, 3390, atr, "gc_f", data,
+        series_last_close=3410, live_spot=3390,
+    ) is True  # $20 premium — normal, under $40 fail band
+    assert pt._spot_close_verified(
+        3480, 3390, atr, "gc_f", data,
+        series_last_close=3440, live_spot=3390,
+    ) is False  # $50 > $40
+    assert pt._spot_close_verified(
+        3392, 3390, atr, "gc_f", data,
+        series_last_close=None, live_spot=3390,
+    ) is False  # missing series last → fail closed, no fill-vs-quote
     fut = {"intraday_source": "Yahoo Finance GC=F", "price": 3410}
-    assert pt._spot_close_verified(3410, 3410, atr, "gc_f", fut) is False
+    assert pt._spot_close_verified(
+        3410, 3410, atr, "gc_f", fut,
+        series_last_close=3410, live_spot=None,
+    ) is False  # futures JSON is not a spot reference
+
+
+def test_spot_close_verified_does_not_hit_network():
+    orig = pt._live_spot_price
+    pt._live_spot_price = lambda: (_ for _ in ()).throw(RuntimeError("network"))
+    try:
+        assert pt._spot_close_verified(
+            4643.59, 4675.0, 14.43, "gc_f",
+            {"intraday_source": "TradingView (OANDA:XAUUSD)", "price": 4675.0},
+            series_last_close=4695.0, live_spot=4675.0,
+        ) is True
+    finally:
+        pt._live_spot_price = orig
 
 
 def test_counts_toward_r():
@@ -45,7 +70,7 @@ def test_counts_toward_r():
 
 
 def test_daily_loss_skips_unverified():
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     log = {
         "trades": [],
         "history": [
@@ -269,6 +294,7 @@ if __name__ == "__main__":
     tests = [
         test_norm_dir,
         test_spot_close_verified,
+        test_spot_close_verified_does_not_hit_network,
         test_counts_toward_r,
         test_daily_loss_skips_unverified,
         test_discipline_stacking,

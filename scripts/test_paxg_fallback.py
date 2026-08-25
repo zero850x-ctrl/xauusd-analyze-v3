@@ -39,6 +39,7 @@ class FakeTV:
         self.m15 = m15
         self.fail_m30 = fail_m30
         self.daily_calls = 0
+        self.m15_calls = 0
 
     def get_hist(self, symbol, exchange, interval=None, n_bars=None):
         if n_bars == 300:
@@ -48,6 +49,9 @@ class FakeTV:
         if n_bars == 180:
             self.daily_calls += 1
             return self.daily
+        if n_bars == 500:
+            self.m15_calls += 1
+            return self.m15
         return self.m15
 
 
@@ -67,6 +71,7 @@ def _run_fetch(yf_map, tv=None, tv_available=False, h1_paxg_exc=False):
         "interval": getattr(av, "TVInterval", None),
         "data": av.DATA_SOURCE,
         "daily": av.DAILY_DATA_SOURCE,
+        "m15": av.M15_DATA_SOURCE,
     }
     av._yf_ohlc = fake_yf
     av._tv = tv
@@ -75,7 +80,7 @@ def _run_fetch(yf_map, tv=None, tv_available=False, h1_paxg_exc=False):
         av.TVInterval = _DummyInterval
     try:
         frames = av.fetch_data()
-        sources = (av.DATA_SOURCE, av.DAILY_DATA_SOURCE)
+        sources = (av.DATA_SOURCE, av.DAILY_DATA_SOURCE, av.M15_DATA_SOURCE)
         return frames, calls, sources
     finally:
         av._yf_ohlc = saved["yf"]
@@ -85,6 +90,7 @@ def _run_fetch(yf_map, tv=None, tv_available=False, h1_paxg_exc=False):
             av.TVInterval = saved["interval"]
         av.DATA_SOURCE = saved["data"]
         av.DAILY_DATA_SOURCE = saved["daily"]
+        av.M15_DATA_SOURCE = saved["m15"]
 
 
 def test_gcf_m30_does_not_use_paxg_daily():
@@ -103,7 +109,7 @@ def test_gcf_m30_does_not_use_paxg_daily():
     }
     frames, calls, sources = _run_fetch(yf_map, tv_available=False)
     m30, _h1, _m15, day = frames
-    data_src, daily_src = sources
+    data_src, daily_src = sources[0], sources[1]
     assert abs(float(m30["Close"].iloc[-1]) - 3500.0) < 1e-9
     assert abs(float(day["Close"].iloc[-1]) - 2222.0) < 1e-9, "must use GC=F daily bars"
     assert (av.PAXG_TICKER, "6mo", "1d") not in calls
@@ -129,7 +135,7 @@ def test_paxg_m30_does_not_take_tv_daily():
     }
     frames, _calls, sources = _run_fetch(yf_map, tv=tv, tv_available=True)
     m30, _h1, _m15, day = frames
-    data_src, daily_src = sources
+    data_src, daily_src = sources[0], sources[1]
     assert abs(float(m30["Close"].iloc[-1]) - 3333.0) < 1e-9
     assert abs(float(day["Close"].iloc[-1]) - 3333.0) < 1e-9, "must use PAXG daily, not TV"
     assert tv.daily_calls == 0
@@ -151,11 +157,73 @@ def test_paxg_h1_failure_keeps_paxg_m30():
     }
     frames, _calls, sources = _run_fetch(yf_map, tv_available=False, h1_paxg_exc=True)
     m30, h1, _m15, _day = frames
-    data_src, daily_src = sources
+    data_src, daily_src = sources[0], sources[1]
     assert abs(float(m30["Close"].iloc[-1]) - 3333.0) < 1e-9
     assert h1 is not None and not h1.empty
     assert data_src == av.PAXG_DATA_SOURCE
     assert daily_src == av.PAXG_DATA_SOURCE
+
+
+def test_gcf_m30_uses_gcf_m15_not_paxg():
+    """Spot-timing mix: GC=F M30 must use GC=F M15, never PAXG 15m."""
+    yf_map = {
+        (av.PAXG_TICKER, "30d", "30m"): None,
+        (av.YF_TICKER, "30d", "30m"): _bars(120, 3500.0, "30min"),
+        (av.YF_TICKER, "60d", "60m"): _bars(40, 3500.0, "1h"),
+        (av.YF_TICKER, "6mo", "1d"): _bars(30, 3500.0, "1D"),
+        (av.PAXG_TICKER, "5d", "15m"): _bars(40, 1111.0, "15min"),
+        (av.YF_TICKER, "5d", "15m"): _bars(40, 2222.0, "15min"),
+    }
+    frames, calls, sources = _run_fetch(yf_map, tv_available=False)
+    m15 = frames[2]
+    assert m15 is not None and abs(float(m15["Close"].iloc[-1]) - 2222.0) < 1e-9
+    assert (av.PAXG_TICKER, "5d", "15m") not in calls
+    assert (av.YF_TICKER, "5d", "15m") in calls
+    assert sources[2] == "Yahoo Finance GC=F (紐約期貨)"
+
+
+def test_paxg_m30_uses_paxg_m15_not_gcf_or_tv():
+    """PAXG M30 → PAXG M15; TV M15 skipped (m30_from_tv is False)."""
+    tv = FakeTV(fail_m30=True, daily=None, m15=_bars(40, 9999.0, "15min"))
+    yf_map = {
+        (av.PAXG_TICKER, "30d", "30m"): _bars(120, 3333.0, "30min"),
+        (av.PAXG_TICKER, "60d", "60m"): _bars(40, 3333.0, "1h"),
+        (av.PAXG_TICKER, "6mo", "1d"): _bars(30, 3333.0, "1D"),
+        (av.PAXG_TICKER, "5d", "15m"): _bars(40, 3333.0, "15min"),
+        (av.YF_TICKER, "5d", "15m"): _bars(40, 4444.0, "15min"),
+    }
+    frames, calls, sources = _run_fetch(yf_map, tv=tv, tv_available=True)
+    m15 = frames[2]
+    assert tv.m15_calls == 0
+    assert (av.PAXG_TICKER, "5d", "15m") in calls
+    assert (av.YF_TICKER, "5d", "15m") not in calls
+    assert abs(float(m15["Close"].iloc[-1]) - 3333.0) < 1e-9
+    assert sources[2] == av.PAXG_DATA_SOURCE
+
+
+def test_tv_m30_m15_fail_falls_to_paxg_not_gcf():
+    """TV M30 + failed TV M15 → PAXG 15m, not GC=F."""
+    tv_m30 = pd.DataFrame({
+        "open": 3400.0, "high": 3402.0, "low": 3398.0,
+        "close": 3400.0, "volume": 100.0,
+    }, index=pd.date_range("2026-07-01", periods=120, freq="30min"))
+    tv_day = pd.DataFrame({
+        "open": 3400.0, "high": 3402.0, "low": 3398.0,
+        "close": 3400.0, "volume": 100.0,
+    }, index=pd.date_range("2026-07-01", periods=30, freq="1D"))
+    tv = FakeTV(m30=tv_m30, daily=tv_day, m15=None)
+    yf_map = {
+        (av.PAXG_TICKER, "5d", "15m"): _bars(40, 5555.0, "15min"),
+        (av.YF_TICKER, "5d", "15m"): _bars(40, 6666.0, "15min"),
+    }
+    frames, calls, sources = _run_fetch(yf_map, tv=tv, tv_available=True)
+    m15 = frames[2]
+    assert tv.m15_calls >= 1
+    assert (av.PAXG_TICKER, "5d", "15m") in calls
+    assert (av.YF_TICKER, "5d", "15m") not in calls
+    assert abs(float(m15["Close"].iloc[-1]) - 5555.0) < 1e-9
+    assert sources[0].startswith("TradingView")
+    assert sources[2] == av.PAXG_DATA_SOURCE
 
 
 if __name__ == "__main__":
@@ -163,6 +231,9 @@ if __name__ == "__main__":
         test_gcf_m30_does_not_use_paxg_daily,
         test_paxg_m30_does_not_take_tv_daily,
         test_paxg_h1_failure_keeps_paxg_m30,
+        test_gcf_m30_uses_gcf_m15_not_paxg,
+        test_paxg_m30_uses_paxg_m15_not_gcf_or_tv,
+        test_tv_m30_m15_fail_falls_to_paxg_not_gcf,
     ]
     failed = 0
     for fn in tests:

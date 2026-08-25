@@ -9,8 +9,8 @@ Discipline Guards (updated 2026-08-22, based on 138-trade combined sample):
   - Anti-stacking: opposite-direction LIVE always blocked; same-direction
     allowed up to SAME_DIR_MAX_CONCURRENT (2). Gate lives in discipline_check.
   - SL floor: reject SL < 0.8×ATR (too tight = noise stop-out)
-  - GC=F fallback closes: traded-range + spot-vs-close check; UNVERIFIED stays
-    LIVE and is excluded from R aggregates (not CLOSED / not counted)
+  - GC=F fallback closes: traded-range + series-basis check (fail if last
+    bar vs spot > $40); UNVERIFIED stays LIVE and is excluded from R
   - Max daily loss: stop after -3R drawdown
   - Cooldown: block new trade < 15 min after last close (enforced)
   - Danger hour re-check: block seed at 07/18 broker even if JSON was analyzed earlier
@@ -44,7 +44,15 @@ except Exception:
     _TV_AVAILABLE = False
 
 LOG_PATH = os.path.expanduser("~/.hermes/reports/paper_trade_log.json")
-JSON_PATH = os.path.expanduser(f"~/.hermes/reports/xauusd_v3_{datetime.now().strftime('%Y-%m-%d')}.json")
+
+
+def _json_path():
+    """Analyze JSON path for UTC today (matches analyze_v3 report filename)."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return os.path.expanduser(f"~/.hermes/reports/xauusd_v3_{today}.json")
+
+
+JSON_PATH = _json_path()  # resolved at import; main() re-resolves via _json_path()
 
 # ═══════════════════════════════════════════════════════════
 # Discipline Guards (138-trade combined sample through 2026-07-30)
@@ -54,7 +62,7 @@ COOLDOWN_MINUTES = 15         # No new trade within 15 min of last close (enforc
 MAX_BARS_HELD = 100           # Timeout exit, aligned with backtest.py (≈2 days M30)
 ANTI_MARTINGALE = True         # Block volume increase after consecutive losses
 SL_MIN_ATR_MULT = 0.8          # SL must be >= 0.8 × ATR (2026-08-22: 0.5→0.8, fewer noise stop-outs)
-SPOT_VERIFY_ATR_MULT = 0.8     # GC=F close vs JSON spot must be within this × ATR
+GC_F_BASIS_FAIL_USD = 40.0     # GC=F last close vs spot; >$40 = rollover, fail closed
 MAX_DAILY_LOSS_R = 3           # Stop trading after -3R daily drawdown
 ANTI_STACKING = True           # Enable stacking / overlap guards
 ANTI_STACKING_OPPOSITE_ONLY = False  # False: also cap same-direction concurrency
@@ -266,15 +274,7 @@ GOLD_API_TIMEOUT = 8
 
 
 def _live_spot_price():
-    """Fresh spot price from gold-api.com (tracks XAU spot within ~$2).
-
-    2026-08-25: replaces the stale JSON price in _spot_close_verified.
-    The JSON `price` is generated at analyze time (cron */5 → up to 5+ min
-    stale) while the close bar can be up to ~30 min old — comparing the two
-    across a moving market wrongly failed real trail closes (gap $32 vs
-    tolerance 0.8×ATR $11.5). A fresh live quote narrows the comparison
-    window to seconds. Returns None on any failure (caller fails closed).
-    """
+    """Fresh spot from gold-api.com. None on failure. Call once per check run."""
     try:
         import urllib.request
         req = urllib.request.Request(
@@ -289,64 +289,45 @@ def _live_spot_price():
     return None
 
 
+def _series_last_close(bars):
+    """Finite last close from fetched M30 bars, or None."""
+    if bars is None or getattr(bars, "empty", True):
+        return None
+    try:
+        return _finite_px(bars["close"].iloc[-1])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
 def _spot_close_verified(close_px, spot, atr, data_source, data=None,
-                         series_last_close=None):
+                         series_last_close=None, live_spot=None):
     """Validate the data series' basis before trusting a simulated close.
 
-    Fail closed if unverifiable.
+    Fail closed if unverifiable. Does not perform network I/O — callers pass
+    `live_spot` from a single `_live_spot_price()` per run.
 
-    2026-08-25 redesign: comparing one historical close against a CURRENT
-    quote is wrong by construction — the close happened up to MAX_BARS_HELD
-    ago and price moves on (real trade-01 Trail @4643 failed vs spot 4675→
-    4685 across ticks, gap $32-42 vs tolerance $11.5). What actually
-    protects against GC=F rollover fabrication is whether the SERIES ITSELF
-    is anchored to spot:
-
-      - tv:   bars ARE spot — always trust.
-      - paxg: bars are spot-anchored (~$7); the traded-range guard already
-              proved the fill lies inside the window's real OHLC extremes.
-      - gc_f: compare the LATEST bar close against the freshest spot
-              (gold-api live quote preferred, JSON price fallback). Anchored
-              series → guarded fill is real; dislocated series ($40+ off)
-              → fail closed regardless of the individual close.
+    - tv / paxg: bars are spot or spot-anchored — trust (range guard already ran).
+    - gc_f: last bar close vs freshest spot (injected live quote, else JSON
+      price if that JSON is itself spot). Fail closed when drift exceeds
+      GC_F_BASIS_FAIL_USD ($40, same band as backtest.py rollover alert),
+      or when series last close / spot reference is missing or non-finite.
+      Individual fill vs current quote is not compared.
     """
-    if data_source == "tv":
-        return True
-    if data_source == "paxg":
+    if data_source in ("tv", "paxg"):
         return True
 
-    # Futures basis (gc_f / unknown): need a trusted spot reference.
-    ref = None
-    json_is_spot = data is None or _json_price_is_spot(data)
-    live = _live_spot_price()
-    if live is not None:
-        ref = live
-    elif json_is_spot and _finite_px(spot) is not None:
-        ref = _finite_px(spot)  # JSON price is spot basis — acceptable fallback
+    ref = _finite_px(live_spot)
     if ref is None:
-        print("  ⚠️ No live spot available for futures verification — fail closed")
+        json_is_spot = data is None or _json_price_is_spot(data)
+        if json_is_spot:
+            ref = _finite_px(spot)
+    if ref is None:
         return False
 
-    atr_px = _finite_px(atr)
-    if atr_px is None or atr_px <= 0:
+    slc = _finite_px(series_last_close)
+    if slc is None:
         return False
-
-    # Series-level basis check: is the futures series anchored to spot NOW?
-    if series_last_close is not None:
-        slc = _finite_px(series_last_close)
-        if slc is not None:
-            drift = abs(slc - ref)
-            if drift > SPOT_VERIFY_ATR_MULT * atr_px:
-                print(f"  ⚠️ Series dislocated: last close {slc:.2f} vs spot "
-                      f"{ref:.2f} (${drift:.2f} > {SPOT_VERIFY_ATR_MULT}×ATR) — fail closed")
-                return False
-            return True
-
-    # Legacy fallback (no series info): keep the conservative per-close check.
-    close = _finite_px(close_px)
-    if close is None:
-        return False
-    return abs(close - ref) <= SPOT_VERIFY_ATR_MULT * atr_px
+    return abs(slc - ref) <= GC_F_BASIS_FAIL_USD
 
 
 def _counts_toward_r(record):
@@ -916,6 +897,11 @@ def check_outcomes(data):
         print("⚠️ Could not fetch M30 data — skipping check")
         return
 
+    series_last = _series_last_close(bars)
+    live_spot = None
+    if data_source not in ("tv", "paxg"):
+        live_spot = _live_spot_price()
+
     still_live = []
     closed = 0
 
@@ -942,15 +928,10 @@ def check_outcomes(data):
             close_px = sim.get("close_price")
             spot = data.get("price")
             if verified:
-                series_last = None
-                if bars is not None and not bars.empty:
-                    try:
-                        series_last = float(bars['close'].iloc[-1])
-                    except (KeyError, IndexError, TypeError, ValueError):
-                        series_last = None
                 verified = _spot_close_verified(
                     close_px, spot, atr, data_source, data,
                     series_last_close=series_last,
+                    live_spot=live_spot,
                 )
             if not verified:
                 trade["data_source"] = sim.get("data_source", data_source)
@@ -958,7 +939,7 @@ def check_outcomes(data):
                     "result": sim["result"],
                     "close_price": close_px,
                     "pnl_r": sim["pnl_r"],
-                    "reason": "gc_f close failed traded-range or spot-vs-close check",
+                    "reason": "gc_f series basis check failed",
                 }
                 still_live.append(trade)
                 print(
@@ -1077,12 +1058,13 @@ def main():
     args = parser.parse_args()
 
     # Load latest JSON
-    if not os.path.exists(JSON_PATH):
-        print(f"⚠️ No JSON found: {JSON_PATH}")
+    json_path = _json_path()
+    if not os.path.exists(json_path):
+        print(f"⚠️ No JSON found: {json_path}")
         print("Run analyze_v3.py --json first.")
         sys.exit(1)
 
-    with open(JSON_PATH) as f:
+    with open(json_path) as f:
         data = json.load(f)
 
     if args.check_only:
@@ -1110,6 +1092,11 @@ def run_backtest(data):
         print("⚠️ Could not fetch M30 data for backtest")
         return
 
+    series_last = _series_last_close(bars)
+    live_spot = None
+    if data_source not in ("tv", "paxg"):
+        live_spot = _live_spot_price()
+
     setups = data.get("setups", [])
     if not setups:
         print("⏳ No setups in JSON")
@@ -1117,7 +1104,7 @@ def run_backtest(data):
 
     seed_dt = _parse_dt(data.get("generated_at"))
     if seed_dt is None:
-        seed_dt = _parse_dt(f"{data.get('date', datetime.now().strftime('%Y-%m-%d'))}T00:00:00Z")
+        seed_dt = _parse_dt(f"{_report_date(data)}T00:00:00Z")
 
     current_price = data.get("price", 0)
     atr = data.get("atr_30m", 15)
@@ -1185,6 +1172,8 @@ def run_backtest(data):
         if sim.get("closed") and verified:
             verified = _spot_close_verified(
                 sim.get("close_price"), current_price, atr, data_source, data,
+                series_last_close=series_last,
+                live_spot=live_spot,
             )
         scalp = " ⚠️SCALP" if bars_held < MIN_HOLDING_BARS else ""
         unv = "" if verified else " ❌UNVERIFIED"
@@ -1213,7 +1202,7 @@ def run_backtest(data):
             "direction": side,
             "status": "CLOSED" if really_closed else "LIVE",
             "seeded_time": str(seed_dt) if seed_dt else "",
-            "seeded_date": data.get("date", datetime.now().strftime('%Y-%m-%d')),
+            "seeded_date": _report_date(data),
             "pnl_r": pnl_r if really_closed else 0.0,
             "verified": verified,
             "close_time": str(seed_dt) if really_closed else "",

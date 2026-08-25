@@ -132,6 +132,7 @@ PAXG_TICKER = "PAXG-USD"    # spot-anchored token fallback (1 PAXG = 1 oz; track
 PAXG_DATA_SOURCE = "Yahoo Finance PAXG-USD (現貨錨定)"
 DATA_SOURCE = "TradingView (OANDA:XAUUSD)"  # updated at runtime (M30/H1 intraday)
 DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"  # daily bars; prefer TV spot when available
+M15_DATA_SOURCE = None  # set in fetch_data; None = M15 disabled
 # Mixed-venue basis (spot M30 close vs futures daily close). None = same venue.
 SPOT_FUTURES_BASIS = None
 BASIS_CRON_BLOCKED = False
@@ -439,11 +440,12 @@ def fetch_data():
     used when M30 is spot-anchored. GC=F M30 stays on GC=F daily so labels
     match bars and mixed-venue basis checks still run.
     """
-    global DATA_SOURCE, DAILY_DATA_SOURCE
+    global DATA_SOURCE, DAILY_DATA_SOURCE, M15_DATA_SOURCE
 
     df_m30 = df_h1 = df_day = None
     DATA_SOURCE = "TradingView (OANDA:XAUUSD)"
     DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"
+    M15_DATA_SOURCE = None
     m30_is_spot = False
     m30_from_tv = False
 
@@ -577,6 +579,7 @@ def fetch_data():
             df_m15 = _tv.get_hist(TV_SYMBOL, TV_EXCHANGE, interval=TVInterval.in_15_minute, n_bars=500)
             df_m15 = _normalize_tv_ohlc(df_m15)
             if df_m15 is not None:
+                M15_DATA_SOURCE = DATA_SOURCE
                 _log(f"   TV M15: {len(df_m15)} bars")
         except Exception as e:
             _log(f"   TV M15 failed: {e}")
@@ -593,6 +596,10 @@ def fetch_data():
             _log(f"[*] M15 fallback: Yahoo Finance {m15_ticker} 15m...")
             df_m15 = _yf_ohlc(m15_ticker, '5d', '15m')
             if df_m15 is not None and not df_m15.empty:
+                M15_DATA_SOURCE = (
+                    PAXG_DATA_SOURCE if m15_ticker == PAXG_TICKER
+                    else "Yahoo Finance GC=F (紐約期貨)"
+                )
                 _log(f"   YF M15 ({m15_ticker}): {len(df_m15)} bars")
             else:
                 df_m15 = None
@@ -603,6 +610,7 @@ def fetch_data():
     if df_m15 is not None and (df_m15.empty or len(df_m15) < MIN_BARS['m15']):
         _log(f"   M15 insufficient ({0 if df_m15 is None else len(df_m15)} bars) — M15 timing disabled")
         df_m15 = None
+        M15_DATA_SOURCE = None
 
     _log(f"   📡 Final: M30={len(df_m30)} bars | H1={len(df_h1)} | M15={len(df_m15) if df_m15 is not None else 0} | Daily={len(df_day)} | Source: {src_note}")
     return df_m30, df_h1, df_m15, df_day
@@ -4146,6 +4154,7 @@ def main():
             'data_source': _data_source_label(),
             'intraday_source': DATA_SOURCE,
             'daily_source': DAILY_DATA_SOURCE,
+            'm15_source': M15_DATA_SOURCE,
             'spot_futures_basis': SPOT_FUTURES_BASIS,
             'basis_cron_blocked': BASIS_CRON_BLOCKED,
             'basis_note': BASIS_NOTE or None,
