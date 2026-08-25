@@ -571,7 +571,8 @@ def fetch_data():
 
     # --- M15: native fetch (TV or yfinance); do not upsample M30 ---
     df_m15 = None
-    if _TV_AVAILABLE:
+    if _TV_AVAILABLE and m30_from_tv:
+        # TV M15 only when M30 itself came from TV — same-venue rule as daily.
         try:
             df_m15 = _tv.get_hist(TV_SYMBOL, TV_EXCHANGE, interval=TVInterval.in_15_minute, n_bars=500)
             df_m15 = _normalize_tv_ohlc(df_m15)
@@ -582,11 +583,17 @@ def fetch_data():
             df_m15 = None
 
     if df_m15 is None:
+        # Venue must match M30 basis (2026-08-25): entry-timing signals are
+        # price-level comparisons — mixing a spot-based setup with GC=F
+        # timing bars misfires by the whole futures premium ($15-65 during
+        # rollover). Any spot M30 (TV or PAXG) → PAXG M15 fallback;
+        # GC=F M30 → GC=F M15.
+        m15_ticker = PAXG_TICKER if m30_is_spot else YF_TICKER
         try:
-            _log("[*] M15 fallback: Yahoo Finance 15m...")
-            df_m15 = _yf_ohlc(YF_TICKER, '5d', '15m')
+            _log(f"[*] M15 fallback: Yahoo Finance {m15_ticker} 15m...")
+            df_m15 = _yf_ohlc(m15_ticker, '5d', '15m')
             if df_m15 is not None and not df_m15.empty:
-                _log(f"   YF M15: {len(df_m15)} bars")
+                _log(f"   YF M15 ({m15_ticker}): {len(df_m15)} bars")
             else:
                 df_m15 = None
         except Exception as e:

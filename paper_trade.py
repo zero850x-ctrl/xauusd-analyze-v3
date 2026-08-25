@@ -261,18 +261,92 @@ def _json_price_is_spot(data):
     return True
 
 
-def _spot_close_verified(close_px, spot, atr, data_source, data=None):
-    """GC=F simulated close must sit near JSON spot. Fail closed if unverifiable."""
+GOLD_API_URL = "https://api.gold-api.com/price/XAU"
+GOLD_API_TIMEOUT = 8
+
+
+def _live_spot_price():
+    """Fresh spot price from gold-api.com (tracks XAU spot within ~$2).
+
+    2026-08-25: replaces the stale JSON price in _spot_close_verified.
+    The JSON `price` is generated at analyze time (cron */5 → up to 5+ min
+    stale) while the close bar can be up to ~30 min old — comparing the two
+    across a moving market wrongly failed real trail closes (gap $32 vs
+    tolerance 0.8×ATR $11.5). A fresh live quote narrows the comparison
+    window to seconds. Returns None on any failure (caller fails closed).
+    """
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            GOLD_API_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=GOLD_API_TIMEOUT) as resp:
+            payload = json.loads(resp.read().decode())
+        px = float(payload.get("price"))
+        if px > 0:
+            return px
+    except Exception as e:
+        print(f"  ⚠️ gold-api live spot unavailable: {e}")
+    return None
+
+
+def _spot_close_verified(close_px, spot, atr, data_source, data=None,
+                         series_last_close=None):
+    """Validate the data series' basis before trusting a simulated close.
+
+    Fail closed if unverifiable.
+
+    2026-08-25 redesign: comparing one historical close against a CURRENT
+    quote is wrong by construction — the close happened up to MAX_BARS_HELD
+    ago and price moves on (real trade-01 Trail @4643 failed vs spot 4675→
+    4685 across ticks, gap $32-42 vs tolerance $11.5). What actually
+    protects against GC=F rollover fabrication is whether the SERIES ITSELF
+    is anchored to spot:
+
+      - tv:   bars ARE spot — always trust.
+      - paxg: bars are spot-anchored (~$7); the traded-range guard already
+              proved the fill lies inside the window's real OHLC extremes.
+      - gc_f: compare the LATEST bar close against the freshest spot
+              (gold-api live quote preferred, JSON price fallback). Anchored
+              series → guarded fill is real; dislocated series ($40+ off)
+              → fail closed regardless of the individual close.
+    """
     if data_source == "tv":
         return True
-    if data is not None and not _json_price_is_spot(data):
+    if data_source == "paxg":
+        return True
+
+    # Futures basis (gc_f / unknown): need a trusted spot reference.
+    ref = None
+    json_is_spot = data is None or _json_price_is_spot(data)
+    live = _live_spot_price()
+    if live is not None:
+        ref = live
+    elif json_is_spot and _finite_px(spot) is not None:
+        ref = _finite_px(spot)  # JSON price is spot basis — acceptable fallback
+    if ref is None:
+        print("  ⚠️ No live spot available for futures verification — fail closed")
         return False
-    spot_px = _finite_px(spot)
-    close = _finite_px(close_px)
+
     atr_px = _finite_px(atr)
-    if spot_px is None or close is None or atr_px is None or atr_px <= 0:
+    if atr_px is None or atr_px <= 0:
         return False
-    return abs(close - spot_px) <= SPOT_VERIFY_ATR_MULT * atr_px
+
+    # Series-level basis check: is the futures series anchored to spot NOW?
+    if series_last_close is not None:
+        slc = _finite_px(series_last_close)
+        if slc is not None:
+            drift = abs(slc - ref)
+            if drift > SPOT_VERIFY_ATR_MULT * atr_px:
+                print(f"  ⚠️ Series dislocated: last close {slc:.2f} vs spot "
+                      f"{ref:.2f} (${drift:.2f} > {SPOT_VERIFY_ATR_MULT}×ATR) — fail closed")
+                return False
+            return True
+
+    # Legacy fallback (no series info): keep the conservative per-close check.
+    close = _finite_px(close_px)
+    if close is None:
+        return False
+    return abs(close - ref) <= SPOT_VERIFY_ATR_MULT * atr_px
 
 
 def _counts_toward_r(record):
@@ -482,8 +556,14 @@ def _parse_dt(val):
 
 
 def _daily_loss_r(log):
-    """Sum of pnl_r for trusted CLOSED trades today. UNVERIFIED excluded."""
-    today = datetime.now().strftime('%Y-%m-%d')
+    """Sum of pnl_r for trusted CLOSED trades today. UNVERIFIED excluded.
+
+    2026-08-25: compare against the UTC date — seeded_date is written from
+    the analyze report date (UTC). Using machine-local time (HKT) made the
+    -3R daily-loss circuit breaker blind to same-day losses between
+    00:00–07:59 HKT, when local and UTC dates differ.
+    """
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     total = 0
     for t in log.get("trades", []):
         if t.get("status") == "CLOSED" and t.get("seeded_date") == today and _counts_toward_r(t):
@@ -779,6 +859,18 @@ def _fetch_m30(start, end):
                     bars['datetime'] = bars['datetime'].dt.tz_convert('UTC').dt.tz_localize(None)
                 data_source = "paxg"
                 print(f"  📊 yfinance PAXG-USD M30: {len(bars)} bars")
+                # 2026-08-25: PAXG trades 24/7 as a crypto token — during the
+                # gold market weekend close it drifts on thin crypto flow.
+                # Flag when the newest bar falls outside Mon-Fri so consumers
+                # know the basis may be slightly off spot until Globex reopens
+                # (Sun 18:00 ET / Mon 07:00 HKT).
+                try:
+                    last_dt = bars['datetime'].max()
+                    if hasattr(last_dt, 'weekday') and last_dt.weekday() >= 5:  # 5=Sat, 6=Sun
+                        print("  ⚠️ Weekend PAXG bars — gold market closed; "
+                              "token drifting on thin crypto flow, basis may deviate from spot")
+                except Exception:
+                    pass
         except Exception as e:
             print(f"  ⚠️ yfinance PAXG fetch failed: {e}")
 
@@ -850,8 +942,15 @@ def check_outcomes(data):
             close_px = sim.get("close_price")
             spot = data.get("price")
             if verified:
+                series_last = None
+                if bars is not None and not bars.empty:
+                    try:
+                        series_last = float(bars['close'].iloc[-1])
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        series_last = None
                 verified = _spot_close_verified(
                     close_px, spot, atr, data_source, data,
+                    series_last_close=series_last,
                 )
             if not verified:
                 trade["data_source"] = sim.get("data_source", data_source)
