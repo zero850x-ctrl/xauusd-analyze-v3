@@ -2143,7 +2143,7 @@ def _setup_seedable(setup, current_price=None):
 
 
 def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
-                          time_quality_override=None):
+                          time_quality_override=None, points=None, atr=None):
     """Attach counter-trend severity, recommended volume, time quality, and cron gate.
 
     time_quality_override: when set (e.g. walk-forward backtest), use this level
@@ -2187,6 +2187,24 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
         )
         if s.get('session_bonus') and s.get('priority', 99) > 1:
             s['priority'] = s['priority'] - 1
+        # 2026-09-02 zone-rejection (mentor H1 charts: he sold $4420-4449
+        # resistance 38 times — repeatedly-tested zones hold). Setups whose
+        # entry sits on a swing-high/low cluster (>=2 prior touches within
+        # 0.5 ATR) get a priority boost. Informational + priority only;
+        # never overrides danger/advisory gating.
+        if points is not None and atr:
+            ep = s.get('entry_price') or _parse_entry_price_from_setup(s, current_price)
+            if ep is not None:
+                touches, zlabel, _ztouch_idx = _zone_rejection_score(
+                    side, float(ep), points, atr
+                )
+                s['zone_touches'] = touches
+                s['zone_label'] = zlabel
+                if touches >= 2 and s.get('priority', 99) > 1:
+                    s['priority'] = s['priority'] - 1
+            else:
+                s['zone_touches'] = 0
+                s['zone_label'] = ''
 
         if s.get('entry_price') is None:
             ep = _parse_entry_price_from_setup(s, current_price)
@@ -3507,6 +3525,39 @@ def _emit_pattern_setups(side, pattern, current_price, atr, daily_trend, h1_tren
     return out
 
 
+
+def _zone_rejection_score(side, entry_level, points, atr, band_mult=1.0):
+    """Count swing extremes clustering at the entry level (mentor 129-trade:
+    he sold the SAME $4420-4449 resistance band 38 times — repeatedly tested
+    zones are the ones that hold. A setup at a zone with >=2 prior touches is
+    a 'rejection zone' and deserves a priority boost.
+
+    side: 'BEARISH' (SELL at resistance) or 'BULLISH' (BUY at support)
+    entry_level: the setup entry price
+    points: swing list from find_swings_ordered
+    band_mult: zone half-width in ATR multiples (default 1.0 ATR either side)
+    Returns (touches, zone_label, last_touch_idx).
+    """
+    band = atr * band_mult
+    wtype = 'high' if side == 'BEARISH' else 'low'
+    touches = 0
+    last_touch_idx = -1
+    for p in points:
+        if p['type'] != wtype:
+            continue
+        if abs(p['price'] - entry_level) <= band:
+            touches += 1
+            last_touch_idx = max(last_touch_idx, p['idx'])
+    if touches >= 3:
+        zone_label = f"強力測試帶 (已測試 {touches} 次)"
+    elif touches == 2:
+        zone_label = f"測試帶 (已測試 {touches} 次)"
+    elif touches == 1:
+        zone_label = f"單次觸及 (測試 {touches} 次)"
+    else:
+        zone_label = ""
+    return touches, zone_label, last_touch_idx
+
 def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, atr, h1_trend=None):
     """Generate trade setups following user's methodology."""
     setups = []
@@ -4171,7 +4222,8 @@ def main():
 
     # 7b. Inject K-line confirmation scores into setups (used by paper_trade + cron filtering)
     _inject_kline_scores(setups, candle_m30, candle_day, len(df_m30) - 1, len(df_day) - 1)
-    _inject_push_metadata(setups, daily_trend, h1_trend, current_price=current)
+    _inject_push_metadata(setups, daily_trend, h1_trend, current_price=current,
+                               points=points, atr=atr)
     
     utc_now = datetime.now(timezone.utc)
     today = utc_now.strftime('%Y-%m-%d')
