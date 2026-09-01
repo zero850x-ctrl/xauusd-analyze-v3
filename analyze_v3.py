@@ -2076,6 +2076,12 @@ def cron_push_eligible(setup):
     # Danger hour block (07:00/18:00 — 138-sample); advisory hours allowed through
     if setup.get('time_quality') == 'danger':
         return False
+    # 2026-09-01 regime filter (mentor 129-trade sample: sells +$5,225, buys -$417
+    # in a falling regime; H1+D1 same-direction = no counter-regime pushes).
+    # ALIGNED already requires daily/H1 agreement; this adds the explicit hard
+    # block so MILD counter setups are never pushed when both TFs oppose.
+    if setup.get('regime_blocked'):
+        return False
     # Must have TP targets — no naked entries
     tp1_str = str(setup.get('tp1', ''))
     if not tp1_str or tp1_str == '0' or '$0' in tp1_str:
@@ -2154,6 +2160,11 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
         tq_level = time_quality_override
     else:
         tq_level, _ = _time_quality_score()
+    broker_hour = _broker_hour()
+    session_bonus = (
+        tq_level != 'danger'
+        and broker_hour in SESSION_BONUS_HOURS
+    )
     for s in setups:
         side = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
         is_sell = side == 'BEARISH'
@@ -2162,6 +2173,24 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
         s['counter_trend_severity'] = severity
         s['recommended_volume'] = vol
         s['time_quality'] = tq_level
+        # 2026-09-01 regime filter: when D1 and H1 both oppose the setup side,
+        # hard-block the push (cron_push_eligible=False below via regime_blocked).
+        d_trend = (daily_trend or {}).get('trend', 'NEUTRAL')
+        h1_t = (h1_trend or {}).get('trend', 'NEUTRAL')
+        if side == 'BEARISH':
+            both_opp = d_trend == 'BULLISH' and h1_t == 'BULLISH'
+        else:
+            both_opp = d_trend == 'BEARISH' and h1_t == 'BEARISH'
+        s['regime_blocked'] = bool(both_opp)
+        # 2026-09-01: mentor-sample session bonus — priority bump for aligned
+        # setups during the mentor's strongest hours. Bonus applies only when
+        # the setup would already be pushed (post cron_push_eligible below);
+        # danger/advisory gating is never lifted by the bonus.
+        s['session_bonus'] = bool(
+            session_bonus and severity == 'ALIGNED'
+        )
+        if s.get('session_bonus') and s.get('priority', 99) > 1:
+            s['priority'] = s['priority'] - 1
 
         if s.get('entry_price') is None:
             ep = _parse_entry_price_from_setup(s, current_price)
@@ -2386,6 +2415,11 @@ GOLDEN_HOURS = {17}          # 17:00 (64.3% win, +$339 — 138-sample 2026-07-30
 ADVISORY_HOURS_0408 = {4, 5, 6, 8}
 # 17:00 promoted to GOLDEN (64.3% win, +$339 net, 14 trades — 138-sample)
 ADVISORY_HOUR_1700 = set()  # vacated; 17:00 now golden
+# 2026-09-01 mentor 129-trade sample (8/24-9/1): 03:00-07:00 +$2,803 (39 trades),
+# 18:00 +$808 (9). Bonus hours boost push priority when ALIGNED; never overrides
+# trend/quality gates. 01:00/05:00 remain loss hours in that sample — 05:00 already
+# inside ADVISORY_HOURS_0408; 01:00 left untouched (too few trades to hard-code).
+SESSION_BONUS_HOURS = {3, 4, 6, 7, 18}  # 05:00 already advisory (same window)
 DANGER_HOURS = {7, 18}       # 07:00 (25% win, -$212 — 0.12 lot massacre); 18:00 (21.4%, -$98)
 DANGER_ADVISORY_HOURS = ADVISORY_HOURS_0408 | DANGER_HOURS  # 07, 18 added as hard-block
 MAX_DAILY_TRADES = 8         # Overtrading threshold (123 trades/week = ~17/day avg)
@@ -2594,6 +2628,7 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
             'tp1': f"${tp1:.0f} (0.618 RR, 止賺 1/3)",
             'tp2': f"${tp2:.0f} (2:1 RR, 止賺 1/3)",
             'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+            'exit_plan': "TP1 後 SL→BE; 餘下 2/3 無固定TP, 1.5 ATR trailing 跟勢",
             'risk_amount': round(risk, 1),
             'rr_tp1': round(rr_tp1, 1),
             'rr_tp2': round(rr_tp2, 1),
@@ -2618,6 +2653,7 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
         'tp1': f"${tp1:.0f} (0.618 RR, 止賺 1/3)",
         'tp2': f"${tp2:.0f} (2:1 RR, 止賺 1/3)",
         'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+        'exit_plan': "TP1 後 SL→BE; 餘下 2/3 無固定TP, 1.5 ATR trailing 跟勢",
         'risk_amount': round(risk, 1),
         'rr_tp1': round(rr_tp1, 1),
         'rr_tp2': round(rr_tp2, 1),
@@ -2627,7 +2663,7 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
 
 
 def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp3_trail,
-                           daily_trend, h1_trend, atr, current_price=None):
+                          daily_trend, h1_trend, atr, current_price=None):
     """Build 0.786 deep retracement setup — derived from HK stock Fib 0.786 playbook.
 
     Strategy: When price retraces deeply to 0.786 Fib level (deep wash-out),
@@ -2687,6 +2723,7 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
             'tp1': f"${tp1:.0f} (0.618 Fib 位, 止賺 1/3)",
             'tp2': f"${tp2:.0f} (跌浪最低點, 止賺 1/3)",
             'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+            'exit_plan': "TP1 後 SL→BE; 餘下 2/3 無固定TP, 1.5 ATR trailing 跟勢",
             'risk_amount': round(risk, 1),
             'rr_tp1': round(rr_tp1, 1),
             'rr_tp2': round(rr_tp2, 1),
@@ -2720,6 +2757,7 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
         'tp1': f"${tp1:.0f} (0.618 Fib 位, 止賺 1/3)",
         'tp2': f"${tp2:.0f} (升浪最高點, 止賺 1/3)",
         'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+        'exit_plan': "TP1 後 SL→BE; 餘下 2/3 無固定TP, 1.5 ATR trailing 跟勢",
         'risk_amount': round(risk, 1),
         'rr_tp1': round(rr_tp1, 1),
         'rr_tp2': round(rr_tp2, 1),
@@ -3123,6 +3161,13 @@ def _make_setup(side, pattern, daily_trend, h1_trend, tp3_trail, *,
         'tp1': f"${targets['tp1']:.0f} ({_tp_method_label(pattern, targets['tp1'], targets['fib_tp'], targets['rr_tp'])}, 止賺 1/3)",
         'tp2': f"${targets['tp2']:.0f} ({_tp_method_label(pattern, targets['tp2'], targets['fib_tp'], targets['rr_tp'], targets['tp2_fib'], targets['tp2_rr'])}, 止賺 1/3)",
         'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+        # 2026-09-01 momentum-hold plan (mentor 129-trade: avg win $126 vs avg loss $27,
+        # 42% win still net +$4,808): after TP1 move SL to BE, tail rides a
+        # 1.5-ATR trailing stop instead of fixed TP2 — cut losses fast, let winners run.
+        'exit_plan': (
+            f"TP1 (+{targets['rr1']:.1f}R) 後 SL→BE; 餘下 2/3 無固定TP, "
+            f"1.5 ATR trailing 跟勢 (前輩式放飛: 平均贏$126/輸$27)"
+        ),
         'risk_amount': round(risk, 1),
         'rr_tp1': round(targets['rr1'], 1),
         'rr_tp2': round(targets['rr2'], 1),
@@ -3173,9 +3218,14 @@ def _emit_boundary(side, pattern, current_price, atr, daily_trend, h1_trend,
         )
     add_default = (bd_entry - bd_risk) if order == 'SELL' else (bd_entry + bd_risk)
     add_level = pattern.get('neckline', add_default)
+    # 2026-09-01 pyramiding (mentor 129-trade: winners scale UP with trend, e.g.
+    # 0.05→0.2→0.35 on 9/1 crash day; losers stay at base size). Add only when
+    # the first tranche is >= +1R in profit, capped at 2 extra tranches total.
+    pyr_add_vol = round(add_vol * 0.5, 3)
     add_position = (
-        f"跌穿 ${add_level:.0f} 加注 {add_vol}" if order == 'SELL'
-        else f"突破 ${add_level:.0f} 加注 {add_vol}"
+        f"跌穿 ${add_level:.0f} 加注 {add_vol}；金字塔: 浮盈≥1R後同向加注 {pyr_add_vol}×2 (上限3注)"
+        if order == 'SELL'
+        else f"突破 ${add_level:.0f} 加注 {add_vol}；金字塔: 浮盈≥1R後同向加注 {pyr_add_vol}×2 (上限3注)"
     )
     if aligned:
         note = (
