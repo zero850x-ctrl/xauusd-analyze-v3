@@ -2076,12 +2076,6 @@ def cron_push_eligible(setup):
     # Danger hour block (07:00/18:00 — 138-sample); advisory hours allowed through
     if setup.get('time_quality') == 'danger':
         return False
-    # 2026-09-01 regime filter (mentor 129-trade sample: sells +$5,225, buys -$417
-    # in a falling regime; H1+D1 same-direction = no counter-regime pushes).
-    # ALIGNED already requires daily/H1 agreement; this adds the explicit hard
-    # block so MILD counter setups are never pushed when both TFs oppose.
-    if setup.get('regime_blocked'):
-        return False
     # Must have TP targets — no naked entries
     tp1_str = str(setup.get('tp1', ''))
     if not tp1_str or tp1_str == '0' or '$0' in tp1_str:
@@ -2173,8 +2167,10 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
         s['counter_trend_severity'] = severity
         s['recommended_volume'] = vol
         s['time_quality'] = tq_level
-        # 2026-09-01 regime filter: when D1 and H1 both oppose the setup side,
-        # hard-block the push (cron_push_eligible=False below via regime_blocked).
+        # 2026-09-01 regime metadata: D1+H1 both oppose side. This is exactly
+        # counter_trend_severity == 'SEVERE' — which cron_push_eligible already
+        # blocks via the ALIGNED gate — so regime_blocked is informational only,
+        # never an additional push gate (no dead-code duplicate guard).
         d_trend = (daily_trend or {}).get('trend', 'NEUTRAL')
         h1_t = (h1_trend or {}).get('trend', 'NEUTRAL')
         if side == 'BEARISH':
@@ -2415,11 +2411,16 @@ GOLDEN_HOURS = {17}          # 17:00 (64.3% win, +$339 — 138-sample 2026-07-30
 ADVISORY_HOURS_0408 = {4, 5, 6, 8}
 # 17:00 promoted to GOLDEN (64.3% win, +$339 net, 14 trades — 138-sample)
 ADVISORY_HOUR_1700 = set()  # vacated; 17:00 now golden
-# 2026-09-01 mentor 129-trade sample (8/24-9/1): 03:00-07:00 +$2,803 (39 trades),
-# 18:00 +$808 (9). Bonus hours boost push priority when ALIGNED; never overrides
-# trend/quality gates. 01:00/05:00 remain loss hours in that sample — 05:00 already
-# inside ADVISORY_HOURS_0408; 01:00 left untouched (too few trades to hard-code).
-SESSION_BONUS_HOURS = {3, 4, 6, 7, 18}  # 05:00 already advisory (same window)
+# 2026-09-01 mentor 129-trade sample (8/24-9/1): strong hours in BROKER time.
+# NOTE (2026-09-02 review): mentor chart times are MT5 SERVER time = GMT+3 =
+# BROKER_UTC_OFFSET_HOURS; so mentor "07:00/18:00 strong" maps directly onto
+# broker hours {7,18} — which CONFLICT with the 138-sample DANGER_HOURS {7,18}
+# (25%/21.4% win). The 9/1 crash-day trades dominate the mentor hour PnL, so
+# those hours are NOT reliable as bonus hours. Only broker 03:00/06:00 are
+# both mentor-positive and not contradicted — and 06:00 is in ADVISORY_HOURS.
+# Final: bonus ONLY at broker 03:00 (+$1,354, 14 trades) when ALIGNED; the
+# 07:00/18:00 mentor "edge" is rejected as outlier-driven, not added.
+SESSION_BONUS_HOURS = {3}  # broker 03:00 only (mentor +$1,354, n=14; no conflict)
 DANGER_HOURS = {7, 18}       # 07:00 (25% win, -$212 — 0.12 lot massacre); 18:00 (21.4%, -$98)
 DANGER_ADVISORY_HOURS = ADVISORY_HOURS_0408 | DANGER_HOURS  # 07, 18 added as hard-block
 MAX_DAILY_TRADES = 8         # Overtrading threshold (123 trades/week = ~17/day avg)
