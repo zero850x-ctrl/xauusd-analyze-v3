@@ -2189,9 +2189,12 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
             s['priority'] = s['priority'] - 1
         # 2026-09-02 zone-rejection (mentor H1 charts: he sold $4420-4449
         # resistance 38 times — repeatedly-tested zones hold). Setups whose
-        # entry sits on a swing-high/low cluster (>=2 prior touches within
-        # 0.5 ATR) get a priority boost. Informational + priority only;
-        # never overrides danger/advisory gating.
+        # entry sits on a swing-high/low cluster (>=2 touches within 1.0 ATR
+        # either side, from find_swings_ordered) get a priority boost.
+        # Breakout/已突破 setups: _parse_entry_price_from_setup falls back to
+        # current_price, so their zone is scored at the live price (entry ==
+        # fill price) — intentional. Informational + priority only; never
+        # overrides danger/advisory gating.
         if points is not None and atr:
             ep = s.get('entry_price') or _parse_entry_price_from_setup(s, current_price)
             if ep is not None:
@@ -3816,6 +3819,11 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
     if setups:
         for i, s in enumerate(setups, 1):
             note = s.get('note', '')
+            # 2026-09-02 zone-rejection: surface the swing-cluster score so the
+            # human report matches what paper_trade/cron see in the JSON.
+            zone_row = ""
+            if s.get('zone_label'):
+                zone_row = f"\n| 🧲 位測試 | {s['zone_label']} |"
             setup_text += f"""
 ### Signal {i}: {s['direction']} ({s['pattern']})
 
@@ -3837,6 +3845,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 風險金額 | ${s['risk_amount']:.0f} |
 | R:R TP1 | {s['rr_tp1']}:1 |
 | R:R TP2 | {s['rr_tp2']}:1 |
+{zone_row}
 {note}
 """
     else:
