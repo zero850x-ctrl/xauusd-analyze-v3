@@ -2143,7 +2143,7 @@ def _setup_seedable(setup, current_price=None):
 
 
 def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
-                          time_quality_override=None):
+                          time_quality_override=None, points=None, atr=None):
     """Attach counter-trend severity, recommended volume, time quality, and cron gate.
 
     time_quality_override: when set (e.g. walk-forward backtest), use this level
@@ -2154,6 +2154,11 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
         tq_level = time_quality_override
     else:
         tq_level, _ = _time_quality_score()
+    broker_hour = _broker_hour()
+    session_bonus = (
+        tq_level != 'danger'
+        and broker_hour in SESSION_BONUS_HOURS
+    )
     for s in setups:
         side = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
         is_sell = side == 'BEARISH'
@@ -2162,6 +2167,47 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
         s['counter_trend_severity'] = severity
         s['recommended_volume'] = vol
         s['time_quality'] = tq_level
+        # 2026-09-01 regime metadata: D1+H1 both oppose side. This is exactly
+        # counter_trend_severity == 'SEVERE' — which cron_push_eligible already
+        # blocks via the ALIGNED gate — so regime_blocked is informational only,
+        # never an additional push gate (no dead-code duplicate guard).
+        d_trend = (daily_trend or {}).get('trend', 'NEUTRAL')
+        h1_t = (h1_trend or {}).get('trend', 'NEUTRAL')
+        if side == 'BEARISH':
+            both_opp = d_trend == 'BULLISH' and h1_t == 'BULLISH'
+        else:
+            both_opp = d_trend == 'BEARISH' and h1_t == 'BEARISH'
+        s['regime_blocked'] = bool(both_opp)
+        # 2026-09-01: mentor-sample session bonus — priority bump for aligned
+        # setups during the mentor's strongest hours. Bonus applies only when
+        # the setup would already be pushed (post cron_push_eligible below);
+        # danger/advisory gating is never lifted by the bonus.
+        s['session_bonus'] = bool(
+            session_bonus and severity == 'ALIGNED'
+        )
+        if s.get('session_bonus') and s.get('priority', 99) > 1:
+            s['priority'] = s['priority'] - 1
+        # 2026-09-02 zone-rejection (mentor H1 charts: he sold $4420-4449
+        # resistance 38 times — repeatedly-tested zones hold). Setups whose
+        # entry sits on a swing-high/low cluster (>=2 touches within 1.0 ATR
+        # either side, from find_swings_ordered) get a priority boost.
+        # Breakout/已突破 setups: _parse_entry_price_from_setup falls back to
+        # current_price, so their zone is scored at the live price (entry ==
+        # fill price) — intentional. Informational + priority only; never
+        # overrides danger/advisory gating.
+        if points is not None and atr:
+            ep = s.get('entry_price') or _parse_entry_price_from_setup(s, current_price)
+            if ep is not None:
+                touches, zlabel, _ztouch_idx = _zone_rejection_score(
+                    side, float(ep), points, atr
+                )
+                s['zone_touches'] = touches
+                s['zone_label'] = zlabel
+                if touches >= 2 and s.get('priority', 99) > 1:
+                    s['priority'] = s['priority'] - 1
+            else:
+                s['zone_touches'] = 0
+                s['zone_label'] = ''
 
         if s.get('entry_price') is None:
             ep = _parse_entry_price_from_setup(s, current_price)
@@ -2386,6 +2432,16 @@ GOLDEN_HOURS = {17}          # 17:00 (64.3% win, +$339 — 138-sample 2026-07-30
 ADVISORY_HOURS_0408 = {4, 5, 6, 8}
 # 17:00 promoted to GOLDEN (64.3% win, +$339 net, 14 trades — 138-sample)
 ADVISORY_HOUR_1700 = set()  # vacated; 17:00 now golden
+# 2026-09-01 mentor 129-trade sample (8/24-9/1): strong hours in BROKER time.
+# NOTE (2026-09-02 review): mentor chart times are MT5 SERVER time = GMT+3 =
+# BROKER_UTC_OFFSET_HOURS; so mentor "07:00/18:00 strong" maps directly onto
+# broker hours {7,18} — which CONFLICT with the 138-sample DANGER_HOURS {7,18}
+# (25%/21.4% win). The 9/1 crash-day trades dominate the mentor hour PnL, so
+# those hours are NOT reliable as bonus hours. Only broker 03:00/06:00 are
+# both mentor-positive and not contradicted — and 06:00 is in ADVISORY_HOURS.
+# Final: bonus ONLY at broker 03:00 (+$1,354, 14 trades) when ALIGNED; the
+# 07:00/18:00 mentor "edge" is rejected as outlier-driven, not added.
+SESSION_BONUS_HOURS = {3}  # broker 03:00 only (mentor +$1,354, n=14; no conflict)
 DANGER_HOURS = {7, 18}       # 07:00 (25% win, -$212 — 0.12 lot massacre); 18:00 (21.4%, -$98)
 DANGER_ADVISORY_HOURS = ADVISORY_HOURS_0408 | DANGER_HOURS  # 07, 18 added as hard-block
 MAX_DAILY_TRADES = 8         # Overtrading threshold (123 trades/week = ~17/day avg)
@@ -2594,6 +2650,7 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
             'tp1': f"${tp1:.0f} (0.618 RR, 止賺 1/3)",
             'tp2': f"${tp2:.0f} (2:1 RR, 止賺 1/3)",
             'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+            'exit_plan': "TP1 後 SL→BE; 餘下 2/3 無固定TP, 1.5 ATR trailing 跟勢",
             'risk_amount': round(risk, 1),
             'rr_tp1': round(rr_tp1, 1),
             'rr_tp2': round(rr_tp2, 1),
@@ -2618,6 +2675,7 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
         'tp1': f"${tp1:.0f} (0.618 RR, 止賺 1/3)",
         'tp2': f"${tp2:.0f} (2:1 RR, 止賺 1/3)",
         'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+        'exit_plan': "TP1 後 SL→BE; 餘下 2/3 無固定TP, 1.5 ATR trailing 跟勢",
         'risk_amount': round(risk, 1),
         'rr_tp1': round(rr_tp1, 1),
         'rr_tp2': round(rr_tp2, 1),
@@ -2627,7 +2685,7 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
 
 
 def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp3_trail,
-                           daily_trend, h1_trend, atr, current_price=None):
+                          daily_trend, h1_trend, atr, current_price=None):
     """Build 0.786 deep retracement setup — derived from HK stock Fib 0.786 playbook.
 
     Strategy: When price retraces deeply to 0.786 Fib level (deep wash-out),
@@ -2687,6 +2745,7 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
             'tp1': f"${tp1:.0f} (0.618 Fib 位, 止賺 1/3)",
             'tp2': f"${tp2:.0f} (跌浪最低點, 止賺 1/3)",
             'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+            'exit_plan': "TP1 後 SL→BE; 餘下 2/3 無固定TP, 1.5 ATR trailing 跟勢",
             'risk_amount': round(risk, 1),
             'rr_tp1': round(rr_tp1, 1),
             'rr_tp2': round(rr_tp2, 1),
@@ -2720,6 +2779,7 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
         'tp1': f"${tp1:.0f} (0.618 Fib 位, 止賺 1/3)",
         'tp2': f"${tp2:.0f} (升浪最高點, 止賺 1/3)",
         'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+        'exit_plan': "TP1 後 SL→BE; 餘下 2/3 無固定TP, 1.5 ATR trailing 跟勢",
         'risk_amount': round(risk, 1),
         'rr_tp1': round(rr_tp1, 1),
         'rr_tp2': round(rr_tp2, 1),
@@ -3123,6 +3183,13 @@ def _make_setup(side, pattern, daily_trend, h1_trend, tp3_trail, *,
         'tp1': f"${targets['tp1']:.0f} ({_tp_method_label(pattern, targets['tp1'], targets['fib_tp'], targets['rr_tp'])}, 止賺 1/3)",
         'tp2': f"${targets['tp2']:.0f} ({_tp_method_label(pattern, targets['tp2'], targets['fib_tp'], targets['rr_tp'], targets['tp2_fib'], targets['tp2_rr'])}, 止賺 1/3)",
         'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
+        # 2026-09-01 momentum-hold plan (mentor 129-trade: avg win $126 vs avg loss $27,
+        # 42% win still net +$4,808): after TP1 move SL to BE, tail rides a
+        # 1.5-ATR trailing stop instead of fixed TP2 — cut losses fast, let winners run.
+        'exit_plan': (
+            f"TP1 (+{targets['rr1']:.1f}R) 後 SL→BE; 餘下 2/3 無固定TP, "
+            f"1.5 ATR trailing 跟勢 (前輩式放飛: 平均贏$126/輸$27)"
+        ),
         'risk_amount': round(risk, 1),
         'rr_tp1': round(targets['rr1'], 1),
         'rr_tp2': round(targets['rr2'], 1),
@@ -3173,9 +3240,14 @@ def _emit_boundary(side, pattern, current_price, atr, daily_trend, h1_trend,
         )
     add_default = (bd_entry - bd_risk) if order == 'SELL' else (bd_entry + bd_risk)
     add_level = pattern.get('neckline', add_default)
+    # 2026-09-01 pyramiding (mentor 129-trade: winners scale UP with trend, e.g.
+    # 0.05→0.2→0.35 on 9/1 crash day; losers stay at base size). Add only when
+    # the first tranche is >= +1R in profit, capped at 2 extra tranches total.
+    pyr_add_vol = round(add_vol * 0.5, 3)
     add_position = (
-        f"跌穿 ${add_level:.0f} 加注 {add_vol}" if order == 'SELL'
-        else f"突破 ${add_level:.0f} 加注 {add_vol}"
+        f"跌穿 ${add_level:.0f} 加注 {add_vol}；金字塔: 浮盈≥1R後同向加注 {pyr_add_vol}×2 (上限3注)"
+        if order == 'SELL'
+        else f"突破 ${add_level:.0f} 加注 {add_vol}；金字塔: 浮盈≥1R後同向加注 {pyr_add_vol}×2 (上限3注)"
     )
     if aligned:
         note = (
@@ -3456,6 +3528,39 @@ def _emit_pattern_setups(side, pattern, current_price, atr, daily_trend, h1_tren
     return out
 
 
+
+def _zone_rejection_score(side, entry_level, points, atr, band_mult=1.0):
+    """Count swing extremes clustering at the entry level (mentor 129-trade:
+    he sold the SAME $4420-4449 resistance band 38 times — repeatedly tested
+    zones are the ones that hold. A setup at a zone with >=2 prior touches is
+    a 'rejection zone' and deserves a priority boost.
+
+    side: 'BEARISH' (SELL at resistance) or 'BULLISH' (BUY at support)
+    entry_level: the setup entry price
+    points: swing list from find_swings_ordered
+    band_mult: zone half-width in ATR multiples (default 1.0 ATR either side)
+    Returns (touches, zone_label, last_touch_idx).
+    """
+    band = atr * band_mult
+    wtype = 'high' if side == 'BEARISH' else 'low'
+    touches = 0
+    last_touch_idx = -1
+    for p in points:
+        if p['type'] != wtype:
+            continue
+        if abs(p['price'] - entry_level) <= band:
+            touches += 1
+            last_touch_idx = max(last_touch_idx, p['idx'])
+    if touches >= 3:
+        zone_label = f"強力測試帶 (已測試 {touches} 次)"
+    elif touches == 2:
+        zone_label = f"測試帶 (已測試 {touches} 次)"
+    elif touches == 1:
+        zone_label = f"單次觸及 (測試 {touches} 次)"
+    else:
+        zone_label = ""
+    return touches, zone_label, last_touch_idx
+
 def generate_trade_setups(df_m30, patterns, points, daily_trend, current_price, atr, h1_trend=None):
     """Generate trade setups following user's methodology."""
     setups = []
@@ -3714,6 +3819,11 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
     if setups:
         for i, s in enumerate(setups, 1):
             note = s.get('note', '')
+            # 2026-09-02 zone-rejection: surface the swing-cluster score so the
+            # human report matches what paper_trade/cron see in the JSON.
+            zone_row = ""
+            if s.get('zone_label'):
+                zone_row = f"\n| 🧲 位測試 | {s['zone_label']} |"
             setup_text += f"""
 ### Signal {i}: {s['direction']} ({s['pattern']})
 
@@ -3735,6 +3845,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 風險金額 | ${s['risk_amount']:.0f} |
 | R:R TP1 | {s['rr_tp1']}:1 |
 | R:R TP2 | {s['rr_tp2']}:1 |
+{zone_row}
 {note}
 """
     else:
@@ -4120,7 +4231,8 @@ def main():
 
     # 7b. Inject K-line confirmation scores into setups (used by paper_trade + cron filtering)
     _inject_kline_scores(setups, candle_m30, candle_day, len(df_m30) - 1, len(df_day) - 1)
-    _inject_push_metadata(setups, daily_trend, h1_trend, current_price=current)
+    _inject_push_metadata(setups, daily_trend, h1_trend, current_price=current,
+                               points=points, atr=atr)
     
     utc_now = datetime.now(timezone.utc)
     today = utc_now.strftime('%Y-%m-%d')
