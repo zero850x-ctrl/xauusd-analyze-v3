@@ -7,7 +7,7 @@ XAUUSD / 黃金技術分析 + 紙交易監控系統。由 Hermes Agent cron job 
 | 項目 | 值 |
 |------|-----|
 | Job ID | `904a8f1758b6` |
-| Schedule | `*/5 7-23 * * 1-5`（週一至五 07:00–23:00 HKT，每 5 分鐘）|
+| Schedule | `*/15 7-23 * * 1-5`（週一至五 07:00–23:00 HKT，每 15 分鐘）|
 | Model | `mimo-v2.5` @ `opencode-go` |
 | Workdir | `~/.hermes/skills/trading/xauusd-technical-analysis` |
 | 報告輸出 | `~/.hermes/cron/output/904a8f1758b6/`（Telegram）|
@@ -39,6 +39,7 @@ TradingView OANDA spot  →  PAXG-USD (yfinance, 現貨錨定, 差 ~$7)  →  GC
 
 ## Paper Trade Guards
 
+- **Anti-martingale**（方案 C，2026-09-03）：同一 UTC 日內 **3+ 連續虧損**（`ANTI_MART_LOSS_LIMIT=3`）先觸發，之後所有 volume > 0.01 嘅 setup 拒絶（0.01 lot 照入）；贏一注或過 UTC 午夜自動解除。跨日虧損唔算連續（2026-09-03 由 2 放寬至 3，原版數晒成個 history 會死鎖）
 - **Traded-range 驗證**：GC=F close 超出實際 OHLC traded range → 標記 `UNVERIFIED`，唔計入績效
 - **Series-basis 驗證**：GC=F 最新 close vs spot 超過 `GC_F_BASIS_FAIL_USD=40` → `UNVERIFIED`，保持 LIVE
 - **Anti-stacking**：相反方向禁止；同方向最多 `SAME_DIR_MAX_CONCURRENT=2`（2026-08-22 放寬）

@@ -5,7 +5,7 @@ Logs paper trades and checks outcomes against historical M30 data.
 
 Discipline Guards (updated 2026-08-22, based on 138-trade combined sample):
   - cron_push_eligible gate: only seed eligible setups (includes SL+TP mandatory)
-  - Anti-martingale: block volume > 0.01 after 2+ consecutive losses
+  - Anti-martingale: block volume > 0.01 after 3+ same-day consecutive losses
   - Anti-stacking: opposite-direction LIVE always blocked; same-direction
     allowed up to SAME_DIR_MAX_CONCURRENT (2). Gate lives in discipline_check.
   - SL floor: reject SL < 0.8×ATR (too tight = noise stop-out)
@@ -61,6 +61,7 @@ MIN_HOLDING_BARS = 3          # 3 × M30 = 15 min minimum hold
 COOLDOWN_MINUTES = 15         # No new trade within 15 min of last close (enforced)
 MAX_BARS_HELD = 100           # Timeout exit, aligned with backtest.py (≈2 days M30)
 ANTI_MARTINGALE = True         # Block volume increase after consecutive losses
+ANTI_MART_LOSS_LIMIT = 3       # 3+ same-day consecutive losses trigger (2026-09-03: 2→3 放寬)
 SL_MIN_ATR_MULT = 0.8          # SL must be >= 0.8 × ATR (2026-08-22: 0.5→0.8, fewer noise stop-outs)
 GC_F_BASIS_FAIL_USD = 40.0     # GC=F last close vs spot; >$40 = rollover, fail closed
 MAX_DAILY_LOSS_R = 3           # Stop trading after -3R daily drawdown
@@ -815,7 +816,7 @@ def discipline_check(log, direction, volume, sl_price, entry_price, atr):
     # ── 4. Anti-martingale ──
     if ANTI_MARTINGALE:
         consec_loss = _consecutive_losses(log)
-        if consec_loss >= 2 and volume > 0.01:
+        if consec_loss >= ANTI_MART_LOSS_LIMIT and volume > 0.01:
             return False, f"🚫 Anti-martingale: {consec_loss} consecutive losses → volume capped at 0.01"
 
     # ── 5. SL floor ──
@@ -1223,7 +1224,7 @@ def report_status(data):
 
     # ── Discipline summary ──
     consec_loss = _consecutive_losses(log)
-    if consec_loss >= 2:
+    if consec_loss >= ANTI_MART_LOSS_LIMIT:
         print(f" ⚠️ {consec_loss} consecutive losses — anti-martingale active (vol capped at 0.01)")
 
     print("=" * 60)

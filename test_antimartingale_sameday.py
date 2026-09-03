@@ -51,6 +51,35 @@ log = {"history": [
 got = pt._consecutive_losses(log)
 cases.append(("跨日無 WIN 都唔連續 (09-03 + 09-01 → 1)", got, 1))
 
+# Case 5: discipline_check — 2 連敗 (同日) + vol 0.02 → 唔觸發 (放寬至 3)
+log = {"history": [
+    mk_win("2026-09-01", 0.5),
+    mk_loss("2026-09-03", -0.3),
+    mk_loss("2026-09-03", -1.0),
+]}
+ok, reason = pt.discipline_check(log, "BUY", 0.02, 4400, 4486, 15)
+cases.append(("2 連敗 vol 0.02 → 放行 (唔觸發)", ok, True))
+
+# Case 6: discipline_check — 3 連敗 (同日) + vol 0.02 → 觸發 block
+log = {"history": [
+    mk_win("2026-09-01", 0.5),
+    mk_loss("2026-09-03", -0.3),
+    mk_loss("2026-09-03", -0.5),
+    mk_loss("2026-09-03", -1.0),
+]}
+ok, reason = pt.discipline_check(log, "BUY", 0.02, 4400, 4486, 15)
+cases.append(("3 連敗 vol 0.02 → block", ok, False))
+
+# Case 7: discipline_check — 3 連敗但 vol 0.01 → 照入 (細注唔鎖)
+log = {"history": [
+    mk_win("2026-09-01", 0.5),
+    mk_loss("2026-09-03", -0.3),
+    mk_loss("2026-09-03", -0.5),
+    mk_loss("2026-09-03", -1.0),
+]}
+ok, reason = pt.discipline_check(log, "BUY", 0.01, 4400, 4486, 15)
+cases.append(("3 連敗 vol 0.01 → 照入 (細注唔鎖)", ok, True))
+
 allpass = True
 for name, got, want in cases:
     ok = got == want
