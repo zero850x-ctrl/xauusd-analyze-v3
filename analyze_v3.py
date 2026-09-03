@@ -1877,22 +1877,42 @@ def detect_rebound_signal(df_m15):
     ~47% ≈ baseline ~50%, 即歷史上無 edge。真實勝率由 live paper sim
     (paper_martingale.json) 收集驗證。配合 3 級馬丁 (0.01→0.04) 模擬。
     純資訊 + paper_trade 模擬 — 唔影響 cron_push_eligible。
+
+    2026-09-03 fix: 必須 evaluate 最後一條「已收市」15m bar — tvDatafeed 最後
+    一行係形成中 (未收市) bar, cron 10min tick 對 15m bar 永遠撞唔正。舊 code
+    用 forming bar 計信號 → 全日 12 個真確認信號全部 miss (實測證實)。
     """
     if df_m15 is None or df_m15.empty or len(df_m15) < 20:
         return {'signal': False, 'reason': 'M15 數據不足', 'bar_time': None, 'entry': None}
     close = df_m15['Close'].values
     high = df_m15['High'].values
     open_ = df_m15['Open'].values
-    last = len(close) - 1
-    if last < 5:
+
+    # --- 只睇已收市 bar ---
+    try:
+        last_start = df_m15.index[-1]
+        interval = pd.Timedelta(minutes=15)
+        if getattr(last_start, 'tzinfo', None) is not None:
+            now_ts = pd.Timestamp.now(tz=last_start.tzinfo)
+        else:
+            now_ts = pd.Timestamp.now()   # TV index 係 naive local (HKT) — 同 local now 對比
+        if last_start + interval > now_ts:
+            bar_idx = len(df_m15) - 2      # 最後一行未收市 → 用上一條 (已收市)
+        else:
+            bar_idx = len(df_m15) - 1
+    except Exception:
+        bar_idx = len(df_m15) - 2          # 判斷失敗 → 保守用上一條
+    if bar_idx < 5:
         return {'signal': False, 'reason': 'M15 數據不足', 'bar_time': None, 'entry': None}
-    sma10 = float(np.mean(close[-10:]))
-    prev_high3 = float(np.max(high[last - 3:last]))  # 前 3 支 bar 最高 (唔含今支)
+
+    last = bar_idx
+    sma10 = float(np.mean(close[last - 9:last + 1]))     # 含評估 bar, 同研究 rolling(10) 一致
+    prev_high3 = float(np.max(high[last - 3:last]))      # 前 3 支 bar 最高 (唔含評估 bar)
     bullish = close[last] > open_[last]
     signal = bool(bullish and close[last] > sma10 and close[last] > prev_high3)
     bar_time = None
     try:
-        bar_time = str(df_m15.index[-1])
+        bar_time = str(df_m15.index[last])
     except Exception:
         pass
     return {
