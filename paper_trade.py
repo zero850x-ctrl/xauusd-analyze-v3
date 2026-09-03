@@ -504,6 +504,170 @@ def save_log(log):
             os.unlink(tmp_path)
 
 
+# ═══════════════════════════════════════════════════════════
+# Rebound-confirmation Martingale paper sim (2026-09-03)
+# S3 signal (15m: bullish bar + close>SMA10 + close>prev-3-bar high)
+# → 10-min snapshot win rate 85.6% (60d PAXG study, baseline 48.9%).
+# Martingale 3 levels 0.01→0.04, level up only after consecutive loss,
+# reset to 0.01 after a win. Independent state file — never touches the
+# main paper_trade_log. Informational only: no push gate impact.
+# ═══════════════════════════════════════════════════════════
+MARTINGALE_PATH = os.path.expanduser("~/.hermes/reports/paper_martingale.json")
+MART_LOT0 = 0.01
+MART_MAX_LEVEL = 3            # 0.01 → 0.02 → 0.04 (study: 3 levels capture all gains)
+MART_HOLD_MINUTES = 10        # snapshot close at ~10 min hold
+
+
+def _martingale_fresh_state():
+    return {
+        "max_level": MART_MAX_LEVEL,
+        "level": 0,
+        "open": None,                 # dict: signal_time, entry, lot, level, open_time
+        "last_signal_time": None,     # dedupe: only NEW signal bars open
+        "trades": [],
+        "equity_usd": 0.0,
+        "peak_equity": 0.0,
+        "max_drawdown_usd": 0.0,
+        "n_wins": 0,
+        "n_losses": 0,
+        "cur_loss_streak": 0,
+        "longest_loss_streak": 0,
+        "created": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def load_martingale_state():
+    if os.path.exists(MARTINGALE_PATH):
+        try:
+            with open(MARTINGALE_PATH) as f:
+                st = json.load(f)
+            st.setdefault("max_level", MART_MAX_LEVEL)
+            st.setdefault("trades", [])
+            for k in ("level", "last_signal_time", "open", "equity_usd", "peak_equity",
+                      "max_drawdown_usd", "n_wins", "n_losses", "cur_loss_streak",
+                      "longest_loss_streak"):
+                st.setdefault(k, _martingale_fresh_state()[k])
+            return st
+        except Exception:
+            pass
+    return _martingale_fresh_state()
+
+
+def save_martingale_state(st):
+    parent = os.path.dirname(MARTINGALE_PATH) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".paper_martingale.", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(st, f, indent=2, ensure_ascii=False, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, MARTINGALE_PATH)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def _mart_now():
+    return datetime.now(timezone.utc)
+
+
+def _mart_elapsed_minutes(open_time_iso, now):
+    try:
+        t = datetime.fromisoformat(str(open_time_iso))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return (now - t).total_seconds() / 60.0
+    except Exception:
+        return MART_HOLD_MINUTES + 1  # unparseable → treat as ripe
+
+
+def run_martingale_cycle(data):
+    """One cycle per cron tick (~10 min). Mirrors the 60-day real-path study:
+       open on new S3 signal; close when hold >= 10 min; loss → next level."""
+    sig = (data or {}).get("rebound_martingale") or {}
+    price = _finite_px((data or {}).get("price"))
+    st = load_martingale_state()
+    now = _mart_now()
+
+    if not sig.get("signal") and st.get("open") is None:
+        # Nothing to do — silent (keeps cron output quiet)
+        return st
+
+    if "rebound_martingale" not in (data or {}):
+        print("⚠️ [馬丁] 報告無 rebound_martingale 欄位 — analyzer 未支援, 跳過")
+        return st
+
+    # ---- 1. Close ripe position ----
+    if st.get("open"):
+        op = st["open"]
+        if price is None:
+            print("⚠️ [馬丁] 有持倉但無現價 — 保持 LIVE")
+            return st
+        if _mart_elapsed_minutes(op.get("open_time"), now) >= MART_HOLD_MINUTES:
+            exit_px = price
+            entry_px = float(op["entry"])
+            lot = float(op["lot"])
+            pnl = (exit_px - entry_px) * (lot / MART_LOT0)  # 0.01 lot = 1 oz
+            win = pnl > 0
+            st["equity_usd"] += pnl
+            st["peak_equity"] = max(st["peak_equity"], st["equity_usd"])
+            st["max_drawdown_usd"] = min(st["max_drawdown_usd"],
+                                         st["equity_usd"] - st["peak_equity"])
+            if win:
+                st["n_wins"] += 1
+                st["cur_loss_streak"] = 0
+                st["level"] = 0
+            else:
+                st["n_losses"] += 1
+                st["cur_loss_streak"] += 1
+                st["longest_loss_streak"] = max(st["longest_loss_streak"],
+                                                st["cur_loss_streak"])
+                st["level"] = min(st["level"] + 1, st["max_level"] - 1)
+            st["trades"].append({
+                "signal_time": op.get("signal_time"),
+                "open_time": op.get("open_time"),
+                "close_time": now.isoformat(),
+                "entry": entry_px,
+                "exit": exit_px,
+                "lot": lot,
+                "level": op.get("level"),
+                "pnl_usd": round(pnl, 2),
+                "win": win,
+            })
+            print(f"[馬丁] 平倉 級{op.get('level')+1} (lot {lot:.2f}): "
+                  f"${entry_px:.1f} → ${exit_px:.1f} = {'✅ +$%.2f' % pnl if win else '❌ -$%.2f' % -pnl}")
+            st["open"] = None
+
+    # ---- 2. Open on new S3 signal ----
+    if st.get("open") is None:
+        s_on = sig.get("signal")
+        s_time = sig.get("bar_time")
+        s_entry = _finite_px(sig.get("entry"))
+        if s_on and s_time and s_entry is not None and s_time != st.get("last_signal_time"):
+            level = st.get("level", 0)
+            lot = MART_LOT0 * 2 ** level
+            st["open"] = {
+                "signal_time": s_time,
+                "open_time": now.isoformat(),
+                "entry": s_entry,
+                "lot": lot,
+                "level": level,
+            }
+            st["last_signal_time"] = s_time
+            print(f"[馬丁] 🎯 S3 反彈確認 @ ${s_entry:.1f} → 開 級{level+1} (lot {lot:.2f})")
+
+    # ---- 3. Status line ----
+    n = st["n_wins"] + st["n_losses"]
+    wr = f"{st['n_wins']/n:.1%}" if n else "-"
+    mr = f"maxDD ${-st['max_drawdown_usd']:.2f}" if st["max_drawdown_usd"] else "maxDD $0"
+    print(f"[馬丁] 狀態: 級{st['level']+1} | equity ${st['equity_usd']:+.2f} | {mr} | "
+          f"勝率 {wr} ({st['n_wins']}/{n}) | 最長連蝕 {st['longest_loss_streak']}")
+
+    save_martingale_state(st)
+    return st
+
+
 def _parse_dt(val):
     """Parse assorted datetime representations → tz-aware UTC datetime (or None).
 
@@ -1083,6 +1247,7 @@ def main():
         eligible = [s for s in data.get("setups", []) if s.get("cron_push_eligible")]
         seed_trades(data, eligible)
         report_status(data)
+        run_martingale_cycle(data)   # 反彈確認馬丁 paper sim (獨立 state, 2026-09-03)
 
 
 def run_backtest(data):

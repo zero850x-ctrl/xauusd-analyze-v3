@@ -6,7 +6,7 @@ sys.path.insert(0, "/tmp/xauusd-analyze-v3")
 import ta
 from analyze_v3 import analyze_m15_entry_timing as new_fn, analyze_m5_entry_timing
 
-git_src = subprocess.run(["git", "-C", "/tmp/xauusd-analyze-v3", "show", "HEAD:analyze_v3.py"],
+git_src = subprocess.run(["git", "-C", "/tmp/xauusd-analyze-v3", "show", "origin/main:analyze_v3.py"],
                          capture_output=True, text=True).stdout
 start = git_src.index("def analyze_m15_entry_timing")
 end = git_src.index("# ═══════════════════════════════════════════════════════════\n# CANDLESTICK PATTERN DETECTION")

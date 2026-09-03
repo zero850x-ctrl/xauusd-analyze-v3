@@ -1869,6 +1869,41 @@ def analyze_m5_entry_timing(df_m5, patterns, points, current_price, atr):
 # CANDLESTICK PATTERN DETECTION
 # ═══════════════════════════════════════════════════════════
 
+def detect_rebound_signal(df_m15):
+    """
+    S3 反彈確認信號 (2026-09-03 研究, 60日 PAXG 實測):
+    15m bar: 陽燭 + close > SMA10 + close > 前3bar最高 → 之後 10 分鐘 snapshot
+    勝率 85.6% (baseline 48.9%)。配合 3 級馬丁 (0.01→0.04) 使用。
+    純資訊 + paper_trade 模擬驗證 — 唔影響 cron_push_eligible。
+    """
+    if df_m15 is None or df_m15.empty or len(df_m15) < 20:
+        return {'signal': False, 'reason': 'M15 數據不足', 'bar_time': None, 'entry': None}
+    close = df_m15['Close'].values
+    high = df_m15['High'].values
+    open_ = df_m15['Open'].values
+    last = len(close) - 1
+    if last < 5:
+        return {'signal': False, 'reason': 'M15 數據不足', 'bar_time': None, 'entry': None}
+    sma10 = float(np.mean(close[-10:]))
+    prev_high3 = float(np.max(high[last - 3:last]))  # 前 3 支 bar 最高 (唔含今支)
+    bullish = close[last] > open_[last]
+    signal = bool(bullish and close[last] > sma10 and close[last] > prev_high3)
+    bar_time = None
+    try:
+        bar_time = str(df_m15.index[-1])
+    except Exception:
+        pass
+    return {
+        'signal': signal,
+        'reason': 'S3 陽燭+站上MA10+破3bar高' if signal else '未確認',
+        'bar_time': bar_time,
+        'entry': round(float(close[last]), 2),
+        'sma10': round(sma10, 2),
+        'prev_high3': round(prev_high3, 2),
+    }
+
+
+
 def _body(o, c):
     """Absolute body size."""
     return abs(c - o)
@@ -3717,7 +3752,8 @@ def _entry_mode_report_label(mode):
 
 
 def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend=None,
-                    candle_m30=None, candle_day=None, m15_result=None, m5_result=None, report_date=None):
+                    candle_m30=None, candle_day=None, m15_result=None, m5_result=None,
+                    rebound=None, report_date=None):
     """Generate comprehensive Markdown report."""
     candle_m30 = candle_m30 or []
     candle_day = candle_day or []
@@ -3853,6 +3889,25 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
             m5_text += "\n⚠️ 無 M5 微調建議\n"
     else:
         m5_text = "\n## 🕒 五-A、M5 快速結構\n\n⚠️ M5 數據不足或不可用 — 無法提供快速結構\n"
+
+    # --- Rebound confirmation section (S3 martingale precondition, informational) ---
+    rebound_text = ""
+    if rebound and rebound.get('signal'):
+        rebound_text = f"""
+## 🎯 五-C、反彈確認 (S3 馬丁前置信號)
+
+| 項目 | 數值 |
+|------|------|
+| 信號 | ✅ {rebound['reason']} |
+| 參考入場 | ${rebound['entry']} |
+| SMA10 (M15) | ${rebound['sma10']} |
+| 前3bar高 | ${rebound['prev_high3']} |
+
+> 💡 2026-09-03 研究 (60日實測): 此信號後 10 分鐘 snapshot 勝率 85.6% (baseline 48.9%)。
+> 配合 3 級馬丁 0.01→0.04 使用 (連續蝕先加注、贏還原)。**paper_trade 模擬驗證中 — 唔影響推送 gate。**
+"""
+    else:
+        rebound_text = "\n## 🎯 五-C、反彈確認 (S3 馬丁前置信號)\n\n⏳ 未確認 — 等陽燭 + 站上 SMA10 + 突破前 3 bar 高\n"
 
     # --- M15 entry timing section ---
     m15_text = ""
@@ -4084,6 +4139,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 
 {setup_text}
 {m5_text}
+{rebound_text}
 {m15_text}
 ## 📊 六、關鍵價位
 
@@ -4224,6 +4280,8 @@ def main():
     _log(f"[*] M15 trend: {m15_result['m15_trend']} | RSI: {m15_result['m15_rsi']} | Suggestions: {len(m15_result['entry_suggestions'])}")
     m5_result = analyze_m5_entry_timing(df_m5, patterns, points, current, atr)
     _log(f"[*] M5 trend: {m5_result['m5_trend']} | RSI: {m5_result['m5_rsi']} | Suggestions: {len(m5_result['entry_suggestions'])}")
+    rebound = detect_rebound_signal(df_m15)
+    _log(f"[*] 反彈確認 (S3): {rebound['signal']} @ {rebound['entry']} ({rebound['reason']})")
 
     # 6. Multi-timeframe analysis (Daily + H1)
     daily_trend = analyze_daily_trend(df_day)
@@ -4249,7 +4307,8 @@ def main():
     # 8. Generate report
     report = generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend,
                              candle_m30=candle_m30, candle_day=candle_day,
-                             m15_result=m15_result, m5_result=m5_result, report_date=today)
+                             m15_result=m15_result, m5_result=m5_result,
+                             rebound=rebound, report_date=today)
     
     # 9. Save — date is UTC to match generated_at (avoids local-midnight filename drift)
     if args.output:
@@ -4277,6 +4336,15 @@ def main():
             'm15_analysis': m15_result or None,
             'm5_source': M5_DATA_SOURCE,
             'm5_analysis': m5_result or None,
+            'rebound_martingale': {
+                'signal': rebound['signal'],
+                'reason': rebound['reason'],
+                'bar_time': rebound['bar_time'],
+                'entry': rebound['entry'],
+                'sma10': rebound['sma10'],
+                'prev_high3': rebound['prev_high3'],
+                'note': 'S3 反彈確認 + 3級馬丁 (0.01→0.04) — 2026-09-03 研究 85.6% 10min勝率',
+            },
             'spot_futures_basis': SPOT_FUTURES_BASIS,
             'basis_cron_blocked': BASIS_CRON_BLOCKED,
             'basis_note': BASIS_NOTE or None,
