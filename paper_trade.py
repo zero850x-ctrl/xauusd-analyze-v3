@@ -725,13 +725,25 @@ def _daily_loss_r(log):
 
 
 def _consecutive_losses(log):
-    """Count consecutive losses from most recent trusted closed trades."""
+    """Count consecutive losses closed on the same UTC day (anti same-day tilt).
+
+    2026-09-03 (方案 C): 只防即日 tilt — 只數「喺同一 UTC 日平倉」嘅連續虧損。
+    跨日唔算（之前嘅 bug：數晒成個 history，隔咗成星期嘅舊虧損會
+    永久鎖死 anti-martingale，連敗永遠斷唔到 → 死鎖）。
+    """
     count = 0
+    last_loss_day = None
     for t in reversed(log.get("history", [])):
         if not _counts_toward_r(t):
             continue
         r = t.get("pnl_r", 0)
         if r < 0:
+            # 呢個係虧損單 — 如果佢同前一個虧損單唔同 UTC 日，就唔算連續
+            closed = t.get("closed_time") or t.get("seeded_time") or ""
+            day = closed[:10] if closed else None
+            if last_loss_day is not None and day != last_loss_day:
+                break
+            last_loss_day = day
             count += 1
         else:
             break
