@@ -11,6 +11,7 @@ flag/wedge pullback entries, tight structure-based stops, 3-tier TP.
   - Daily:   MA20/MA50 + RSI(14) → trend direction + strength
   - H1:      MA20/MA50 + RSI(14) → intermediate trend
   - M15:     micro entry timing (trend, RSI, swing points, per-pattern suggestions)
+  - M5:      quick microstructure (trend, RSI, swings — informational only, never gates pushes)
   - Multi-TF alignment check: aligned_with_trends()
 
 📈 INDICATORS (add_indicators)
@@ -133,6 +134,7 @@ PAXG_DATA_SOURCE = "Yahoo Finance PAXG-USD (現貨錨定)"
 DATA_SOURCE = "TradingView (OANDA:XAUUSD)"  # updated at runtime (M30/H1 intraday)
 DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"  # daily bars; prefer TV spot when available
 M15_DATA_SOURCE = None  # set in fetch_data; None = M15 disabled
+M5_DATA_SOURCE = None   # set in fetch_data; None = M5 disabled
 # Mixed-venue basis (spot M30 close vs futures daily close). None = same venue.
 SPOT_FUTURES_BASIS = None
 BASIS_CRON_BLOCKED = False
@@ -142,7 +144,7 @@ TV_OHLC_MAP = {
     'open': 'Open', 'high': 'High', 'low': 'Low',
     'close': 'Close', 'volume': 'Volume',
 }
-MIN_BARS = {'m30': 50, 'h1': 30, 'm15': 30, 'day': 20}
+MIN_BARS = {'m30': 50, 'h1': 30, 'm15': 30, 'm5': 100, 'day': 20}
 TRAIL_PROFIT_ATR = float(os.environ.get('TRAIL_PROFIT_ATR', '2.0'))
 TRAIL_STOP_ATR = float(os.environ.get('TRAIL_STOP_ATR', '1.5'))
 
@@ -440,12 +442,13 @@ def fetch_data():
     used when M30 is spot-anchored. GC=F M30 stays on GC=F daily so labels
     match bars and mixed-venue basis checks still run.
     """
-    global DATA_SOURCE, DAILY_DATA_SOURCE, M15_DATA_SOURCE
+    global DATA_SOURCE, DAILY_DATA_SOURCE, M15_DATA_SOURCE, M5_DATA_SOURCE
 
-    df_m30 = df_h1 = df_day = None
+    df_m30 = df_h1 = df_day = df_m15 = df_m5 = None
     DATA_SOURCE = "TradingView (OANDA:XAUUSD)"
     DAILY_DATA_SOURCE = "Yahoo Finance GC=F (紐約期貨)"
     M15_DATA_SOURCE = None
+    M5_DATA_SOURCE = None
     m30_is_spot = False
     m30_from_tv = False
 
@@ -612,8 +615,46 @@ def fetch_data():
         df_m15 = None
         M15_DATA_SOURCE = None
 
-    _log(f"   📡 Final: M30={len(df_m30)} bars | H1={len(df_h1)} | M15={len(df_m15) if df_m15 is not None else 0} | Daily={len(df_day)} | Source: {src_note}")
-    return df_m30, df_h1, df_m15, df_day
+    # --- M5: native fetch (TV or yfinance); do not upsample M30 ---
+    # Same venue rule as M15: spot M30 (TV or PAXG) → PAXG 5m fallback;
+    # GC=F M30 → GC=F 5m. M5 is informational only (fast structure / trigger
+    # timing) and NEVER feeds the push gate (2026-09-03 decision).
+    df_m5 = None
+    if _TV_AVAILABLE and m30_from_tv:
+        try:
+            df_m5 = _tv.get_hist(TV_SYMBOL, TV_EXCHANGE, interval=TVInterval.in_5_minute, n_bars=500)
+            df_m5 = _normalize_tv_ohlc(df_m5)
+            if df_m5 is not None:
+                M5_DATA_SOURCE = DATA_SOURCE
+                _log(f"   TV M5: {len(df_m5)} bars")
+        except Exception as e:
+            _log(f"   TV M5 failed: {e}")
+            df_m5 = None
+
+    if df_m5 is None:
+        m5_ticker = PAXG_TICKER if m30_is_spot else YF_TICKER
+        try:
+            _log(f"[*] M5 fallback: Yahoo Finance {m5_ticker} 5m...")
+            df_m5 = _yf_ohlc(m5_ticker, '2d', '5m')
+            if df_m5 is not None and not df_m5.empty:
+                M5_DATA_SOURCE = (
+                    PAXG_DATA_SOURCE if m5_ticker == PAXG_TICKER
+                    else "Yahoo Finance GC=F (紐約期貨)"
+                )
+                _log(f"   YF M5 ({m5_ticker}): {len(df_m5)} bars")
+            else:
+                df_m5 = None
+        except Exception as e:
+            _log(f"   YF M5 failed: {e}")
+            df_m5 = None
+
+    if df_m5 is not None and (df_m5.empty or len(df_m5) < MIN_BARS['m5']):
+        _log(f"   M5 insufficient ({0 if df_m5 is None else len(df_m5)} bars) — M5 quick structure disabled")
+        df_m5 = None
+        M5_DATA_SOURCE = None
+
+    _log(f"   📡 Final: M30={len(df_m30)} bars | H1={len(df_h1)} | M15={len(df_m15) if df_m15 is not None else 0} | M5={len(df_m5) if df_m5 is not None else 0} | Daily={len(df_day)} | Source: {src_note}")
+    return df_m30, df_h1, df_m15, df_m5, df_day
 
 # ═══════════════════════════════════════════════════════════
 # INDICATORS (lightweight — just what we need)
@@ -1640,25 +1681,26 @@ def analyze_h1_trend(df_h1):
 # M15 ENTRY TIMING
 # ═══════════════════════════════════════════════════════════
 
-def analyze_m15_entry_timing(df_m15, patterns, points, current_price, atr):
+def _analyze_mini_tf(df, patterns, points, current_price, atr, atr_scale=0.7):
     """
-    Analyze M15 timeframe for refined entry timing.
-    Returns dict with m15_trend, m15_rsi, m15_swings, and per-pattern entry_suggestions.
+    Core mini-timeframe (M5/M15) structure + per-pattern entry timing.
+    Informational ONLY — never feeds cron_push_eligible (2026-09-03 decision).
+    Returns dict with neutral keys: trend, rsi, swings, suggestions.
     """
-    if df_m15 is None or df_m15.empty or len(df_m15) < 20:
+    if df is None or df.empty or len(df) < 20:
         return {
-            'm15_trend': 'N/A (數據不足)',
-            'm15_rsi': None,
-            'm15_swings': None,
-            'entry_suggestions': [],
+            'trend': 'N/A (數據不足)',
+            'rsi': None,
+            'swings': None,
+            'suggestions': [],
         }
 
-    close = df_m15['Close'].values
-    high = df_m15['High'].values
-    low = df_m15['Low'].values
+    close = df['Close'].values
+    high = df['High'].values
+    low = df['Low'].values
     n = len(close)
 
-    # --- M15 short-term trend from last 20 bars ---
+    # --- Short-term trend from last 20 bars ---
     lookback = min(20, n)
     recent = close[-lookback:]
     ma10 = np.mean(recent[-min(10, lookback):])
@@ -1666,38 +1708,38 @@ def analyze_m15_entry_timing(df_m15, patterns, points, current_price, atr):
         first_half = np.mean(recent[:10])
         second_half = np.mean(recent[10:])
         if second_half > first_half * 1.001:
-            m15_trend = '🟢 BULLISH'
+            trend = '🟢 BULLISH'
         elif second_half < first_half * 0.999:
-            m15_trend = '🔴 BEARISH'
+            trend = '🔴 BEARISH'
         else:
-            m15_trend = '🟡 NEUTRAL'
+            trend = '🟡 NEUTRAL'
     else:
         if close[-1] > ma10:
-            m15_trend = '🟢 BULLISH'
+            trend = '🟢 BULLISH'
         elif close[-1] < ma10:
-            m15_trend = '🔴 BEARISH'
+            trend = '🔴 BEARISH'
         else:
-            m15_trend = '🟡 NEUTRAL'
+            trend = '🟡 NEUTRAL'
 
-    # --- M15 RSI ---
-    m15_rsi = None
+    # --- RSI ---
+    rsi = None
     try:
-        if 'RSI' in df_m15.columns:
-            rsi_val = float(df_m15['RSI'].iloc[-1])
+        if 'RSI' in df.columns:
+            rsi_val = float(df['RSI'].iloc[-1])
             if not np.isnan(rsi_val):
-                m15_rsi = round(rsi_val, 1)
+                rsi = round(rsi_val, 1)
     except Exception:
         pass
-    if m15_rsi is None:
+    if rsi is None:
         try:
             rsi_series = ta.momentum.RSIIndicator(close, window=14).rsi()
-            m15_rsi = round(float(rsi_series[-1]), 1) if not pd.isna(rsi_series[-1]) else None
+            rsi = round(float(rsi_series[-1]), 1) if not pd.isna(rsi_series[-1]) else None
         except Exception:
             pass
 
-    # --- M15 swing points: simple swing detection on last ~40 bars ---
+    # --- Swing points: simple swing detection on last ~40 bars ---
     swing_lookback = min(40, n - 4)
-    m15_swings = {'highs': [], 'lows': []}
+    swings = {'highs': [], 'lows': []}
     for i in range(n - swing_lookback + 2, n - 2):
         lb = 3
         if i < lb or i >= n - lb:
@@ -1709,77 +1751,117 @@ def analyze_m15_entry_timing(df_m15, patterns, points, current_price, atr):
         is_low = all(l <= float(low[i - j]) for j in range(1, lb + 1)) and \
                  all(l <= float(low[i + j]) for j in range(1, lb + 1))
         if is_high:
-            m15_swings['highs'].append(round(h, 2))
+            swings['highs'].append(round(h, 2))
         elif is_low:
-            m15_swings['lows'].append(round(l, 2))
+            swings['lows'].append(round(l, 2))
 
     # Nearest swing high/low relative to current price
     nearest_high = None
     nearest_low = None
-    if m15_swings['highs']:
-        above = [h for h in m15_swings['highs'] if h > current_price]
+    if swings['highs']:
+        above = [h for h in swings['highs'] if h > current_price]
         if above:
             nearest_high = min(above)
         else:
-            nearest_high = max(m15_swings['highs'])  # all below — use highest
-    if m15_swings['lows']:
-        below = [l for l in m15_swings['lows'] if l < current_price]
+            nearest_high = max(swings['highs'])  # all below — use highest
+    if swings['lows']:
+        below = [l for l in swings['lows'] if l < current_price]
         if below:
             nearest_low = max(below)
         else:
-            nearest_low = min(m15_swings['lows'])  # all above — use lowest
+            nearest_low = min(swings['lows'])  # all above — use lowest
 
     # --- Per-pattern entry suggestions ---
     entry_suggestions = []
-    m15_atr = None
+    mini_atr = None
     try:
-        if 'ATR' in df_m15.columns:
-            val = float(df_m15['ATR'].iloc[-1])
+        if 'ATR' in df.columns:
+            val = float(df['ATR'].iloc[-1])
             if not np.isnan(val):
-                m15_atr = val
+                mini_atr = val
     except Exception:
         pass
-    if m15_atr is None:
-        # Estimate M15 ATR as roughly half of M30 ATR
-        m15_atr = atr * 0.7
+    if mini_atr is None:
+        # Estimate mini ATR as a fraction of M30 ATR (M15 ~0.7x, M5 ~0.5x)
+        mini_atr = atr * atr_scale
 
     for p in patterns:
         direction = p.get('direction', 'NEUTRAL')
         ptype = p.get('type', 'Unknown')
 
-        # Tighter entry zone: use M15 ATR for refinement
+        # Tighter entry zone: use mini ATR for refinement
         if 'BULL' in direction.upper() or 'LONG' in direction.upper():
-            # For longs: entry zone near recent M15 low + buffer
-            entry_low = round(current_price - m15_atr * 0.5, 2)
-            entry_high = round(current_price + m15_atr * 0.3, 2)
-            sl = round(current_price - m15_atr * 1.5, 2) if nearest_low is None else round(min(current_price - m15_atr * 1.5, nearest_low - m15_atr * 0.3), 2)
+            # For longs: entry zone near recent low + buffer
+            entry_low = round(current_price - mini_atr * 0.5, 2)
+            entry_high = round(current_price + mini_atr * 0.3, 2)
+            sl = round(current_price - mini_atr * 1.5, 2) if nearest_low is None else round(min(current_price - mini_atr * 1.5, nearest_low - mini_atr * 0.3), 2)
         elif 'BEAR' in direction.upper() or 'SHORT' in direction.upper():
-            entry_low = round(current_price - m15_atr * 0.3, 2)
-            entry_high = round(current_price + m15_atr * 0.5, 2)
-            sl = round(current_price + m15_atr * 1.5, 2) if nearest_high is None else round(max(current_price + m15_atr * 1.5, nearest_high + m15_atr * 0.3), 2)
+            entry_low = round(current_price - mini_atr * 0.3, 2)
+            entry_high = round(current_price + mini_atr * 0.5, 2)
+            sl = round(current_price + mini_atr * 1.5, 2) if nearest_high is None else round(max(current_price + mini_atr * 1.5, nearest_high + mini_atr * 0.3), 2)
         else:
-            entry_low = round(current_price - m15_atr * 0.5, 2)
-            entry_high = round(current_price + m15_atr * 0.5, 2)
-            sl = round(current_price - m15_atr * 1.5, 2)
+            entry_low = round(current_price - mini_atr * 0.5, 2)
+            entry_high = round(current_price + mini_atr * 0.5, 2)
+            sl = round(current_price - mini_atr * 1.5, 2)
 
         entry_suggestions.append({
             'pattern_type': ptype,
             'direction': direction,
-            'm15_entry_zone': f'${entry_low:.0f} – ${entry_high:.0f}',
-            'm15_sl': f'${sl:.0f}',
-            'm15_atr': round(m15_atr, 2),
+            'entry_zone': f'${entry_low:.0f} – ${entry_high:.0f}',
+            'sl': f'${sl:.0f}',
+            'mini_atr': round(mini_atr, 2),
         })
 
     return {
-        'm15_trend': m15_trend,
-        'm15_rsi': m15_rsi,
-        'm15_swings': {
+        'trend': trend,
+        'rsi': rsi,
+        'swings': {
             'nearest_high': nearest_high,
             'nearest_low': nearest_low,
-            'highs': m15_swings['highs'][-5:],
-            'lows': m15_swings['lows'][-5:],
+            'highs': swings['highs'][-5:],
+            'lows': swings['lows'][-5:],
         },
-        'entry_suggestions': entry_suggestions,
+        'suggestions': entry_suggestions,
+    }
+
+
+def analyze_m15_entry_timing(df_m15, patterns, points, current_price, atr):
+    """M15 wrapper — keeps m15_* key shape for existing report/JSON consumers."""
+    core = _analyze_mini_tf(df_m15, patterns, points, current_price, atr, atr_scale=0.7)
+    return {
+        'm15_trend': core['trend'],
+        'm15_rsi': core['rsi'],
+        'm15_swings': core['swings'],
+        'entry_suggestions': [
+            {
+                'pattern_type': s['pattern_type'],
+                'direction': s['direction'],
+                'm15_entry_zone': s['entry_zone'],
+                'm15_sl': s['sl'],
+                'm15_atr': s['mini_atr'],
+            }
+            for s in core['suggestions']
+        ],
+    }
+
+
+def analyze_m5_entry_timing(df_m5, patterns, points, current_price, atr):
+    """M5 wrapper — mirrors M15 keys with m5_* prefix (informational only)."""
+    core = _analyze_mini_tf(df_m5, patterns, points, current_price, atr, atr_scale=0.5)
+    return {
+        'm5_trend': core['trend'],
+        'm5_rsi': core['rsi'],
+        'm5_swings': core['swings'],
+        'entry_suggestions': [
+            {
+                'pattern_type': s['pattern_type'],
+                'direction': s['direction'],
+                'm5_entry_zone': s['entry_zone'],
+                'm5_sl': s['sl'],
+                'm5_atr': s['mini_atr'],
+            }
+            for s in core['suggestions']
+        ],
     }
 
 
@@ -3635,7 +3717,7 @@ def _entry_mode_report_label(mode):
 
 
 def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend=None,
-                    candle_m30=None, candle_day=None, m15_result=None, report_date=None):
+                    candle_m30=None, candle_day=None, m15_result=None, m5_result=None, report_date=None):
     """Generate comprehensive Markdown report."""
     candle_m30 = candle_m30 or []
     candle_day = candle_day or []
@@ -3740,6 +3822,38 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
     else:
         setup_text = "\n⚠️ 無有效交易信號 — 等待形態形成\n"
     
+    # --- M5 quick structure section (informational — never gates pushes) ---
+    m5_text = ""
+    if m5_result and m5_result.get('m5_trend', 'N/A') != 'N/A (數據不足)':
+        m5_rsi_str = f"{m5_result['m5_rsi']:.1f}" if m5_result.get('m5_rsi') is not None else '-'
+        m5_swings = m5_result.get('m5_swings') or {}
+        m5_nh = f"${m5_swings.get('nearest_high'):.0f}" if m5_swings.get('nearest_high') else '-'
+        m5_nl = f"${m5_swings.get('nearest_low'):.0f}" if m5_swings.get('nearest_low') else '-'
+
+        m5_text = f"""
+## 🕒 五-A、M5 快速結構
+
+| 指標 | M5 |
+|------|-----|
+| 短線趨勢 | {m5_result['m5_trend']} |
+| RSI(14) | {m5_rsi_str} |
+| 最近阻力 (swing high) | {m5_nh} |
+| 最近支持 (swing low) | {m5_nl} |
+
+"""
+        m5_suggestions = m5_result.get('entry_suggestions', [])
+        if m5_suggestions:
+            m5_text += "### M5 微調建議\n\n"
+            m5_text += "| 信號 | 方向 | M5 入場區間 | M5 止損 | M5 ATR |\n"
+            m5_text += "|------|------|-------------|---------|--------|\n"
+            for i, sug in enumerate(m5_suggestions, 1):
+                m5_text += f"| Signal {i} ({sug['pattern_type']}) | {sug['direction']} | {sug['m5_entry_zone']} | {sug['m5_sl']} | ${sug['m5_atr']:.2f} |\n"
+            m5_text += "\n> ℹ️ M5 只反映即時微結構 — 極敏感，僅作觸發時機參考，**不影響推送 gate**。\n"
+        else:
+            m5_text += "\n⚠️ 無 M5 微調建議\n"
+    else:
+        m5_text = "\n## 🕒 五-A、M5 快速結構\n\n⚠️ M5 數據不足或不可用 — 無法提供快速結構\n"
+
     # --- M15 entry timing section ---
     m15_text = ""
     if m15_result and m15_result.get('m15_trend', 'N/A') != 'N/A (數據不足)':
@@ -3969,6 +4083,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 🔥 快速連發 | {RAPID_FIRE_WINDOW_MIN}min 內 ≤ {RAPID_FIRE_MAX_TRADES} 筆 (<5min 持倉勝率 26.3%) |
 
 {setup_text}
+{m5_text}
 {m15_text}
 ## 📊 六、關鍵價位
 
@@ -4062,7 +4177,7 @@ def main():
         TRAIL_STOP_ATR = args.trail_stop
     
     # 1. Fetch data
-    df_m30, df_h1, df_m15, df_day = fetch_data()
+    df_m30, df_h1, df_m15, df_m5, df_day = fetch_data()
     
     # 2. Add indicators
     df_m30 = add_indicators(df_m30)
@@ -4070,6 +4185,8 @@ def main():
     df_day = add_indicators(df_day)
     if df_m15 is not None and not df_m15.empty:
         df_m15 = add_indicators(df_m15)
+    if df_m5 is not None and not df_m5.empty:
+        df_m5 = add_indicators(df_m5)
     
     # 3. Find swing points
     points = find_swings_ordered(df_m30['High'].values, df_m30['Low'].values,
@@ -4102,9 +4219,11 @@ def main():
     for cp in all_candle:
         _log(f"   {cp['name']} ({cp['direction']}, {cp['strength']}) @ {cp['price']}")
 
-    # 5c. M15 entry timing analysis
+    # 5c. M15/M5 entry-timing analysis (informational — never feeds push gate)
     m15_result = analyze_m15_entry_timing(df_m15, patterns, points, current, atr)
     _log(f"[*] M15 trend: {m15_result['m15_trend']} | RSI: {m15_result['m15_rsi']} | Suggestions: {len(m15_result['entry_suggestions'])}")
+    m5_result = analyze_m5_entry_timing(df_m5, patterns, points, current, atr)
+    _log(f"[*] M5 trend: {m5_result['m5_trend']} | RSI: {m5_result['m5_rsi']} | Suggestions: {len(m5_result['entry_suggestions'])}")
 
     # 6. Multi-timeframe analysis (Daily + H1)
     daily_trend = analyze_daily_trend(df_day)
@@ -4130,7 +4249,7 @@ def main():
     # 8. Generate report
     report = generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend, h1_trend,
                              candle_m30=candle_m30, candle_day=candle_day,
-                             m15_result=m15_result, report_date=today)
+                             m15_result=m15_result, m5_result=m5_result, report_date=today)
     
     # 9. Save — date is UTC to match generated_at (avoids local-midnight filename drift)
     if args.output:
@@ -4155,6 +4274,9 @@ def main():
             'intraday_source': DATA_SOURCE,
             'daily_source': DAILY_DATA_SOURCE,
             'm15_source': M15_DATA_SOURCE,
+            'm15_analysis': m15_result or None,
+            'm5_source': M5_DATA_SOURCE,
+            'm5_analysis': m5_result or None,
             'spot_futures_basis': SPOT_FUTURES_BASIS,
             'basis_cron_blocked': BASIS_CRON_BLOCKED,
             'basis_note': BASIS_NOTE or None,
