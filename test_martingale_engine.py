@@ -56,8 +56,10 @@ def test_unit():
 
 test_unit()
 
-# ---------- 60日 replay: 用真研究嘅 events ----------
-# 重新產生 S3 events (同研究一樣) — 用 yfinance
+# ---------- 60日 replay (誠實協議) ----------
+# ⚠️ 2026-09-03 review: 原研究協議有 look-ahead bias (entry 用 bar 起點+5m 價,
+# 但信號要 15m bar 收市先確認)。誠實協議: entry = 5m bar labeled t+10m 的 close
+# (= 信號 bar 收市價 t+15m), exit = +10min。此 replay 作為引擎回歸基準。
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -71,35 +73,37 @@ bullish = df15['Close'] > df15['Open']
 s3 = (df15['Close'] > df15['sma10']) & bullish & (df15['Close'] > df15['prev_high3'])
 sig_times = df15.index[s3.fillna(False).values]
 
-# replay: 每個信號 = 一個 cycle (open 用信號 close, close 用 +10min 價)
+# replay: 誠實 entry (bar 收市價), 每注用自己嘅 +10min exit 平倉
+# (引擎 live 行為: 10min hold < 15m bar 間隔, 無重疊 — 所以 (entry_i, exit_i) 一一配對)
 os.remove(pt.MARTINGALE_PATH)
 st = pt.load_martingale_state()
-last_sig_time = None
+pending_exit = None
 for t in sig_times:
-    try:
-        entry = float(df5.loc[t, 'Close'])
-    except Exception:
+    pos = df5.index.get_indexer([t], method='nearest')[0]
+    e_idx = pos + 2          # close of 5m bar labeled t+10m = price AT t+15m = bar close
+    x_idx = e_idx + 2        # +10 min
+    if x_idx >= len(df5):
         continue
-    idx = df5.index.get_indexer([t], method='nearest')[0]
-    if idx + 2 >= len(df5):
-        continue
-    exit_px = float(df5.iloc[idx + 2]['Close'])
-    if st["open"] is not None:
-        # 先 close (用 exit 價)
+    entry = float(df5['Close'].iloc[e_idx])
+    own_exit = float(df5['Close'].iloc[x_idx])
+    if pending_exit is not None and st["open"] is not None:
+        # 先用上一注自己嘅 exit 價平倉 (無信號 tick)
         st["open"]["open_time"] = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+        pt.save_martingale_state(st)
+        st = pt.run_martingale_cycle(fresh_data(False, None, None, pending_exit))
+    # 開今注
     pt.save_martingale_state(st)
-    st = pt.run_martingale_cycle(fresh_data(True, str(t), entry, exit_px))
-    # 再立即開下一次 (重設 open_time 用人工時間)
+    st = pt.run_martingale_cycle(fresh_data(True, str(t), entry, entry))
+    pending_exit = own_exit
 
-# 確保最後冇 open 遺留 (用最後價 close)
-if st["open"]:
+# 確保最後冇 open 遺留 (用佢自己嘅 exit)
+if st["open"] and pending_exit is not None:
     st["open"]["open_time"] = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
     pt.save_martingale_state(st)
-    last = float(df5['Close'].iloc[-1])
-    st = pt.run_martingale_cycle(fresh_data(True, "final", last, last))
+    st = pt.run_martingale_cycle(fresh_data(False, None, None, pending_exit))
 
-print(f"\n=== 60日 replay 結果 ===")
+print(f"\n=== 60日 replay (誠實協議) 結果 ===")
 print(f"trades: {st['n_wins']+st['n_losses']} | 勝率: {st['n_wins']/(st['n_wins']+st['n_losses']):.1%}")
 print(f"equity: ${st['equity_usd']:+,.2f} | maxDD: ${-st['max_drawdown_usd']:.2f} | 最長連蝕: {st['longest_loss_streak']}")
 print(f"level 分佈: {[sum(1 for tr in st['trades'] if tr['level']==k) for k in range(3)]}")
-print("(研究對照: 3級 → +$3,631 / maxDD $21 / 最長連蝕 3 — 會略有差異因為 close 價同 lot 計算基準)")
+print("(誠實協議基準: 勝率 ~47% ≈ baseline, 無歷史 edge — 呢個 replay 驗證引擎正確性, 唔係策略 edge)")

@@ -506,11 +506,14 @@ def save_log(log):
 
 # ═══════════════════════════════════════════════════════════
 # Rebound-confirmation Martingale paper sim (2026-09-03)
-# S3 signal (15m: bullish bar + close>SMA10 + close>prev-3-bar high)
-# → 10-min snapshot win rate 85.6% (60d PAXG study, baseline 48.9%).
-# Martingale 3 levels 0.01→0.04, level up only after consecutive loss,
-# reset to 0.01 after a win. Independent state file — never touches the
-# main paper_trade_log. Informational only: no push gate impact.
+# S3 signal (15m: bullish bar + close>SMA10 + close>prev-3-bar high).
+# ⚠️ Historical study had look-ahead bias (entry before signal confirm);
+# honest protocol: ~47% win rate ≈ baseline — NO historical edge.
+# This sim collects LIVE honest data (analyzes after bar close, enters at
+# then-current price) to verify the strategy for real. 3 levels 0.01→0.04,
+# level up only after consecutive loss, reset to 0.01 after a win.
+# Independent state file — never touches the main paper_trade_log.
+# Informational only: no push gate impact.
 # ═══════════════════════════════════════════════════════════
 MARTINGALE_PATH = os.path.expanduser("~/.hermes/reports/paper_martingale.json")
 MART_LOT0 = 0.01

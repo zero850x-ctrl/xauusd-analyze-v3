@@ -1871,10 +1871,12 @@ def analyze_m5_entry_timing(df_m5, patterns, points, current_price, atr):
 
 def detect_rebound_signal(df_m15):
     """
-    S3 反彈確認信號 (2026-09-03 研究, 60日 PAXG 實測):
-    15m bar: 陽燭 + close > SMA10 + close > 前3bar最高 → 之後 10 分鐘 snapshot
-    勝率 85.6% (baseline 48.9%)。配合 3 級馬丁 (0.01→0.04) 使用。
-    純資訊 + paper_trade 模擬驗證 — 唔影響 cron_push_eligible。
+    S3 反彈確認信號 (2026-09-03):
+    15m bar: 陽燭 + close > SMA10 + close > 前3bar最高 → 之後 10 分鐘 snapshot。
+    ⚠️ 歷史回測協議曾現 look-ahead bias (entry 早於信號確認) — 修正後勝率
+    ~47% ≈ baseline ~50%, 即歷史上無 edge。真實勝率由 live paper sim
+    (paper_martingale.json) 收集驗證。配合 3 級馬丁 (0.01→0.04) 模擬。
+    純資訊 + paper_trade 模擬 — 唔影響 cron_push_eligible。
     """
     if df_m15 is None or df_m15.empty or len(df_m15) < 20:
         return {'signal': False, 'reason': 'M15 數據不足', 'bar_time': None, 'entry': None}
@@ -3903,8 +3905,9 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | SMA10 (M15) | ${rebound['sma10']} |
 | 前3bar高 | ${rebound['prev_high3']} |
 
-> 💡 2026-09-03 研究 (60日實測): 此信號後 10 分鐘 snapshot 勝率 85.6% (baseline 48.9%)。
-> 配合 3 級馬丁 0.01→0.04 使用 (連續蝕先加注、贏還原)。**paper_trade 模擬驗證中 — 唔影響推送 gate。**
+> ⚠️ 歷史回測曾現 look-ahead bias（entry 早於信號確認）— 修正後勝率 ~47% ≈ baseline，
+> 歷史上無 edge。呢個信號而家處於 **live paper sim 驗證階段**（paper_martingale.json
+> 收集真實勝率，幾星期後覆核）。配合 3 級馬丁 0.01→0.04 模擬。**唔影響推送 gate。**
 """
     else:
         rebound_text = "\n## 🎯 五-C、反彈確認 (S3 馬丁前置信號)\n\n⏳ 未確認 — 等陽燭 + 站上 SMA10 + 突破前 3 bar 高\n"
@@ -4343,7 +4346,7 @@ def main():
                 'entry': rebound['entry'],
                 'sma10': rebound['sma10'],
                 'prev_high3': rebound['prev_high3'],
-                'note': 'S3 反彈確認 + 3級馬丁 (0.01→0.04) — 2026-09-03 研究 85.6% 10min勝率',
+                'note': 'S3 反彈確認 + 3級馬丁 (0.01→0.04) — live paper sim 驗證中（歷史 backtest 有 look-ahead bias，修正後勝率 ~47% ≈ baseline，無歷史 edge）',
             },
             'spot_futures_basis': SPOT_FUTURES_BASIS,
             'basis_cron_blocked': BASIS_CRON_BLOCKED,
