@@ -3,6 +3,12 @@
 
 Regression: Double Bottom @ $4417.57 emitted while price = $4485.70 (6.4 ATR away)
 → stale limit order pushed as HIGH QUALITY SIGNAL.
+
+⚠️ 語義警示 (GLM review 3c9c171): 呢個 cap 量嘅係「entry level 離現價」，
+同 _emit_pattern_setups L3586-3591 breakout gate 嘅「trigger level ±2 ATR」
+語義唔同 (量 entry vs 量 trigger/neckline)。Double Bottom 嘅 bottom 可以遠
+而 neckline 近 (V 型反轉) — 嗰陣 boundary 被 cap 拒、breakout 照出 (entry =
+現價，唔 stale，合理)。統一兩者之前先諗清楚，唔好照抄 2.5 去 breakout。
 """
 import importlib.util, sys, types
 spec = importlib.util.spec_from_file_location("analyze_v3", "/tmp/xauusd-analyze-v3/analyze_v3.py")
