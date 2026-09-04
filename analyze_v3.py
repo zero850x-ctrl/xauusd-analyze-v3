@@ -3277,6 +3277,16 @@ def _make_setup(side, pattern, daily_trend, h1_trend, tp3_trail, *,
     return rec
 
 
+def _boundary_max_distance(atr):
+    """Max distance (in ATR) between current price and a boundary limit entry.
+
+    2026-09-04 fix: 之前冇距離上限 — Double Bottom 喺低位形成後價格升走,
+    setup 永遠指返舊 bottom ($4418 vs 現價 $4485, 偏離 6.4 ATR) 照 emit +
+    push。限價單射程外嘅 boundary = stale, 唔 actionable。
+    """
+    return atr * 2.5
+
+
 def _emit_boundary(side, pattern, current_price, atr, daily_trend, h1_trend,
                    tp3_trail, add_vol, aligned):
     """Limit entry at pattern boundary. None if not fillable / risk too wide."""
@@ -3287,6 +3297,11 @@ def _emit_boundary(side, pattern, current_price, atr, daily_trend, h1_trend,
     if order == 'SELL' and not (bd_entry > current_price):
         return None
     if order == 'BUY' and not (bd_entry < current_price):
+        return None
+    # 2026-09-04: distance cap — boundary 太遠 = stale, 唔 emit
+    max_dist = _boundary_max_distance(atr)
+    dist = (bd_entry - current_price) if order == 'SELL' else (current_price - bd_entry)
+    if dist > max_dist:
         return None
     bd_stop = _boundary_entry_sl(pattern, order, atr, current_price)
     bd_risk = (bd_stop - bd_entry) if order == 'SELL' else (bd_entry - bd_stop)
