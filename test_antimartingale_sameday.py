@@ -60,7 +60,7 @@ log = {"history": [
 ok, reason = pt.discipline_check(log, "BUY", 0.02, 4400, 4486, 15)
 cases.append(("2 連敗 vol 0.02 → 放行 (唔觸發)", ok, True))
 
-# Case 6: discipline_check — 3 連敗 (同日) + vol 0.02 → 觸發 block
+# Case 6: discipline_check — 3 連敗 (同日) + vol 0.02 → 放行 (2026-09-04 門檻改 5)
 log = {"history": [
     mk_win("2026-09-01", 0.5),
     mk_loss("2026-09-03", -0.3),
@@ -68,7 +68,7 @@ log = {"history": [
     mk_loss("2026-09-03", -1.0),
 ]}
 ok, reason = pt.discipline_check(log, "BUY", 0.02, 4400, 4486, 15)
-cases.append(("3 連敗 vol 0.02 → block", ok, False))
+cases.append(("3 連敗 vol 0.02 → 放行 (門檻 5)", ok, True))
 
 # Case 7: discipline_check — 3 連敗但 vol 0.01 → 照入 (細注唔鎖)
 log = {"history": [
@@ -79,6 +79,46 @@ log = {"history": [
 ]}
 ok, reason = pt.discipline_check(log, "BUY", 0.01, 4400, 4486, 15)
 cases.append(("3 連敗 vol 0.01 → 照入 (細注唔鎖)", ok, True))
+
+# Case 8: 4 連敗 (同日) + vol 0.02 → 放行 (放寬至 5)
+log = {"history": [
+    mk_win("2026-09-01", 0.5),
+    mk_loss("2026-09-03", -0.3),
+    mk_loss("2026-09-03", -0.5),
+    mk_loss("2026-09-03", -0.7),
+    mk_loss("2026-09-03", -1.0),
+]}
+ok, reason = pt.discipline_check(log, "BUY", 0.02, 4400, 4486, 15)
+cases.append(("4 連敗 vol 0.02 → 放行 (唔觸發, 上限5)", ok, True))
+
+# Case 9: 5 連敗 (同日) + vol 0.02 → 觸發 block
+log = {"history": [
+    mk_win("2026-09-01", 0.5),
+    mk_loss("2026-09-03", -0.3),
+    mk_loss("2026-09-03", -0.5),
+    mk_loss("2026-09-03", -0.7),
+    mk_loss("2026-09-03", -0.9),
+    mk_loss("2026-09-03", -1.0),
+]}
+ok, reason = pt.discipline_check(log, "BUY", 0.02, 4400, 4486, 15)
+cases.append(("5 連敗 vol 0.02 → block", ok, False))
+
+# Case 10: 3 concurrent — max 3 同方向 LIVE 時第 4 個 block
+log4 = {"history": [mk_win("2026-09-01", 0.5)]}
+log4["trades"] = [
+    {"status": "LIVE", "direction": "BUY"}, {"status": "LIVE", "direction": "BUY"},
+    {"status": "LIVE", "direction": "BUY"},
+]
+ok, reason = pt.discipline_check(log4, "BUY", 0.01, 4400, 4486, 15)
+cases.append(("3 同方向 LIVE → 第 4 個 block (max 3)", ok, False))
+
+# Case 11: 2 concurrent — 2 個同方向 LIVE 時第 3 個照開
+log4b = {"history": [mk_win("2026-09-01", 0.5)]}
+log4b["trades"] = [
+    {"status": "LIVE", "direction": "BUY"}, {"status": "LIVE", "direction": "BUY"},
+]
+ok, reason = pt.discipline_check(log4b, "BUY", 0.01, 4400, 4486, 15)
+cases.append(("2 同方向 LIVE → 第 3 個照開 (max 3)", ok, True))
 
 allpass = True
 for name, got, want in cases:

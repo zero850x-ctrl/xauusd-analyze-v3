@@ -5,9 +5,9 @@ Logs paper trades and checks outcomes against historical M30 data.
 
 Discipline Guards (updated 2026-08-22, based on 138-trade combined sample):
   - cron_push_eligible gate: only seed eligible setups (includes SL+TP mandatory)
-  - Anti-martingale: block volume > 0.01 after 3+ same-day consecutive losses
+  - Anti-martingale: block volume > 0.01 after 5+ same-day consecutive losses
   - Anti-stacking: opposite-direction LIVE always blocked; same-direction
-    allowed up to SAME_DIR_MAX_CONCURRENT (2). Gate lives in discipline_check.
+    allowed up to SAME_DIR_MAX_CONCURRENT (3). Gate lives in discipline_check.
   - SL floor: reject SL < 0.8×ATR (too tight = noise stop-out)
   - GC=F fallback closes: traded-range + series-basis check (fail if last
     bar vs spot > $40); UNVERIFIED stays LIVE and is excluded from R
@@ -61,14 +61,14 @@ MIN_HOLDING_BARS = 3          # 3 × M30 = 15 min minimum hold
 COOLDOWN_MINUTES = 15         # No new trade within 15 min of last close (enforced)
 MAX_BARS_HELD = 100           # Timeout exit, aligned with backtest.py (≈2 days M30)
 ANTI_MARTINGALE = True         # Block volume increase after consecutive losses
-ANTI_MART_LOSS_LIMIT = 3       # 3+ same-day consecutive losses trigger (2026-09-03: 2→3 放寬)
+ANTI_MART_LOSS_LIMIT = 5       # 5+ same-day consecutive losses trigger (2026-09-04: 3→5 放寬)
 SL_MIN_ATR_MULT = 0.8          # SL must be >= 0.8 × ATR (2026-08-22: 0.5→0.8, fewer noise stop-outs)
 GC_F_BASIS_FAIL_USD = 40.0     # GC=F last close vs spot; >$40 = rollover, fail closed
 MAX_DAILY_LOSS_R = 3           # Stop trading after -3R daily drawdown
 ANTI_STACKING = True           # Enable stacking / overlap guards
 ANTI_STACKING_OPPOSITE_ONLY = False  # False: also cap same-direction concurrency
-# Same-direction stacking allowed up to 2 concurrent; opposite always blocked.
-SAME_DIR_MAX_CONCURRENT = 2
+# Same-direction stacking allowed up to 3 concurrent; opposite always blocked.
+SAME_DIR_MAX_CONCURRENT = 3
 DANGER_HOURS = {7, 18}         # 07/18 broker hard-block (138-sample)
 DIR_BIAS_LIMIT = 3             # Warn when 3+ consecutive trades same direction
 
