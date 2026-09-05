@@ -356,6 +356,11 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
     trail_stop = None
     r_tp1 = r_tp2 = 0.0
     bars_held = 0
+    # 2026-09-01 momentum-hold exit (mentor 129-trade): after TP1, remaining
+    # 2/3 rides a trailing stop instead of fixed TP2, and the effective stop
+    # moves to breakeven so a late reversal can never turn the trade into a
+    # full loss. Set MOMENTUM_HOLD_EXIT=0 to restore fixed-TP2 behaviour.
+    momentum_hold = os.environ.get("MOMENTUM_HOLD_EXIT", "1") == "1"
     traded_max_high = None
     traded_min_low = None
 
@@ -428,8 +433,15 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
             tp1_hit = True
             fill = tp1 + SLIPPAGE_TICKS if is_sell else tp1 - SLIPPAGE_TICKS
             r_tp1 = ((entry - fill) / risk if is_sell else (fill - entry) / risk) / 3.0
+            # Momentum-hold: arm breakeven stop for the tail right after TP1;
+            # the later trail block may tighten it further as profit grows.
+            if momentum_hold and not trail_active:
+                trail_active = True
+                trail_stop = entry
 
-        if not tp2_hit and tp2 > 0 and not stop_in and ((is_sell and low <= tp2) or (not is_sell and high >= tp2)):
+        # Momentum-hold: fixed TP2 retired once TP1 arms the BE/trail tail;
+        # the tail exits via trail (or timeout) so winners can run.
+        if not tp2_hit and not (momentum_hold and tp1_hit) and tp2 > 0 and not stop_in and ((is_sell and low <= tp2) or (not is_sell and high >= tp2)):
             tp2_hit = True
             fill = tp2 + SLIPPAGE_TICKS if is_sell else tp2 - SLIPPAGE_TICKS
             r_tp2 = ((entry - fill) / risk if is_sell else (fill - entry) / risk) / 3.0
@@ -457,7 +469,11 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
         # look-ahead bias (using bar close to set a stop that triggers
         # within the same bar).
         profit = (entry - close_px) if is_sell else (close_px - entry)
-        if tp2_hit or profit >= 2.0 * atr:
+        # Momentum-hold: once the BE tail is armed (TP1 hit), the 1.5-ATR
+        # trail updates from the next bar without waiting for the legacy
+        # 2-ATR profit threshold or a TP2 hit (TP2 no longer fires).
+        if (tp2_hit or profit >= 2.0 * atr
+                or (momentum_hold and tp1_hit)):
             if is_sell:
                 new_trail = close_px + 1.5 * atr
                 if trail_stop is None or new_trail < trail_stop:
