@@ -2215,6 +2215,10 @@ def cron_push_eligible(setup):
     # Danger hour block (07:00/18:00 — 138-sample); advisory hours allowed through
     if setup.get('time_quality') == 'danger':
         return False
+    # Post-spike chase gate (2026-09-04, mentor 9/1-9/4): 急跌/急升後短窗口
+    # 內追同一方向 = V 型反彈陷阱 (9/4 追沽 6 筆全滅 −$2,200+)
+    if setup.get('post_spike_blocked'):
+        return False
     # Must have TP targets — no naked entries
     tp1_str = str(setup.get('tp1', ''))
     if not tp1_str or tp1_str == '0' or '$0' in tp1_str:
@@ -2281,8 +2285,36 @@ def _setup_seedable(setup, current_price=None):
     return False
 
 
+def _post_spike_state(closes, atr):
+    """Post-sharp-move mean-reversion window (see SPIKE_* constants).
+
+    2026-09-04 (mentor 9/1-9/4, 132 trades): 9/4 金價急插 4470→4375 後 2 小時
+    內追沽 6 筆全滅 (−$2,200+)。急跌/急升後短窗口內追同一方向 = V 型反彈
+    陷阱。本函數檢查「最近 SPIKE_WINDOW_BARS 條已收市 M30 bar」嘅累計變動
+    (close-to-close, 唔含 forming bar), > SPIKE_ATR_MULT×ATR 即返回 spike
+    方向。setup 方向同 spike 方向一致 → post_spike_blocked=True (唔推送)。
+
+    closes: M30 close 序列 (numpy array 或 list, 最後一個可能係 forming bar)
+    atr:    M30 ATR 值 (float)
+    """
+    if closes is None or atr is None or atr <= 0:
+        return None
+    closes = [float(c) for c in closes if c is not None]
+    need = SPIKE_WINDOW_BARS + 2  # 4 收市 bar + last(forming) + 前 1 參考
+    if len(closes) < need:
+        return None
+    # closes[-1] = forming bar (未收市, tvDatafeed 最後一行), closes[-2] = 最後已收市
+    ref = closes[-2]
+    base = closes[-2 - SPIKE_WINDOW_BARS]
+    move = ref - base
+    if abs(move) <= SPIKE_ATR_MULT * atr:
+        return None
+    return {"direction": "down" if move < 0 else "up", "move": round(move, 2)}
+
+
 def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
-                          time_quality_override=None, points=None, atr=None):
+                          time_quality_override=None, points=None, atr=None,
+                          closes=None):
     """Attach counter-trend severity, recommended volume, time quality, and cron gate.
 
     time_quality_override: when set (e.g. walk-forward backtest), use this level
@@ -2298,6 +2330,7 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
         tq_level != 'danger'
         and broker_hour in SESSION_BONUS_HOURS
     )
+    spike = _post_spike_state(closes, atr) if closes is not None else None
     for s in setups:
         side = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
         is_sell = side == 'BEARISH'
@@ -2347,6 +2380,21 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
             else:
                 s['zone_touches'] = 0
                 s['zone_label'] = ''
+
+        # 2026-09-04 post-spike chase gate: 急跌/急升後短窗口內追同一方向 →
+        # 唔推送 (V 型反彈陷阱, mentor 9/1-9/4: 9/4 追沽 6 筆全滅 −$2,200+)
+        if spike is not None:
+            same_dir = (spike['direction'] == 'down' and is_sell) or \
+                       (spike['direction'] == 'up' and not is_sell)
+            s['post_spike_blocked'] = bool(same_dir)
+            s['post_spike_note'] = (
+                f"⚠️ 最近 {SPIKE_WINDOW_BARS} bar 急{'跌' if spike['direction']=='down' else '升'} "
+                f"{abs(spike['move']):.0f} 點 — 追沽風險窗口內, 唔推送"
+                if same_dir else ""
+            )
+        else:
+            s['post_spike_blocked'] = False
+            s['post_spike_note'] = ""
 
         if s.get('entry_price') is None:
             ep = _parse_entry_price_from_setup(s, current_price)
@@ -2564,6 +2612,17 @@ def _counter_trend_note(side, daily_trend, h1_trend, prefix=''):
 
 # Broker timezone offset from UTC (hours). Override via BROKER_UTC_OFFSET_HOURS env.
 BROKER_UTC_OFFSET_HOURS = int(os.environ.get('BROKER_UTC_OFFSET_HOURS', '-3'))
+
+# 2026-09-04 post-spike chase gate (mentor 9/1-9/4, 132 trades):
+#   - 9/4: 金價 13:00-13:37 急插 4470→4375 (≈9.5 ATR) 後 2 小時內追沽 6 筆全滅
+#     (−$2,200+), 全部被 V 型反彈夾爆 (13:32 SELL@4395→−$365, 13:37→−$461,
+#     14:18→−$236, 14:24→−$466 ...)
+#   - 9/1 崩盤日嘅贏家 sell 全部係 spike 前入 (07:47 SELL@4429 +$869), 唔係
+#     spike 後追 — 所以 block 追 direction 唔會誤殺 trend-follow 入場
+#   - Gate 只 block「追 spike 方向」嘅 setup 推送; 反方向 (搏反彈) 唔 block,
+#     因為 counter-trend severity gate 已處理佢
+SPIKE_WINDOW_BARS = 4          # 最近 4 條已收市 M30 bar 嘅累計變動窗口
+SPIKE_ATR_MULT = 2.0           # 窗口內變動 > 2×ATR 先算 spike
 MAX_PATTERNS_PER_DIRECTION = 2  # top-N patterns per side before setup generation
 
 # Broker-local hours below (UTC + offset).
@@ -4447,7 +4506,7 @@ def main():
     # 7b. Inject K-line confirmation scores into setups (used by paper_trade + cron filtering)
     _inject_kline_scores(setups, candle_m30, candle_day, len(df_m30) - 1, len(df_day) - 1)
     _inject_push_metadata(setups, daily_trend, h1_trend, current_price=current,
-                               points=points, atr=atr)
+                               points=points, atr=atr, closes=df_m30['Close'].values)
     
     utc_now = datetime.now(timezone.utc)
     today = utc_now.strftime('%Y-%m-%d')

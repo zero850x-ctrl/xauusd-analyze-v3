@@ -30,23 +30,23 @@ TREND_BEAR = {"trend": "BEARISH", "strength": 2, "close": 4480.0, "ma20": 4500.0
 cases = []
 # Case 1 (regression): 今日真案 — bottom 4417.57, price 4485.70 → 6.48 ATR → 應拒
 p = pattern_db(4417.57, 4510.93)
-got = av._emit_boundary("BULLISH", p, 4485.70, atr, TREND_B, TREND_B, None, None, True)
+got = av._emit_boundary("BULLISH", p, 4485.70, atr, TREND_B, TREND_B, None, 0.02, True)
 cases.append(("今日 stale Double Bottom (6.5 ATR) → 唔 emit", got, None))
 
 # Case 2: boundary 近 (< 2.5 ATR) → emit
 p2 = pattern_db(4470.0, 4510.0)
-got2 = av._emit_boundary("BULLISH", p2, 4485.70, atr, TREND_B, TREND_B, None, None, True)
+got2 = av._emit_boundary("BULLISH", p2, 4485.70, atr, TREND_B, TREND_B, None, 0.02, True)
 cases.append(("近 boundary (1.5 ATR) → emit", got2, "dict"))
 
 # Case 3: 邊界差少少喺射程邊 (~2.5 ATR) → emit
 p3 = pattern_db(4459.0, 4510.0)   # 4485.70-4459 = 26.7 ≈ 2.54 ATR — 啱啱過 → 拒
-got3 = av._emit_boundary("BULLISH", p3, 4485.70, atr, TREND_B, TREND_B, None, None, True)
+got3 = av._emit_boundary("BULLISH", p3, 4485.70, atr, TREND_B, TREND_B, None, 0.02, True)
 cases.append(("2.54 ATR 邊界 → 唔 emit (cap 邊緣)", got3, None))
 
 # Case 4: SELL boundary 太遠 (top 遠高過現價) → 拒
 p4 = {"type": "🔻 Double Top (雙頂)", "direction": "BEARISH", "top_price": 4550.0,
       "neckline": 4480.0, "depth": 70, "target": 4410.0, "broken": False, "confidence": "HIGH"}
-got4 = av._emit_boundary("BEARISH", p4, 4485.70, atr, TREND_BEAR, TREND_BEAR, None, None, True)
+got4 = av._emit_boundary("BEARISH", p4, 4485.70, atr, TREND_BEAR, TREND_BEAR, None, 0.02, True)
 cases.append(("SELL top 遠 (6.1 ATR) → 唔 emit", got4, None))
 
 ok = True
