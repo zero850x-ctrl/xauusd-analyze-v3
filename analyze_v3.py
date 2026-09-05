@@ -2389,7 +2389,7 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
             s['post_spike_blocked'] = bool(same_dir)
             s['post_spike_note'] = (
                 f"⚠️ 最近 {SPIKE_WINDOW_BARS} bar 急{'跌' if spike['direction']=='down' else '升'} "
-                f"{abs(spike['move']):.0f} 點 — 追沽風險窗口內, 唔推送"
+                f"{abs(spike['move']):.0f} 點 — 追{'沽' if is_sell else '買'}風險窗口內, 唔推送"
                 if same_dir else ""
             )
         else:
