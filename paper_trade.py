@@ -5,9 +5,9 @@ Logs paper trades and checks outcomes against historical M30 data.
 
 Discipline Guards (updated 2026-08-22, based on 138-trade combined sample):
   - cron_push_eligible gate: only seed eligible setups (includes SL+TP mandatory)
-  - Anti-martingale: block volume > 0.01 after 2+ consecutive losses
+  - Anti-martingale: block volume > 0.01 after 5+ same-day consecutive losses
   - Anti-stacking: opposite-direction LIVE always blocked; same-direction
-    allowed up to SAME_DIR_MAX_CONCURRENT (2). Gate lives in discipline_check.
+    allowed up to SAME_DIR_MAX_CONCURRENT (3). Gate lives in discipline_check.
   - SL floor: reject SL < 0.8×ATR (too tight = noise stop-out)
   - GC=F fallback closes: traded-range + series-basis check (fail if last
     bar vs spot > $40); UNVERIFIED stays LIVE and is excluded from R
@@ -61,13 +61,14 @@ MIN_HOLDING_BARS = 3          # 3 × M30 = 15 min minimum hold
 COOLDOWN_MINUTES = 15         # No new trade within 15 min of last close (enforced)
 MAX_BARS_HELD = 100           # Timeout exit, aligned with backtest.py (≈2 days M30)
 ANTI_MARTINGALE = True         # Block volume increase after consecutive losses
+ANTI_MART_LOSS_LIMIT = 5       # 5+ same-day consecutive losses trigger (2026-09-04: 3→5 放寬)
 SL_MIN_ATR_MULT = 0.8          # SL must be >= 0.8 × ATR (2026-08-22: 0.5→0.8, fewer noise stop-outs)
 GC_F_BASIS_FAIL_USD = 40.0     # GC=F last close vs spot; >$40 = rollover, fail closed
 MAX_DAILY_LOSS_R = 3           # Stop trading after -3R daily drawdown
 ANTI_STACKING = True           # Enable stacking / overlap guards
 ANTI_STACKING_OPPOSITE_ONLY = False  # False: also cap same-direction concurrency
-# Same-direction stacking allowed up to 2 concurrent; opposite always blocked.
-SAME_DIR_MAX_CONCURRENT = 2
+# Same-direction stacking allowed up to 3 concurrent; opposite always blocked.
+SAME_DIR_MAX_CONCURRENT = 3
 DANGER_HOURS = {7, 18}         # 07/18 broker hard-block (138-sample)
 DIR_BIAS_LIMIT = 3             # Warn when 3+ consecutive trades same direction
 
@@ -355,6 +356,11 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
     trail_stop = None
     r_tp1 = r_tp2 = 0.0
     bars_held = 0
+    # 2026-09-01 momentum-hold exit (mentor 129-trade): after TP1, remaining
+    # 2/3 rides a trailing stop instead of fixed TP2, and the effective stop
+    # moves to breakeven so a late reversal can never turn the trade into a
+    # full loss. Set MOMENTUM_HOLD_EXIT=0 to restore fixed-TP2 behaviour.
+    momentum_hold = os.environ.get("MOMENTUM_HOLD_EXIT", "1") == "1"
     traded_max_high = None
     traded_min_low = None
 
@@ -427,8 +433,15 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
             tp1_hit = True
             fill = tp1 + SLIPPAGE_TICKS if is_sell else tp1 - SLIPPAGE_TICKS
             r_tp1 = ((entry - fill) / risk if is_sell else (fill - entry) / risk) / 3.0
+            # Momentum-hold: arm breakeven stop for the tail right after TP1;
+            # the later trail block may tighten it further as profit grows.
+            if momentum_hold and not trail_active:
+                trail_active = True
+                trail_stop = entry
 
-        if not tp2_hit and tp2 > 0 and not stop_in and ((is_sell and low <= tp2) or (not is_sell and high >= tp2)):
+        # Momentum-hold: fixed TP2 retired once TP1 arms the BE/trail tail;
+        # the tail exits via trail (or timeout) so winners can run.
+        if not tp2_hit and not (momentum_hold and tp1_hit) and tp2 > 0 and not stop_in and ((is_sell and low <= tp2) or (not is_sell and high >= tp2)):
             tp2_hit = True
             fill = tp2 + SLIPPAGE_TICKS if is_sell else tp2 - SLIPPAGE_TICKS
             r_tp2 = ((entry - fill) / risk if is_sell else (fill - entry) / risk) / 3.0
@@ -456,7 +469,11 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
         # look-ahead bias (using bar close to set a stop that triggers
         # within the same bar).
         profit = (entry - close_px) if is_sell else (close_px - entry)
-        if tp2_hit or profit >= 2.0 * atr:
+        # Momentum-hold: once the BE tail is armed (TP1 hit), the 1.5-ATR
+        # trail updates from the next bar without waiting for the legacy
+        # 2-ATR profit threshold or a TP2 hit (TP2 no longer fires).
+        if (tp2_hit or profit >= 2.0 * atr
+                or (momentum_hold and tp1_hit)):
             if is_sell:
                 new_trail = close_px + 1.5 * atr
                 if trail_stop is None or new_trail < trail_stop:
@@ -502,6 +519,173 @@ def save_log(log):
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+# ═══════════════════════════════════════════════════════════
+# Rebound-confirmation Martingale paper sim (2026-09-03)
+# S3 signal (15m: bullish bar + close>SMA10 + close>prev-3-bar high).
+# ⚠️ Historical study had look-ahead bias (entry before signal confirm);
+# honest protocol: ~47% win rate ≈ baseline — NO historical edge.
+# This sim collects LIVE honest data (analyzes after bar close, enters at
+# then-current price) to verify the strategy for real. 3 levels 0.01→0.04,
+# level up only after consecutive loss, reset to 0.01 after a win.
+# Independent state file — never touches the main paper_trade_log.
+# Informational only: no push gate impact.
+# ═══════════════════════════════════════════════════════════
+MARTINGALE_PATH = os.path.expanduser("~/.hermes/reports/paper_martingale.json")
+MART_LOT0 = 0.01
+MART_MAX_LEVEL = 3            # 0.01 → 0.02 → 0.04 (study: 3 levels capture all gains)
+MART_HOLD_MINUTES = 10        # snapshot close at ~10 min hold
+
+
+def _martingale_fresh_state():
+    return {
+        "max_level": MART_MAX_LEVEL,
+        "level": 0,
+        "open": None,                 # dict: signal_time, entry, lot, level, open_time
+        "last_signal_time": None,     # dedupe: only NEW signal bars open
+        "trades": [],
+        "equity_usd": 0.0,
+        "peak_equity": 0.0,
+        "max_drawdown_usd": 0.0,
+        "n_wins": 0,
+        "n_losses": 0,
+        "cur_loss_streak": 0,
+        "longest_loss_streak": 0,
+        "created": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def load_martingale_state():
+    if os.path.exists(MARTINGALE_PATH):
+        try:
+            with open(MARTINGALE_PATH) as f:
+                st = json.load(f)
+            st.setdefault("max_level", MART_MAX_LEVEL)
+            st.setdefault("trades", [])
+            for k in ("level", "last_signal_time", "open", "equity_usd", "peak_equity",
+                      "max_drawdown_usd", "n_wins", "n_losses", "cur_loss_streak",
+                      "longest_loss_streak"):
+                st.setdefault(k, _martingale_fresh_state()[k])
+            return st
+        except Exception:
+            pass
+    return _martingale_fresh_state()
+
+
+def save_martingale_state(st):
+    parent = os.path.dirname(MARTINGALE_PATH) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".paper_martingale.", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(st, f, indent=2, ensure_ascii=False, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, MARTINGALE_PATH)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def _mart_now():
+    return datetime.now(timezone.utc)
+
+
+def _mart_elapsed_minutes(open_time_iso, now):
+    try:
+        t = datetime.fromisoformat(str(open_time_iso))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return (now - t).total_seconds() / 60.0
+    except Exception:
+        return MART_HOLD_MINUTES + 1  # unparseable → treat as ripe
+
+
+def run_martingale_cycle(data):
+    """One cycle per cron tick (~10 min). Mirrors the 60-day real-path study:
+       open on new S3 signal; close when hold >= 10 min; loss → next level."""
+    sig = (data or {}).get("rebound_martingale") or {}
+    price = _finite_px((data or {}).get("price"))
+    st = load_martingale_state()
+    now = _mart_now()
+
+    if not sig.get("signal") and st.get("open") is None:
+        # Nothing to do — silent (keeps cron output quiet)
+        return st
+
+    if "rebound_martingale" not in (data or {}):
+        print("⚠️ [馬丁] 報告無 rebound_martingale 欄位 — analyzer 未支援, 跳過")
+        return st
+
+    # ---- 1. Close ripe position ----
+    if st.get("open"):
+        op = st["open"]
+        if price is None:
+            print("⚠️ [馬丁] 有持倉但無現價 — 保持 LIVE")
+            return st
+        if _mart_elapsed_minutes(op.get("open_time"), now) >= MART_HOLD_MINUTES:
+            exit_px = price
+            entry_px = float(op["entry"])
+            lot = float(op["lot"])
+            pnl = (exit_px - entry_px) * (lot / MART_LOT0)  # 0.01 lot = 1 oz
+            win = pnl > 0
+            st["equity_usd"] += pnl
+            st["peak_equity"] = max(st["peak_equity"], st["equity_usd"])
+            st["max_drawdown_usd"] = min(st["max_drawdown_usd"],
+                                         st["equity_usd"] - st["peak_equity"])
+            if win:
+                st["n_wins"] += 1
+                st["cur_loss_streak"] = 0
+                st["level"] = 0
+            else:
+                st["n_losses"] += 1
+                st["cur_loss_streak"] += 1
+                st["longest_loss_streak"] = max(st["longest_loss_streak"],
+                                                st["cur_loss_streak"])
+                st["level"] = min(st["level"] + 1, st["max_level"] - 1)
+            st["trades"].append({
+                "signal_time": op.get("signal_time"),
+                "open_time": op.get("open_time"),
+                "close_time": now.isoformat(),
+                "entry": entry_px,
+                "exit": exit_px,
+                "lot": lot,
+                "level": op.get("level"),
+                "pnl_usd": round(pnl, 2),
+                "win": win,
+            })
+            print(f"[馬丁] 平倉 級{op.get('level')+1} (lot {lot:.2f}): "
+                  f"${entry_px:.1f} → ${exit_px:.1f} = {'✅ +$%.2f' % pnl if win else '❌ -$%.2f' % -pnl}")
+            st["open"] = None
+
+    # ---- 2. Open on new S3 signal ----
+    if st.get("open") is None:
+        s_on = sig.get("signal")
+        s_time = sig.get("bar_time")
+        s_entry = _finite_px(sig.get("entry"))
+        if s_on and s_time and s_entry is not None and s_time != st.get("last_signal_time"):
+            level = st.get("level", 0)
+            lot = MART_LOT0 * 2 ** level
+            st["open"] = {
+                "signal_time": s_time,
+                "open_time": now.isoformat(),
+                "entry": s_entry,
+                "lot": lot,
+                "level": level,
+            }
+            st["last_signal_time"] = s_time
+            print(f"[馬丁] 🎯 S3 反彈確認 @ ${s_entry:.1f} → 開 級{level+1} (lot {lot:.2f})")
+
+    # ---- 3. Status line ----
+    n = st["n_wins"] + st["n_losses"]
+    wr = f"{st['n_wins']/n:.1%}" if n else "-"
+    mr = f"maxDD ${-st['max_drawdown_usd']:.2f}" if st["max_drawdown_usd"] else "maxDD $0"
+    print(f"[馬丁] 狀態: 級{st['level']+1} | equity ${st['equity_usd']:+.2f} | {mr} | "
+          f"勝率 {wr} ({st['n_wins']}/{n}) | 最長連蝕 {st['longest_loss_streak']}")
+
+    save_martingale_state(st)
+    return st
 
 
 def _parse_dt(val):
@@ -558,13 +742,25 @@ def _daily_loss_r(log):
 
 
 def _consecutive_losses(log):
-    """Count consecutive losses from most recent trusted closed trades."""
+    """Count consecutive losses closed on the same UTC day (anti same-day tilt).
+
+    2026-09-03 (方案 C): 只防即日 tilt — 只數「喺同一 UTC 日平倉」嘅連續虧損。
+    跨日唔算（之前嘅 bug：數晒成個 history，隔咗成星期嘅舊虧損會
+    永久鎖死 anti-martingale，連敗永遠斷唔到 → 死鎖）。
+    """
     count = 0
+    last_loss_day = None
     for t in reversed(log.get("history", [])):
         if not _counts_toward_r(t):
             continue
         r = t.get("pnl_r", 0)
         if r < 0:
+            # 呢個係虧損單 — 如果佢同前一個虧損單唔同 UTC 日，就唔算連續
+            closed = t.get("closed_time") or t.get("seeded_time") or ""
+            day = closed[:10] if closed else None
+            if last_loss_day is not None and day != last_loss_day:
+                break
+            last_loss_day = day
             count += 1
         else:
             break
@@ -636,7 +832,7 @@ def discipline_check(log, direction, volume, sl_price, entry_price, atr):
     # ── 4. Anti-martingale ──
     if ANTI_MARTINGALE:
         consec_loss = _consecutive_losses(log)
-        if consec_loss >= 2 and volume > 0.01:
+        if consec_loss >= ANTI_MART_LOSS_LIMIT and volume > 0.01:
             return False, f"🚫 Anti-martingale: {consec_loss} consecutive losses → volume capped at 0.01"
 
     # ── 5. SL floor ──
@@ -1044,7 +1240,7 @@ def report_status(data):
 
     # ── Discipline summary ──
     consec_loss = _consecutive_losses(log)
-    if consec_loss >= 2:
+    if consec_loss >= ANTI_MART_LOSS_LIMIT:
         print(f" ⚠️ {consec_loss} consecutive losses — anti-martingale active (vol capped at 0.01)")
 
     print("=" * 60)
@@ -1083,6 +1279,7 @@ def main():
         eligible = [s for s in data.get("setups", []) if s.get("cron_push_eligible")]
         seed_trades(data, eligible)
         report_status(data)
+        run_martingale_cycle(data)   # 反彈確認馬丁 paper sim (獨立 state, 2026-09-03)
 
 
 def run_backtest(data):
