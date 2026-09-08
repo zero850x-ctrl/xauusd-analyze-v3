@@ -88,17 +88,22 @@ def test_discipline_stacking():
     assert ok, "first same-direction stack should pass"
     no, reason = pt.discipline_check(one, "🔴 SELL", 0.01, 3500.0, 3400.0, atr)
     assert not no and "Opposite" in reason
-    two = {"trades": [
+    # 3rd tranche = pyramiding: needs an existing same-dir LIVE ≥ +1R floating
+    winner = {"status": "LIVE", "direction": "🟢 BUY", "entry": 3400.0,
+              "stop_loss": 3300.0, "floating_pnl": 120.0}
+    two_flat = {"trades": [
         {"status": "LIVE", "direction": "BUY"},
         {"status": "LIVE", "direction": "🟢 BUY"},
     ], "history": []}
-    ok3, _ = pt.discipline_check(two, "BUY", 0.01, sl, entry, atr)
-    assert ok3, "third same-direction stack should pass (max 3)"
-    three = {"trades": [
+    no3, reason3 = pt.discipline_check(two_flat, "BUY", 0.01, sl, entry, atr)
+    assert not no3 and "Pyramiding" in reason3, reason3
+    two_win = {"trades": [
         {"status": "LIVE", "direction": "BUY"},
-        {"status": "LIVE", "direction": "BUY"},
-        {"status": "LIVE", "direction": "🟢 BUY"},
+        dict(winner),
     ], "history": []}
+    ok3, _ = pt.discipline_check(two_win, "BUY", 0.01, sl, entry, atr)
+    assert ok3, "third same-direction stack should pass when one tranche is >= +1R"
+    three = {"trades": [dict(winner), dict(winner), dict(winner)], "history": []}
     no4, reason4 = pt.discipline_check(three, "BUY", 0.01, sl, entry, atr)
     assert not no4 and "same-direction" in reason4
 

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Equivalence test: old M15 analyzer (git main) vs refactored _analyze_mini_tf wrappers."""
+"""Equivalence test: pre-refactor M15 analyzer vs refactored _analyze_mini_tf wrappers.
+
+Baseline is pinned to 150906f (last main before the M5/M15 refactor landed).
+Using origin/main made the test self-referential once the refactor merged.
+"""
 import os
 import sys
 import subprocess
@@ -16,8 +20,9 @@ except Exception:
 import ta
 from analyze_v3 import analyze_m15_entry_timing as new_fn, analyze_m5_entry_timing
 
+BASELINE_REV = "150906f"   # pre-refactor analyze_v3.py
 git_src = subprocess.run(
-    ["git", "-C", _ROOT, "show", "origin/main:analyze_v3.py"],
+    ["git", "-C", _ROOT, "show", f"{BASELINE_REV}:analyze_v3.py"],
     capture_output=True, text=True, check=True, encoding="utf-8", errors="replace",
 ).stdout
 start = git_src.index("def analyze_m15_entry_timing")

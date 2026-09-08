@@ -5,9 +5,10 @@ Logs paper trades and checks outcomes against historical M30 data.
 
 Discipline Guards (updated 2026-08-22, based on 138-trade combined sample):
   - cron_push_eligible gate: only seed eligible setups (includes SL+TP mandatory)
-  - Anti-martingale: block volume > 0.01 after 5+ same-day consecutive losses
+  - Anti-martingale: block volume > 0.01 after 3+ same-day consecutive losses
   - Anti-stacking: opposite-direction LIVE always blocked; same-direction
-    allowed up to SAME_DIR_MAX_CONCURRENT (3). Gate lives in discipline_check.
+    allowed up to SAME_DIR_MAX_CONCURRENT (3); 3rd tranche needs an existing
+    same-dir LIVE ≥ +1R floating (pyramiding). Gate lives in discipline_check.
   - SL floor: reject SL < 0.8×ATR (too tight = noise stop-out)
   - GC=F fallback closes: traded-range + series-basis check (fail if last
     bar vs spot > $40); UNVERIFIED stays LIVE and is excluded from R
@@ -61,7 +62,10 @@ MIN_HOLDING_BARS = 3          # 3 × M30 = 15 min minimum hold
 COOLDOWN_MINUTES = 15         # No new trade within 15 min of last close (enforced)
 MAX_BARS_HELD = 100           # Timeout exit, aligned with backtest.py (≈2 days M30)
 ANTI_MARTINGALE = True         # Block volume increase after consecutive losses
-ANTI_MART_LOSS_LIMIT = 5       # 5+ same-day consecutive losses trigger (2026-09-04: 3→5 放寬)
+# 2026-09-08 review: 5 was dead config — MAX_DAILY_LOSS_R=3 always fires first
+# (5 losses ≥ 3R). 3 same-day consecutive losses is the earliest point at which
+# this guard can still do something the daily-R cap does not.
+ANTI_MART_LOSS_LIMIT = 3       # 3+ same-day consecutive losses → volume capped at 0.01
 SL_MIN_ATR_MULT = 0.8          # SL must be >= 0.8 × ATR (2026-08-22: 0.5→0.8, fewer noise stop-outs)
 GC_F_BASIS_FAIL_USD = 40.0     # GC=F last close vs spot; >$40 = rollover, fail closed
 MAX_DAILY_LOSS_R = 3           # Stop trading after -3R daily drawdown
@@ -69,6 +73,12 @@ ANTI_STACKING = True           # Enable stacking / overlap guards
 ANTI_STACKING_OPPOSITE_ONLY = False  # False: also cap same-direction concurrency
 # Same-direction stacking allowed up to 3 concurrent; opposite always blocked.
 SAME_DIR_MAX_CONCURRENT = 3
+# 2026-09-08 review: pyramiding rule (mentor scaled INTO profit, 0.05→0.2→0.35).
+# The 2nd tranche is free (breakout + pullback of one signal are one position
+# split). From the 3rd tranche on, at least one existing same-direction LIVE
+# trade must show floating profit ≥ PYRAMID_MIN_R × its own risk.
+PYRAMID_FREE_TRANCHES = 2
+PYRAMID_MIN_R = 1.0
 DANGER_HOURS = {7, 18}         # 07/18 broker hard-block (138-sample)
 DIR_BIAS_LIMIT = 3             # Warn when 3+ consecutive trades same direction
 
@@ -336,7 +346,8 @@ def _counts_toward_r(record):
     return record.get("verified") is not False
 
 
-def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=None, data_source="tv"):
+def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=None, data_source="tv",
+                          init_state=None):
     """Bar-by-bar staged exit simulation (shared by check_outcomes and --backtest).
 
     Returns dict with keys: closed, result, pnl_r, bars_held, tp1_hit, tp2_hit,
@@ -345,17 +356,25 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
     [min low, max high] (± slippage). That is a sanity check only — futures
     basis shifts fill and range together, so check_outcomes still requires
     a spot-vs-close verification before trusting the close.
+
+    init_state (2026-09-08 review): resume from a persisted mid-trade state
+    (tp1_hit, tp2_hit, trail_active, trail_stop, r_tp1, r_tp2, bars_held)
+    when the fetched bar window no longer reaches back to seed_dt. Without
+    it a truncated replay forgets TP1/BE and can close a banked winner at -1R.
     """
     is_sell = _norm_dir(direction) == "SELL"
     risk = abs(entry - stop)
     if risk <= 0:
         return {"closed": False, "result": "LIVE", "pnl_r": 0.0, "bars_held": 0}
 
-    tp1_hit = tp2_hit = False
-    trail_active = False
-    trail_stop = None
-    r_tp1 = r_tp2 = 0.0
-    bars_held = 0
+    st = init_state or {}
+    tp1_hit = bool(st.get("tp1_hit", False))
+    tp2_hit = bool(st.get("tp2_hit", False))
+    trail_active = bool(st.get("trail_active", False))
+    trail_stop = _finite_px(st.get("trail_stop"))
+    r_tp1 = float(st.get("r_tp1") or 0.0)
+    r_tp2 = float(st.get("r_tp2") or 0.0)
+    bars_held = int(st.get("bars_held") or 0)
     # 2026-09-01 momentum-hold exit (mentor 129-trade): after TP1, remaining
     # 2/3 rides a trailing stop instead of fixed TP2, and the effective stop
     # moves to breakeven so a late reversal can never turn the trade into a
@@ -363,6 +382,7 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
     momentum_hold = os.environ.get("MOMENTUM_HOLD_EXIT", "1") == "1"
     traded_max_high = None
     traded_min_low = None
+    last_bar_dt = None
 
     def _guard_close(close_px):
         if data_source == "tv":
@@ -396,6 +416,7 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
             continue
 
         bars_held += 1
+        last_bar_dt = bar_dt
         traded_max_high = high if traded_max_high is None else max(traded_max_high, high)
         traded_min_low = low if traded_min_low is None else min(traded_min_low, low)
         eff_stop = _effective_stop(stop, trail_stop, trail_active, is_sell)
@@ -438,9 +459,11 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
             r_tp1 = ((entry - fill) / risk if is_sell else (fill - entry) / risk) / 3.0
             # Momentum-hold: arm breakeven stop for the tail right after TP1;
             # the later trail block may tighten it further as profit grows.
+            # BE is offset by SLIPPAGE_TICKS so the simulated fill lands on
+            # entry exactly (a stop *at* entry fills at entry∓slippage = loss).
             if momentum_hold and not trail_active:
                 trail_active = True
-                trail_stop = entry
+                trail_stop = (entry - SLIPPAGE_TICKS) if is_sell else (entry + SLIPPAGE_TICKS)
 
         # Momentum-hold: fixed TP2 retired once TP1 arms the BE/trail tail;
         # the tail exits via trail (or timeout) so winners can run.
@@ -498,6 +521,9 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
         "tp2_hit": tp2_hit,
         "trail_active": trail_active,
         "trail_stop": round(trail_stop, 2) if trail_stop is not None else None,
+        "r_tp1": round(r_tp1, 4),
+        "r_tp2": round(r_tp2, 4),
+        "last_bar_time": last_bar_dt.strftime('%Y-%m-%dT%H:%M:%SZ') if last_bar_dt is not None else None,
     }
 
 
@@ -539,6 +565,14 @@ MARTINGALE_PATH = os.path.expanduser("~/.hermes/reports/paper_martingale.json")
 MART_LOT0 = 0.01
 MART_MAX_LEVEL = 3            # 0.01 → 0.02 → 0.04 (study: 3 levels capture all gains)
 MART_HOLD_MINUTES = 10        # snapshot close at ~10 min hold
+# 2026-09-08 review: round-trip cost per oz (spread + slippage). XAUUSD retail
+# spread is ~$0.20-0.40; the honest replay showed spread alone flips the 60-day
+# result from +$107 to -$290, so a sim that ignores it cannot validate an edge.
+MART_COST_PER_OZ = float(os.environ.get("MART_COST_PER_OZ", "0.30"))
+# True 3-level martingale: after a loss at the top level, reset to level 0
+# (the streak counter keeps running for stats). Previously the sim stayed at
+# 0.04 indefinitely — a 10-loss streak meant 8 trades at 4× size.
+MART_RESET_AFTER_MAX = True
 
 
 def _martingale_fresh_state():
@@ -631,7 +665,10 @@ def run_martingale_cycle(data):
             exit_px = price
             entry_px = float(op["entry"])
             lot = float(op["lot"])
-            pnl = (exit_px - entry_px) * (lot / MART_LOT0)  # 0.01 lot = 1 oz
+            oz = lot / MART_LOT0                          # 0.01 lot = 1 oz
+            gross = (exit_px - entry_px) * oz
+            cost = MART_COST_PER_OZ * oz
+            pnl = gross - cost
             win = pnl > 0
             st["equity_usd"] += pnl
             st["peak_equity"] = max(st["peak_equity"], st["equity_usd"])
@@ -646,15 +683,21 @@ def run_martingale_cycle(data):
                 st["cur_loss_streak"] += 1
                 st["longest_loss_streak"] = max(st["longest_loss_streak"],
                                                 st["cur_loss_streak"])
-                st["level"] = min(st["level"] + 1, st["max_level"] - 1)
+                if MART_RESET_AFTER_MAX and st["level"] >= st["max_level"] - 1:
+                    st["level"] = 0
+                else:
+                    st["level"] = min(st["level"] + 1, st["max_level"] - 1)
             st["trades"].append({
                 "signal_time": op.get("signal_time"),
                 "open_time": op.get("open_time"),
                 "close_time": now.isoformat(),
                 "entry": entry_px,
+                "signal_close": op.get("signal_close"),
                 "exit": exit_px,
                 "lot": lot,
                 "level": op.get("level"),
+                "gross_usd": round(gross, 2),
+                "cost_usd": round(cost, 2),
                 "pnl_usd": round(pnl, 2),
                 "win": win,
             })
@@ -663,22 +706,31 @@ def run_martingale_cycle(data):
             st["open"] = None
 
     # ---- 2. Open on new S3 signal ----
+    # 2026-09-08 review: fill at the LIVE price at this cron tick, not at the
+    # signal bar's close. The bar closed up to ~10 min before this tick, so
+    # filling at its close is look-ahead — the same bias the honest protocol
+    # removed from the historical study. `signal_close` is kept for reference.
     if st.get("open") is None:
         s_on = sig.get("signal")
         s_time = sig.get("bar_time")
-        s_entry = _finite_px(sig.get("entry"))
-        if s_on and s_time and s_entry is not None and s_time != st.get("last_signal_time"):
-            level = st.get("level", 0)
-            lot = MART_LOT0 * 2 ** level
-            st["open"] = {
-                "signal_time": s_time,
-                "open_time": now.isoformat(),
-                "entry": s_entry,
-                "lot": lot,
-                "level": level,
-            }
-            st["last_signal_time"] = s_time
-            print(f"[馬丁] 🎯 S3 反彈確認 @ ${s_entry:.1f} → 開 級{level+1} (lot {lot:.2f})")
+        s_close = _finite_px(sig.get("entry"))
+        if s_on and s_time and s_time != st.get("last_signal_time"):
+            if price is None:
+                print("⚠️ [馬丁] S3 信號但無現價 — 唔開倉 (唔用 bar close 補位)")
+            else:
+                level = st.get("level", 0)
+                lot = MART_LOT0 * 2 ** level
+                st["open"] = {
+                    "signal_time": s_time,
+                    "open_time": now.isoformat(),
+                    "entry": price,
+                    "signal_close": s_close,
+                    "lot": lot,
+                    "level": level,
+                }
+                st["last_signal_time"] = s_time
+                ref = f" (bar close ${s_close:.1f})" if s_close is not None else ""
+                print(f"[馬丁] 🎯 S3 反彈確認 → 現價 ${price:.1f}{ref} 開 級{level+1} (lot {lot:.2f})")
 
     # ---- 3. Status line ----
     n = st["n_wins"] + st["n_losses"]
@@ -768,6 +820,25 @@ def _consecutive_losses(log):
     return count
 
 
+def _best_live_floating_r(log, want_dir):
+    """Best floating P&L (in R) among LIVE trades of `want_dir`; -inf if none
+    has a usable floating_pnl. floating_pnl is written by check_outcomes."""
+    best = float("-inf")
+    for t in log.get("trades", []):
+        if t.get("status") != "LIVE" or _norm_dir(t.get("direction", "")) != want_dir:
+            continue
+        fl = t.get("floating_pnl")
+        entry = _finite_px(t.get("entry"))
+        stop = _finite_px(t.get("stop_loss"))
+        if fl is None or entry is None or stop is None:
+            continue
+        risk = abs(entry - stop)
+        if risk <= 0:
+            continue
+        best = max(best, float(fl) / risk)
+    return best
+
+
 def _live_position_directions(log):
     """Return canonical BUY/SELL of currently-LIVE positions."""
     dirs = [_norm_dir(t.get("direction", "")) for t in log.get("trades", [])
@@ -829,6 +900,14 @@ def discipline_check(log, direction, volume, sl_price, entry_price, atr):
                     f"🚫 {same_count} same-direction LIVE "
                     f"(max {SAME_DIR_MAX_CONCURRENT}) — no stacking"
                 )
+            if not ANTI_STACKING_OPPOSITE_ONLY and same_count >= PYRAMID_FREE_TRANCHES:
+                best_r = _best_live_floating_r(log, my_dir)
+                if best_r < PYRAMID_MIN_R:
+                    return False, (
+                        f"🚫 Pyramiding: tranche #{same_count + 1} needs an existing "
+                        f"{my_dir} ≥ +{PYRAMID_MIN_R:.0f}R floating (best {best_r:+.2f}R) — "
+                        f"no scaling into a loser"
+                    )
 
     # ── 4. Anti-martingale ──
     if ANTI_MARTINGALE:
@@ -1117,8 +1196,24 @@ def check_outcomes(data):
         seed_dt = _parse_dt(trade.get("seeded_time", ""))
         atr = trade.get("atr") or data.get("atr_30m", 15)
 
+        # 2026-09-08 review: if the fetched window no longer reaches back to
+        # the seed bar, a fresh replay would forget TP1/BE state. Resume from
+        # the persisted mid-trade state instead of restarting blind.
+        init_state = None
+        prev_state = trade.get("sim_state") or {}
+        first_bar_dt = _parse_dt(bars.iloc[0].get("datetime")) if len(bars) else None
+        if (seed_dt is not None and first_bar_dt is not None and first_bar_dt > seed_dt
+                and prev_state.get("last_bar_time")):
+            resume_dt = _parse_dt(prev_state["last_bar_time"])
+            if resume_dt is not None:
+                init_state = prev_state
+                seed_dt = resume_dt
+                print(f"  ↩️  {trade.get('id')}: bar window starts after seed — resuming from "
+                      f"{prev_state['last_bar_time']} (tp1_hit={prev_state.get('tp1_hit')})")
+
         sim = _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr,
-                                    seed_dt=seed_dt, data_source=data_source)
+                                    seed_dt=seed_dt, data_source=data_source,
+                                    init_state=init_state)
 
         if sim.get("closed"):
             verified = bool(sim.get("verified", True))
@@ -1168,6 +1263,17 @@ def check_outcomes(data):
         trade["tp2_hit"] = sim.get("tp2_hit", False)
         trade["trail_active"] = sim.get("trail_active", False)
         trade["trail_stop"] = sim.get("trail_stop")
+        if sim.get("last_bar_time"):
+            trade["sim_state"] = {
+                "tp1_hit": sim.get("tp1_hit", False),
+                "tp2_hit": sim.get("tp2_hit", False),
+                "trail_active": sim.get("trail_active", False),
+                "trail_stop": sim.get("trail_stop"),
+                "r_tp1": sim.get("r_tp1", 0.0),
+                "r_tp2": sim.get("r_tp2", 0.0),
+                "bars_held": sim.get("bars_held", 0),
+                "last_bar_time": sim.get("last_bar_time"),
+            }
         last_bar = bars.iloc[-1]
         current = last_bar.get('close', 0)
         is_sell = _norm_dir(direction) == "SELL"

@@ -56,6 +56,8 @@ from analyze_v3 import (
     detect_candlestick_patterns,
     _inject_kline_scores,
     _inject_push_metadata,
+    _time_quality_for_hour,
+    BROKER_UTC_OFFSET_HOURS,
     TRAIL_PROFIT_ATR,
     TRAIL_STOP_ATR,
     YF_TICKER,
@@ -728,7 +730,19 @@ def run_backtest(df_bars, df_day, verbose=False):
                 setups, candle_m30, candle_day,
                 len(window) - 1, len(day_window) - 1 if day_window is not None and not day_window.empty else 0,
             )
-            _inject_push_metadata(setups, daily_trend, h1_trend, current_price=current_price)
+            # 2026-09-08 review: rate the HISTORICAL bar's broker hour (not the
+            # wall-clock hour the backtest runs at) and feed points/atr/closes so
+            # the zone score and post-spike gate apply exactly as they do live.
+            bar_ts = pd.Timestamp(current_date)
+            if bar_ts.tzinfo is not None:
+                bar_ts = bar_ts.tz_convert('UTC').tz_localize(None)
+            broker_hour = (bar_ts.hour + BROKER_UTC_OFFSET_HOURS) % 24
+            tq_level, _ = _time_quality_for_hour(broker_hour)
+            _inject_push_metadata(
+                setups, daily_trend, h1_trend, current_price=current_price,
+                time_quality_override=tq_level, points=points, atr=atr,
+                closes=window['Close'].values,
+            )
         except Exception:
             continue
 

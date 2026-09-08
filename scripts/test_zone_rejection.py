@@ -53,9 +53,8 @@ def test_priority_boost():
         "direction": "🔴 SELL",
         "entry_price": 4440.0,
         "priority": 3,
-        "entry_mode": "breakout",
-        "entry_status": "已突破",
-        "entry_trigger": "已突破",
+        "entry_mode": "boundary",
+        "entry_status": "限價待觸及",
         "kline_confirmed": True,
         "quality": "OK",
         "stop_loss": 4500,
@@ -72,11 +71,21 @@ def test_priority_boost():
 
 
 def test_no_boost_without_points():
-    setup = {"direction": "🔴 SELL", "entry_price": 4440.0, "priority": 3}
+    setup = {"direction": "🔴 SELL", "entry_price": 4440.0, "priority": 3, "entry_mode": "boundary"}
     a._inject_push_metadata([setup], {"trend": "BEARISH"}, {"trend": "BEARISH"},
                             current_price=4440.0)
     assert setup.get("zone_touches", 0) == 0, setup
     assert setup["priority"] == 3, "no points -> no boost"
+
+
+def test_breakout_not_zone_scored():
+    """Breakout entry == current price sits at the opposite swing type; never score it."""
+    setup = {"direction": "🔴 SELL", "priority": 3, "entry_mode": "breakout",
+             "entry_status": "已突破", "entry_trigger": "已突破"}
+    a._inject_push_metadata([setup], {"trend": "BEARISH"}, {"trend": "BEARISH"},
+                            current_price=4440.0, points=POINTS, atr=ATR)
+    assert setup["zone_touches"] == 0 and setup["zone_label"] == "", setup
+    assert setup["rank_priority"] == 3
 
 
 if __name__ == "__main__":
@@ -86,6 +95,7 @@ if __name__ == "__main__":
         test_buy_side_low_zone,
         test_priority_boost,
         test_no_boost_without_points,
+        test_breakout_not_zone_scored,
     ]
     failed = 0
     for t in tests:

@@ -112,7 +112,7 @@ def test_gcf_m30_does_not_use_paxg_daily():
         (av.YF_TICKER, "60d", "60m"): gcf_h1,
         (av.YF_TICKER, "6mo", "1d"): gcf_day,
         (av.YF_TICKER, "5d", "15m"): None,
-        (av.YF_TICKER, "2d", "5m"): None,
+        (av.YF_TICKER, "5d", "5m"): None,
     }
     frames, calls, sources = _run_fetch(yf_map, tv_available=False)
     m30, _h1, _m15, _m5, day = frames
@@ -139,7 +139,7 @@ def test_paxg_m30_does_not_take_tv_daily():
         (av.PAXG_TICKER, "6mo", "1d"): paxg_day,
         (av.YF_TICKER, "6mo", "1d"): _bars(30, 2222.0, "1D"),
         (av.YF_TICKER, "5d", "15m"): None,
-        (av.PAXG_TICKER, "2d", "5m"): None,
+        (av.PAXG_TICKER, "5d", "5m"): None,
     }
     frames, _calls, sources = _run_fetch(yf_map, tv=tv, tv_available=True)
     m30, _h1, _m15, _m5, day = frames
@@ -162,7 +162,7 @@ def test_paxg_h1_failure_keeps_paxg_m30():
         (av.YF_TICKER, "60d", "60m"): _bars(40, 4444.0, "1h"),
         (av.YF_TICKER, "6mo", "1d"): _bars(30, 4444.0, "1D"),
         (av.YF_TICKER, "5d", "15m"): None,
-        (av.YF_TICKER, "2d", "5m"): None,
+        (av.YF_TICKER, "5d", "5m"): None,
     }
     frames, _calls, sources = _run_fetch(yf_map, tv_available=False, h1_paxg_exc=True)
     m30, h1, _m15, _m5, _day = frames
@@ -182,7 +182,7 @@ def test_gcf_m30_uses_gcf_m15_not_paxg():
         (av.YF_TICKER, "6mo", "1d"): _bars(30, 3500.0, "1D"),
         (av.PAXG_TICKER, "5d", "15m"): _bars(40, 1111.0, "15min"),
         (av.YF_TICKER, "5d", "15m"): _bars(40, 2222.0, "15min"),
-        (av.YF_TICKER, "2d", "5m"): None,
+        (av.YF_TICKER, "5d", "5m"): None,
     }
     frames, calls, sources = _run_fetch(yf_map, tv_available=False)
     m15 = frames[2]
@@ -201,7 +201,7 @@ def test_paxg_m30_uses_paxg_m15_not_gcf_or_tv():
         (av.PAXG_TICKER, "6mo", "1d"): _bars(30, 3333.0, "1D"),
         (av.PAXG_TICKER, "5d", "15m"): _bars(40, 3333.0, "15min"),
         (av.YF_TICKER, "5d", "15m"): _bars(40, 4444.0, "15min"),
-        (av.PAXG_TICKER, "2d", "5m"): None,
+        (av.PAXG_TICKER, "5d", "5m"): None,
     }
     frames, calls, sources = _run_fetch(yf_map, tv=tv, tv_available=True)
     m15 = frames[2]
@@ -210,6 +210,23 @@ def test_paxg_m30_uses_paxg_m15_not_gcf_or_tv():
     assert (av.YF_TICKER, "5d", "15m") not in calls
     assert abs(float(m15["Close"].iloc[-1]) - 3333.0) < 1e-9
     assert sources[2] == av.PAXG_DATA_SOURCE
+
+
+def test_m5_fallback_uses_5d_period():
+    """Review 2026-09-08: 2d yielded <100 GC=F 5m bars after weekends (M5 silently off)."""
+    yf_map = {
+        (av.PAXG_TICKER, "30d", "30m"): None,
+        (av.YF_TICKER, "30d", "30m"): _bars(120, 3500.0, "30min"),
+        (av.YF_TICKER, "60d", "60m"): _bars(40, 3500.0, "1h"),
+        (av.YF_TICKER, "6mo", "1d"): _bars(30, 3500.0, "1D"),
+        (av.YF_TICKER, "5d", "15m"): None,
+        (av.YF_TICKER, "5d", "5m"): _bars(150, 3500.0, "5min"),
+    }
+    frames, calls, _sources = _run_fetch(yf_map, tv_available=False)
+    m5 = frames[3]
+    assert (av.YF_TICKER, "5d", "5m") in calls
+    assert (av.YF_TICKER, "2d", "5m") not in calls
+    assert m5 is not None and len(m5) == 150
 
 
 def test_tv_m30_m15_fail_falls_to_paxg_not_gcf():
@@ -226,7 +243,7 @@ def test_tv_m30_m15_fail_falls_to_paxg_not_gcf():
     yf_map = {
         (av.PAXG_TICKER, "5d", "15m"): _bars(40, 5555.0, "15min"),
         (av.YF_TICKER, "5d", "15m"): _bars(40, 6666.0, "15min"),
-        (av.PAXG_TICKER, "2d", "5m"): None,
+        (av.PAXG_TICKER, "5d", "5m"): None,
     }
     frames, calls, sources = _run_fetch(yf_map, tv=tv, tv_available=True)
     m15 = frames[2]
@@ -246,6 +263,7 @@ if __name__ == "__main__":
         test_gcf_m30_uses_gcf_m15_not_paxg,
         test_paxg_m30_uses_paxg_m15_not_gcf_or_tv,
         test_tv_m30_m15_fail_falls_to_paxg_not_gcf,
+        test_m5_fallback_uses_5d_period,
     ]
     failed = 0
     for fn in tests:

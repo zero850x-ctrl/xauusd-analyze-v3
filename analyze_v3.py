@@ -635,7 +635,9 @@ def fetch_data():
         m5_ticker = PAXG_TICKER if m30_is_spot else YF_TICKER
         try:
             _log(f"[*] M5 fallback: Yahoo Finance {m5_ticker} 5m...")
-            df_m5 = _yf_ohlc(m5_ticker, '2d', '5m')
+            # 5d (not 2d): GC=F has <100 5m bars in the last 2 calendar days
+            # after a weekend, which silently disabled M5 every Monday.
+            df_m5 = _yf_ohlc(m5_ticker, '5d', '5m')
             if df_m5 is not None and not df_m5.empty:
                 M5_DATA_SOURCE = (
                     PAXG_DATA_SOURCE if m5_ticker == PAXG_TICKER
@@ -2304,10 +2306,15 @@ def _post_spike_state(closes, atr):
     """
     if closes is None or atr is None or atr <= 0:
         return None
-    closes = [float(c) for c in closes if c is not None and np.isfinite(c)]
     need = SPIKE_WINDOW_BARS + 2  # 4 收市 bar + last(forming) + 前 1 參考
     if len(closes) < need:
         return None
+    # Only the tail window matters; any non-finite value inside it would
+    # shift the window if filtered, so bail out instead of compacting.
+    tail = list(closes[-need:])
+    if any(c is None or not np.isfinite(float(c)) for c in tail):
+        return None
+    closes = [float(c) for c in tail]
     # closes[-1] = forming bar (未收市, tvDatafeed 最後一行), closes[-2] = 最後已收市
     ref = closes[-2]
     base = closes[-2 - SPIKE_WINDOW_BARS]
@@ -2368,9 +2375,12 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
         # either side, from find_swings_ordered) get a priority boost.
         # Breakout/已突破 setups: _parse_entry_price_from_setup falls back to
         # current_price, so their zone is scored at the live price (entry ==
-        # fill price) — intentional. Informational + priority only; never
-        # overrides danger/advisory gating.
-        if points is not None and atr:
+        # 2026-09-08 review: breakout setups fall back to current_price, and
+        # after a break the price sits at the *opposite* swing type (SELL
+        # breakout → near swing lows), so counting highs there is meaningless.
+        # Score only limit-style modes whose entry is a real level.
+        zone_modes = ('boundary', 'pullback', 'fib', 'fib0786')
+        if points is not None and atr and s.get('entry_mode', 'breakout') in zone_modes:
             ep = s.get('entry_price') or _parse_entry_price_from_setup(s, current_price)
             if ep is not None:
                 touches, zlabel, _ztouch_idx = _zone_rejection_score(
@@ -2381,6 +2391,9 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
             else:
                 s['zone_touches'] = 0
                 s['zone_label'] = ''
+        else:
+            s['zone_touches'] = 0
+            s['zone_label'] = ''
 
         # 2026-09-04 post-spike chase gate: 急跌/急升後短窗口內追同一方向 →
         # 唔推送 (V 型反彈陷阱, mentor 9/1-9/4: 9/4 追沽 6 筆全滅 −$2,200+)
@@ -2436,6 +2449,7 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
         s['rank_priority'] = rp
 
     setups.sort(key=lambda s: (s.get('rank_priority', s.get('priority', 99)), -s.get('rr_tp1', 0)))
+    return spike
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2633,7 +2647,11 @@ BROKER_UTC_OFFSET_HOURS = int(os.environ.get('BROKER_UTC_OFFSET_HOURS', '-3'))
 #   - Gate 只 block「追 spike 方向」嘅 setup 推送; 反方向 (搏反彈) 唔 block,
 #     因為 counter-trend severity gate 已處理佢
 SPIKE_WINDOW_BARS = 4          # 最近 4 條已收市 M30 bar 嘅累計變動窗口
-SPIKE_ATR_MULT = 2.0           # 窗口內變動 > 2×ATR 先算 spike
+# 2026-09-08 review: 2.0×ATR over 4 bars fires on ordinary trend continuation
+# (0.5 ATR/bar). The motivating 9/4 move was ≈9.5 ATR. 3.0 keeps the gate for
+# genuine spikes while letting normal trend-follow pushes through. Hit rate is
+# exported in JSON (`post_spike`) so the threshold can be tuned on data.
+SPIKE_ATR_MULT = float(os.environ.get('SPIKE_ATR_MULT', '3.0'))
 MAX_PATTERNS_PER_DIRECTION = 2  # top-N patterns per side before setup generation
 
 # Broker-local hours below (UTC + offset).
@@ -2676,8 +2694,11 @@ def _time_quality_score():
 
     Returns: ('golden'|'danger'|'advisory'|'normal', advisory_text)
     """
-    broker_hour = _broker_hour()
+    return _time_quality_for_hour(_broker_hour())
 
+
+def _time_quality_for_hour(broker_hour):
+    """Time-quality rating for an explicit broker-local hour (backtest-safe)."""
     if broker_hour in GOLDEN_HOURS:
         return ('golden', '🌅 黃金時段 (17:00 broker, 64.3% 勝, +$339 — 138-sample) — 適合入場')
     if broker_hour in DANGER_HOURS:
@@ -4055,6 +4076,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 參數 | 詳情 |
 |------|------|
 | 信號確定性 | {s['confidence']} |
+| 優先級 | P{s.get('priority', '?')} (排序 P{s.get('rank_priority', s.get('priority', '?'))}) |
 | 入場模式 | {_entry_mode_report_label(s.get('entry_mode', 'breakout'))} |
 | 質素 | {_quality_report_label(s.get('quality', '?'))} |
 | 日線配合 | {s['daily_alignment']} |
@@ -4516,8 +4538,11 @@ def main():
 
     # 7b. Inject K-line confirmation scores into setups (used by paper_trade + cron filtering)
     _inject_kline_scores(setups, candle_m30, candle_day, len(df_m30) - 1, len(df_day) - 1)
-    _inject_push_metadata(setups, daily_trend, h1_trend, current_price=current,
-                               points=points, atr=atr, closes=df_m30['Close'].values)
+    spike_state = _inject_push_metadata(setups, daily_trend, h1_trend, current_price=current,
+                                        points=points, atr=atr, closes=df_m30['Close'].values)
+    if spike_state:
+        _log(f"[*] Post-spike gate ACTIVE: {spike_state['direction']} {spike_state['move']:+.1f} "
+             f"(> {SPIKE_ATR_MULT}×ATR) — blocking {'SELL' if spike_state['direction']=='down' else 'BUY'} pushes")
     
     utc_now = datetime.now(timezone.utc)
     today = utc_now.strftime('%Y-%m-%d')
@@ -4564,6 +4589,14 @@ def main():
                 'sma10': rebound['sma10'],
                 'prev_high3': rebound['prev_high3'],
                 'note': 'S3 反彈確認 + 3級馬丁 (0.01→0.04) — live paper sim 驗證中（歷史 backtest 有 look-ahead bias，修正後勝率 ~47% ≈ baseline，無歷史 edge）',
+            },
+            'post_spike': {
+                'active': spike_state is not None,
+                'direction': spike_state['direction'] if spike_state else None,
+                'move': spike_state['move'] if spike_state else None,
+                'window_bars': SPIKE_WINDOW_BARS,
+                'atr_mult': SPIKE_ATR_MULT,
+                'blocked_setups': sum(1 for s in setups if s.get('post_spike_blocked')),
             },
             'spot_futures_basis': SPOT_FUTURES_BASIS,
             'basis_cron_blocked': BASIS_CRON_BLOCKED,

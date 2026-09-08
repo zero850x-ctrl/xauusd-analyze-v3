@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""馬丁引擎測試: 單元 (state 轉換) + 60日真實數據 replay 對照研究結果."""
+"""馬丁引擎測試: 單元 (state 轉換) + 60日真實數據 replay 對照研究結果.
+
+Default run = offline unit tests only.  `--replay` additionally downloads 60d
+of PAXG 5m from yfinance and replays the honest protocol (needs network, ~45s).
+"""
 import json, os, tempfile, sys
 from datetime import datetime, timedelta, timezone
+
+RUN_REPLAY = "--replay" in sys.argv
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
@@ -28,40 +34,62 @@ def make_open(st, mins_ago):
     pt.save_martingale_state(st)   # cycle 會重新 load — 必須 persist
 
 def test_unit():
-    # 1. open on signal
+    # 1. open on signal — entry is the LIVE price (4401), not the bar close (4400)
     pt.run_martingale_cycle(fresh_data(True, "t1", 4400.0, 4401.0))
     st = pt.load_martingale_state()
     assert st["open"] is not None and st["open"]["lot"] == 0.01, "should open 0.01"
+    assert st["open"]["entry"] == 4401.0, f"entry must be live price, got {st['open']['entry']}"
+    assert st["open"]["signal_close"] == 4400.0
     assert st["last_signal_time"] == "t1"
 
-    # 2. same signal dedupe (no reopen after close)
-    make_open(st, 12)  # ripe
+    # 1b. signal without a live price must NOT open (no bar-close fallback)
+    st["open"] = None
+    st["last_signal_time"] = None
+    pt.save_martingale_state(st)
+    st = pt.run_martingale_cycle(fresh_data(True, "t1", 4400.0, None))
+    assert st["open"] is None, "no live price → no open"
+
+    # 2. same signal dedupe (no reopen after close); win must clear the cost
+    st["last_signal_time"] = "t1"
+    make_open(st, 12)  # ripe, entry 4400
     st = pt.run_martingale_cycle(fresh_data(True, "t1", 4400.0, 4402.0))
     assert st["open"] is None, "closed"
     assert st["n_wins"] == 1 and st["level"] == 0, "win → reset level 0"
+    last = st["trades"][-1]
+    assert abs(last["gross_usd"] - 2.0) < 1e-9 and abs(last["cost_usd"] - pt.MART_COST_PER_OZ) < 1e-9
+    assert abs(last["pnl_usd"] - (2.0 - pt.MART_COST_PER_OZ)) < 1e-9, last
     # signal still t1 → must NOT reopen
     st = pt.run_martingale_cycle(fresh_data(True, "t1", 4400.0, 4402.0))
     assert st["open"] is None, "same signal must not reopen"
 
+    # 2b. a move smaller than the cost is a LOSS after cost
+    st = pt.run_martingale_cycle(fresh_data(True, "t1b", 4400.0, 4400.0))
+    make_open(st, 12)
+    st = pt.run_martingale_cycle(fresh_data(True, "t1b", 4400.0, 4400.0 + pt.MART_COST_PER_OZ / 2))
+    assert st["n_losses"] == 1 and st["level"] == 1, f"sub-cost move is a loss, got {st}"
+
     # 3. loss → level up
     st = pt.run_martingale_cycle(fresh_data(True, "t2", 4400.0, 4401.0))
     make_open(st, 12)
-    st = pt.run_martingale_cycle(fresh_data(True, "t2", 4400.0, 4399.0))  # exit 4399 < entry 4400 → loss
-    assert st["open"] is None and st["n_losses"] == 1 and st["level"] == 1, f"loss → level 1, got {st}"
+    st = pt.run_martingale_cycle(fresh_data(True, "t2", 4400.0, 4399.0))
+    assert st["open"] is None and st["n_losses"] == 2 and st["level"] == 2, f"loss → level 2, got {st}"
 
-    # 4. loss again → level 2 (cap)
+    # 4. loss at top level → RESET to level 0 (true 3-level), streak keeps counting
     st = pt.run_martingale_cycle(fresh_data(True, "t3", 4400.0, 4401.0))
     make_open(st, 12)
+    assert st["open"]["lot"] == 0.04
     st = pt.run_martingale_cycle(fresh_data(True, "t3", 4400.0, 4395.0))
-    assert st["level"] == 2, "level 2"
-    st = pt.run_martingale_cycle(fresh_data(True, "t4", 4400.0, 4401.0))
-    make_open(st, 12)
-    st = pt.run_martingale_cycle(fresh_data(True, "t4", 4400.0, 4395.0))
-    assert st["level"] == 2, f"cap at 3 levels (max_level-1=2), got {st['level']}"
+    assert st["level"] == 0, f"top-level loss must reset to 0, got {st['level']}"
     assert st["longest_loss_streak"] == 3
+    st = pt.run_martingale_cycle(fresh_data(True, "t4", 4400.0, 4401.0))
+    assert st["open"]["lot"] == 0.01, "next tranche after reset is 0.01"
     print("test_unit: ✅ all assertions passed")
 
 test_unit()
+
+if "--replay" not in sys.argv:
+    print("(60-day yfinance replay skipped — pass --replay to run it; needs network, ~45s)")
+    sys.exit(0)
 
 # ---------- 60日 replay (誠實協議) ----------
 # ⚠️ 2026-09-03 review: 原研究協議有 look-ahead bias (entry 用 bar 起點+5m 價,
