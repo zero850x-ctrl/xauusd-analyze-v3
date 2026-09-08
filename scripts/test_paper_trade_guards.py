@@ -92,8 +92,15 @@ def test_discipline_stacking():
         {"status": "LIVE", "direction": "BUY"},
         {"status": "LIVE", "direction": "🟢 BUY"},
     ], "history": []}
-    no2, reason2 = pt.discipline_check(two, "BUY", 0.01, sl, entry, atr)
-    assert not no2 and "same-direction" in reason2
+    ok3, _ = pt.discipline_check(two, "BUY", 0.01, sl, entry, atr)
+    assert ok3, "third same-direction stack should pass (max 3)"
+    three = {"trades": [
+        {"status": "LIVE", "direction": "BUY"},
+        {"status": "LIVE", "direction": "BUY"},
+        {"status": "LIVE", "direction": "🟢 BUY"},
+    ], "history": []}
+    no4, reason4 = pt.discipline_check(three, "BUY", 0.01, sl, entry, atr)
+    assert not no4 and "same-direction" in reason4
 
 
 def test_range_guard_both_bounds():

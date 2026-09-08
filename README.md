@@ -7,7 +7,7 @@ XAUUSD / 黃金技術分析 + 紙交易監控系統。由 Hermes Agent cron job 
 | 項目 | 值 |
 |------|-----|
 | Job ID | `904a8f1758b6` |
-| Schedule | `*/5 7-23 * * 1-5`（週一至五 07:00–23:00 HKT，每 5 分鐘）|
+| Schedule | `*/15 7-23 * * 1-5`（週一至五 07:00–23:00 HKT，每 15 分鐘）|
 | Model | `mimo-v2.5` @ `opencode-go` |
 | Workdir | `~/.hermes/skills/trading/xauusd-technical-analysis` |
 | 報告輸出 | `~/.hermes/cron/output/904a8f1758b6/`（Telegram）|
@@ -39,9 +39,12 @@ TradingView OANDA spot  →  PAXG-USD (yfinance, 現貨錨定, 差 ~$7)  →  GC
 
 ## Paper Trade Guards
 
+- **Post-spike chase gate**（2026-09-04，mentor 9/1-9/4 sample）：最近 4 條已收市 M30 bar 累計變動 > 2×ATR（`SPIKE_WINDOW_BARS=4` / `SPIKE_ATR_MULT=2.0`）時，追同一方向嘅 setup `post_spike_blocked=true` 唔推送（V 型反彈陷阱 — 9/4 金價急插 4470→4375 後 2 小時內追沽 6 筆全滅 −$2,200+）。反方向（搏反彈）唔 block — 由 counter-trend severity gate 處理。
+- **Momentum-hold exit**（2026-09-01，mentor 129-trade sample，merge 2026-09-04）：`MOMENTUM_HOLD_EXIT=1`（default）— TP1 成交後剩餘 2/3 倉位推去 breakeven + 1.5 ATR trail，固定 TP2 退休（贏家可以跑；真實 PAXG 回測 +5.19R vs 固定TP2 +2.41R）。`MOMENTUM_HOLD_EXIT=0` 還原舊 fixed-TP2 行為。
+- **Anti-martingale**（方案 C，2026-09-03）：同一 UTC 日內 **5+ 連續虧損**（`ANTI_MART_LOSS_LIMIT=5`，09-04 由 3 放寬）先觸發，之後所有 volume > 0.01 嘅 setup 拒絶（0.01 lot 照入）；贏一注或過 UTC 午夜自動解除。跨日虧損唔算連續（原版數晒成個 history 會死鎖）
 - **Traded-range 驗證**：GC=F close 超出實際 OHLC traded range → 標記 `UNVERIFIED`，唔計入績效
 - **Series-basis 驗證**：GC=F 最新 close vs spot 超過 `GC_F_BASIS_FAIL_USD=40` → `UNVERIFIED`，保持 LIVE
-- **Anti-stacking**：相反方向禁止；同方向最多 `SAME_DIR_MAX_CONCURRENT=2`（2026-08-22 放寬）
+- **Anti-stacking**：相反方向禁止；同方向最多 `SAME_DIR_MAX_CONCURRENT=3`（2026-09-04 放寬至 3）
 - **SL floor**：`SL_MIN_ATR_MULT=0.8`（2026-08-22 由 0.5 提高，減少 noise stop-out）
 - **Seed dedup**（2026-08-24 / PR #28）：同 pattern+direction+entry_mode 已 LIVE（任何日）或今日 CLOSED → skip；trade ID 用 trades+history max suffix +1
 

@@ -18,6 +18,7 @@ import analyze_v3 as av
 class _DummyInterval:
     in_30_minute = object()
     in_15_minute = object()
+    in_5_minute = object()
     in_daily = object()
 
 
@@ -33,13 +34,15 @@ def _bars(n, price, freq):
 
 
 class FakeTV:
-    def __init__(self, m30=None, daily=None, m15=None, fail_m30=False):
+    def __init__(self, m30=None, daily=None, m15=None, m5=None, fail_m30=False):
         self.m30 = m30
         self.daily = daily
         self.m15 = m15
+        self.m5 = m5
         self.fail_m30 = fail_m30
         self.daily_calls = 0
         self.m15_calls = 0
+        self.m5_calls = 0
 
     def get_hist(self, symbol, exchange, interval=None, n_bars=None):
         if n_bars == 300:
@@ -50,6 +53,9 @@ class FakeTV:
             self.daily_calls += 1
             return self.daily
         if n_bars == 500:
+            if interval == _DummyInterval.in_5_minute:
+                self.m5_calls += 1
+                return self.m5
             self.m15_calls += 1
             return self.m15
         return self.m15
@@ -106,9 +112,10 @@ def test_gcf_m30_does_not_use_paxg_daily():
         (av.YF_TICKER, "60d", "60m"): gcf_h1,
         (av.YF_TICKER, "6mo", "1d"): gcf_day,
         (av.YF_TICKER, "5d", "15m"): None,
+        (av.YF_TICKER, "2d", "5m"): None,
     }
     frames, calls, sources = _run_fetch(yf_map, tv_available=False)
-    m30, _h1, _m15, day = frames
+    m30, _h1, _m15, _m5, day = frames
     data_src, daily_src = sources[0], sources[1]
     assert abs(float(m30["Close"].iloc[-1]) - 3500.0) < 1e-9
     assert abs(float(day["Close"].iloc[-1]) - 2222.0) < 1e-9, "must use GC=F daily bars"
@@ -132,9 +139,10 @@ def test_paxg_m30_does_not_take_tv_daily():
         (av.PAXG_TICKER, "6mo", "1d"): paxg_day,
         (av.YF_TICKER, "6mo", "1d"): _bars(30, 2222.0, "1D"),
         (av.YF_TICKER, "5d", "15m"): None,
+        (av.PAXG_TICKER, "2d", "5m"): None,
     }
     frames, _calls, sources = _run_fetch(yf_map, tv=tv, tv_available=True)
-    m30, _h1, _m15, day = frames
+    m30, _h1, _m15, _m5, day = frames
     data_src, daily_src = sources[0], sources[1]
     assert abs(float(m30["Close"].iloc[-1]) - 3333.0) < 1e-9
     assert abs(float(day["Close"].iloc[-1]) - 3333.0) < 1e-9, "must use PAXG daily, not TV"
@@ -154,9 +162,10 @@ def test_paxg_h1_failure_keeps_paxg_m30():
         (av.YF_TICKER, "60d", "60m"): _bars(40, 4444.0, "1h"),
         (av.YF_TICKER, "6mo", "1d"): _bars(30, 4444.0, "1D"),
         (av.YF_TICKER, "5d", "15m"): None,
+        (av.YF_TICKER, "2d", "5m"): None,
     }
     frames, _calls, sources = _run_fetch(yf_map, tv_available=False, h1_paxg_exc=True)
-    m30, h1, _m15, _day = frames
+    m30, h1, _m15, _m5, _day = frames
     data_src, daily_src = sources[0], sources[1]
     assert abs(float(m30["Close"].iloc[-1]) - 3333.0) < 1e-9
     assert h1 is not None and not h1.empty
@@ -173,6 +182,7 @@ def test_gcf_m30_uses_gcf_m15_not_paxg():
         (av.YF_TICKER, "6mo", "1d"): _bars(30, 3500.0, "1D"),
         (av.PAXG_TICKER, "5d", "15m"): _bars(40, 1111.0, "15min"),
         (av.YF_TICKER, "5d", "15m"): _bars(40, 2222.0, "15min"),
+        (av.YF_TICKER, "2d", "5m"): None,
     }
     frames, calls, sources = _run_fetch(yf_map, tv_available=False)
     m15 = frames[2]
@@ -191,6 +201,7 @@ def test_paxg_m30_uses_paxg_m15_not_gcf_or_tv():
         (av.PAXG_TICKER, "6mo", "1d"): _bars(30, 3333.0, "1D"),
         (av.PAXG_TICKER, "5d", "15m"): _bars(40, 3333.0, "15min"),
         (av.YF_TICKER, "5d", "15m"): _bars(40, 4444.0, "15min"),
+        (av.PAXG_TICKER, "2d", "5m"): None,
     }
     frames, calls, sources = _run_fetch(yf_map, tv=tv, tv_available=True)
     m15 = frames[2]
@@ -215,6 +226,7 @@ def test_tv_m30_m15_fail_falls_to_paxg_not_gcf():
     yf_map = {
         (av.PAXG_TICKER, "5d", "15m"): _bars(40, 5555.0, "15min"),
         (av.YF_TICKER, "5d", "15m"): _bars(40, 6666.0, "15min"),
+        (av.PAXG_TICKER, "2d", "5m"): None,
     }
     frames, calls, sources = _run_fetch(yf_map, tv=tv, tv_available=True)
     m15 = frames[2]
