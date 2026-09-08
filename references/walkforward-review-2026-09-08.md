@@ -61,6 +61,28 @@ claude-fable-5-1: 用 1-2 年數據跑 walk-forward，計每種訊號模式
 8. **last_trade_bar cooldown** — limit fill / stop-out 而家都更新
    `last_trade_bar`，cooldown 對 limit 單生效（helper 回傳新值）。
 
+### Round 3（merge 前衛生）
+9. **假測試清除** — test_limit_fill.py「last_trade_bar 唔郁」真化
+   （assert 返 42）；test_seed_pushes.py 重寫測 **真 `_setup_is_seedable`**
+   （自寫 list comprehension 全刪）。**新 `test_inject_push_metadata.py`：
+   41 個真 cases 直接 call `_inject_push_metadata`** — blocker 修復正式
+   入 repo 覆蓋（唔再只靠 manual probe）。矩陣：4 limit modes × breakout
+   × triggered × LIMIT_MODE_PUSH=1 × 未觸發語義。
+10. **push_candidates code 層保險** — analyze_v3 JSON 加
+    `push_candidates`（`cron_push_eligible && !push_suppressed` 過濾
+    好嘅列表）。cron prompt 步驟 4/6/規則全部改為**只讀呢個列表**，
+    唔再靠 LLM 自然語言重推 eligibility。（prompt 文字本身留喺
+    jobs.json，sync 入 repo = follow-up，已記錄。）
+11. **語義還原** — 未觸發 pullback/fib 唔再 `cron_push_eligible`
+    （elif 還原 `('boundary','fib0786')` = main 語義）。push_suppressed
+    照 cover 4 個 limit modes，呢個 guard 只限制 LIMIT_MODE_PUSH=1
+    重新開啟時可以生存邊啲。
+
+### 測試總結（merge 前）
+- `test_limit_fill.py` 20、`test_seed_pushes.py` 9、
+  `test_inject_push_metadata.py` 41 = **70 個真 cases，全 pass**，
+  假 check 全滅。
+
 ## 誠實結果（2y H1 GC=F, spread 0.15/side, train/TEST split）
 | 段 | mode | n | 勝率 | E(R) | PF | net |
 |---|---|---|---|---|---|---|
