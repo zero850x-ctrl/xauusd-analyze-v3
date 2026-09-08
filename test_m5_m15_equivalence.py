@@ -1,13 +1,25 @@
 #!/usr/bin/env python3
-"""Equivalence test: old M15 analyzer (git HEAD) vs refactored _analyze_mini_tf wrappers."""
-import sys, subprocess
-import numpy as np, pandas as pd
-sys.path.insert(0, "/tmp/xauusd-analyze-v3")
+"""Equivalence test: old M15 analyzer (git main) vs refactored _analyze_mini_tf wrappers."""
+import os
+import sys
+import subprocess
+import numpy as np
+import pandas as pd
+
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _ROOT)
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 import ta
 from analyze_v3 import analyze_m15_entry_timing as new_fn, analyze_m5_entry_timing
 
-git_src = subprocess.run(["git", "-C", "/tmp/xauusd-analyze-v3", "show", "origin/main:analyze_v3.py"],
-                         capture_output=True, text=True).stdout
+git_src = subprocess.run(
+    ["git", "-C", _ROOT, "show", "origin/main:analyze_v3.py"],
+    capture_output=True, text=True, check=True, encoding="utf-8", errors="replace",
+).stdout
 start = git_src.index("def analyze_m15_entry_timing")
 end = git_src.index("# ═══════════════════════════════════════════════════════════\n# CANDLESTICK PATTERN DETECTION")
 old_fn = git_src[start:end].replace("def analyze_m15_entry_timing", "def analyze_m15_old")

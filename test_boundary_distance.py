@@ -10,8 +10,15 @@ Regression: Double Bottom @ $4417.57 emitted while price = $4485.70 (6.4 ATR awa
 而 neckline 近 (V 型反轉) — 嗰陣 boundary 被 cap 拒、breakout 照出 (entry =
 現價，唔 stale，合理)。統一兩者之前先諗清楚，唔好照抄 2.5 去 breakout。
 """
-import importlib.util, sys, types
-spec = importlib.util.spec_from_file_location("analyze_v3", "/tmp/xauusd-analyze-v3/analyze_v3.py")
+import importlib.util, sys, types, os
+
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+spec = importlib.util.spec_from_file_location("analyze_v3", os.path.join(_ROOT, "analyze_v3.py"))
 av = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(av)
 

@@ -7,9 +7,15 @@
   C. 急插後 BUY (搏反彈) → 唔應 block (counter-trend gate 自行處理)
   D. 平靜市況 → 冇 spike, 唔應 block
 """
-import importlib.util, sys
+import importlib.util, sys, os
 
-spec = importlib.util.spec_from_file_location("analyze_v3", "/tmp/xauusd-analyze-v3/analyze_v3.py")
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+spec = importlib.util.spec_from_file_location("analyze_v3", os.path.join(_ROOT, "analyze_v3.py"))
 av = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(av)
 

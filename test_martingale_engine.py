@@ -2,7 +2,14 @@
 """馬丁引擎測試: 單元 (state 轉換) + 60日真實數據 replay 對照研究結果."""
 import json, os, tempfile, sys
 from datetime import datetime, timedelta, timezone
-sys.path.insert(0, "/tmp/xauusd-analyze-v3")
+
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _ROOT)
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 import paper_trade as pt
 
