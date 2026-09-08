@@ -48,18 +48,26 @@ def test_buy_side_low_zone():
 
 
 def test_priority_boost():
-    # Fake a setup at a tested zone; inject metadata with points -> priority drops by 1
+    # Fake a setup at a tested zone; rank_priority drops by 1, base priority unchanged
     setup = {
         "direction": "🔴 SELL",
         "entry_price": 4440.0,
         "priority": 3,
+        "entry_mode": "breakout",
+        "entry_status": "已突破",
+        "entry_trigger": "已突破",
+        "kline_confirmed": True,
+        "quality": "OK",
+        "stop_loss": 4500,
+        "tp1": 4400,
     }
     daily = {"trend": "BEARISH"}
     h1 = {"trend": "BEARISH"}
     a._inject_push_metadata([setup], daily, h1, current_price=4440.0,
                             points=POINTS, atr=ATR)
     assert setup["zone_touches"] >= 2, setup["zone_touches"]
-    assert setup["priority"] == 2, f"priority should drop 3->2, got {setup['priority']}"
+    assert setup["priority"] == 3, f"priority must stay 3 for cron gate, got {setup['priority']}"
+    assert setup["rank_priority"] == 2, f"rank_priority should drop 3->2, got {setup.get('rank_priority')}"
     assert "測試" in setup["zone_label"], setup["zone_label"]
 
 

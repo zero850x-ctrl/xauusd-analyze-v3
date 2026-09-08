@@ -1869,6 +1869,12 @@ def analyze_m5_entry_timing(df_m5, patterns, points, current_price, atr):
 # CANDLESTICK PATTERN DETECTION
 # ═══════════════════════════════════════════════════════════
 
+_REBOUND_EMPTY = {
+    'signal': False, 'reason': 'M15 數據不足', 'bar_time': None, 'entry': None,
+    'sma10': None, 'prev_high3': None,
+}
+
+
 def detect_rebound_signal(df_m15):
     """
     S3 反彈確認信號 (2026-09-03):
@@ -1883,19 +1889,18 @@ def detect_rebound_signal(df_m15):
     用 forming bar 計信號 → 全日 12 個真確認信號全部 miss (實測證實)。
     """
     if df_m15 is None or df_m15.empty or len(df_m15) < 20:
-        return {'signal': False, 'reason': 'M15 數據不足', 'bar_time': None, 'entry': None}
+        return dict(_REBOUND_EMPTY)
     close = df_m15['Close'].values
     high = df_m15['High'].values
     open_ = df_m15['Open'].values
 
-    # --- 只睇已收市 bar ---
+    # --- 只睇已收市 bar (naive index = UTC, same convention as M30/H1) ---
     try:
-        last_start = df_m15.index[-1]
+        last_start = pd.Timestamp(df_m15.index[-1])
+        if last_start.tzinfo is not None:
+            last_start = last_start.tz_convert('UTC').tz_localize(None)
         interval = pd.Timedelta(minutes=15)
-        if getattr(last_start, 'tzinfo', None) is not None:
-            now_ts = pd.Timestamp.now(tz=last_start.tzinfo)
-        else:
-            now_ts = pd.Timestamp.now()   # TV index 係 naive local (HKT) — 同 local now 對比
+        now_ts = pd.Timestamp.now(tz='UTC').tz_localize(None)
         if last_start + interval > now_ts:
             bar_idx = len(df_m15) - 2      # 最後一行未收市 → 用上一條 (已收市)
         else:
@@ -1903,7 +1908,7 @@ def detect_rebound_signal(df_m15):
     except Exception:
         bar_idx = len(df_m15) - 2          # 判斷失敗 → 保守用上一條
     if bar_idx < 5:
-        return {'signal': False, 'reason': 'M15 數據不足', 'bar_time': None, 'entry': None}
+        return dict(_REBOUND_EMPTY)
 
     last = bar_idx
     sma10 = float(np.mean(close[last - 9:last + 1]))     # 含評估 bar, 同研究 rolling(10) 一致
@@ -2299,7 +2304,7 @@ def _post_spike_state(closes, atr):
     """
     if closes is None or atr is None or atr <= 0:
         return None
-    closes = [float(c) for c in closes if c is not None]
+    closes = [float(c) for c in closes if c is not None and np.isfinite(c)]
     need = SPIKE_WINDOW_BARS + 2  # 4 收市 bar + last(forming) + 前 1 參考
     if len(closes) < need:
         return None
@@ -2357,8 +2362,6 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
         s['session_bonus'] = bool(
             session_bonus and severity == 'ALIGNED'
         )
-        if s.get('session_bonus') and s.get('priority', 99) > 1:
-            s['priority'] = s['priority'] - 1
         # 2026-09-02 zone-rejection (mentor H1 charts: he sold $4420-4449
         # resistance 38 times — repeatedly-tested zones hold). Setups whose
         # entry sits on a swing-high/low cluster (>=2 touches within 1.0 ATR
@@ -2375,8 +2378,6 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
                 )
                 s['zone_touches'] = touches
                 s['zone_label'] = zlabel
-                if touches >= 2 and s.get('priority', 99) > 1:
-                    s['priority'] = s['priority'] - 1
             else:
                 s['zone_touches'] = 0
                 s['zone_label'] = ''
@@ -2425,6 +2426,16 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
             s['cron_push_eligible'] = base
         else:
             s['cron_push_eligible'] = False
+
+        # rank_priority: display/sort only — must not widen cron_push_eligible
+        rp = s.get('priority', 99)
+        if s.get('session_bonus') and rp > 1:
+            rp -= 1
+        if s.get('zone_touches', 0) >= 2 and rp > 1:
+            rp -= 1
+        s['rank_priority'] = rp
+
+    setups.sort(key=lambda s: (s.get('rank_priority', s.get('priority', 99)), -s.get('rr_tp1', 0)))
 
 
 # ═══════════════════════════════════════════════════════════

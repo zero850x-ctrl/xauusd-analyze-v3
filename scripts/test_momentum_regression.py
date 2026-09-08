@@ -87,11 +87,24 @@ def test_momentum_not_worse_in_range():
     )
 
 
+def test_momentum_tp2_race_does_not_block_be_stop():
+    """Retired TP2 must not enter stop_first race after TP1 arms momentum-hold."""
+    bars = pd.DataFrame([
+        _bar(1, 4400, 4404, 4379, 4381),
+        _bar(2, 4381, 4410, 4355, 4405),
+    ])
+    sim = _run(bars, momentum=True)
+    assert sim["closed"], f"expected close, got {sim}"
+    assert sim["result"] in ("Trail", "SL"), sim["result"]
+    assert sim["pnl_r"] >= 0.3, f"BE floor should save tail, got {sim['pnl_r']}"
+
+
 if __name__ == "__main__":
     tests = [
         test_momentum_beats_fixed_in_trend,
         test_momentum_be_floor_on_reversal,
         test_momentum_not_worse_in_range,
+        test_momentum_tp2_race_does_not_block_be_stop,
     ]
     failed = 0
     for t in tests:
