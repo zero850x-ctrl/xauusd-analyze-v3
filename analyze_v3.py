@@ -2433,7 +2433,20 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
         # Limit modes with a machine entry_price may also be pushed so Hermes
         # can place a pending order — paper_trade still requires seedable.
         base = cron_push_eligible(s)
-        if s['seedable']:
+        # 2026-09-08 walk-forward review (claude-fable-5-1 + Cursor 3-model):
+        # limit-style entries have NO demonstrated edge — 2y walk-forward with
+        # limit-fill verification shows boundary 0-15% win (both segments
+        # negative R), pullback/fib have ~0 fills. Keep generating + recording
+        # so paper_trade accumulates real fill samples, but stop pushing them
+        # to the user. 3 months of data → decide deletion. Reversible.
+        if mode in ('boundary', 'pullback', 'fib', 'fib0786'):
+            s['cron_push_eligible'] = False
+            s['limit_mode_blocked'] = True
+            s['limit_mode_note'] = (
+                '🔒 限價模式經 walk-forward 證實無 edge（boundary 真 fill 後 0-15% '
+                '勝率, pullback/fib 近乎零成交）— 只記錄唔推送, 三個月後再裁決'
+            )
+        elif s['seedable']:
             s['cron_push_eligible'] = base
         elif mode in ('boundary', 'fib0786') and s.get('entry_price') is not None:
             s['cron_push_eligible'] = base

@@ -616,6 +616,71 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
 # MAIN BACKTEST LOOP
 # ═══════════════════════════════════════════════════════════
 
+def process_pending_orders(pending_orders, bar_idx, bar_high, bar_low,
+                           open_trades, closed_trades, verbose=False):
+    """Fill/expire pending limit orders against the current bar's range.
+
+    2026-09-08 Cursor review fix (a): when a limit order fills, the SAME bar's
+    range is immediately checked against the stop. The classic boundary death
+    is "touch the level then break straight through it" — before this fix that
+    case was counted as a safe entry and the stop only registered on a later
+    bar, inflating boundary results. Now a fill whose stop also trades on the
+    fill bar is closed instantly at the stop (conservative).
+
+    Returns the updated pending list.
+    """
+    still_pending = []
+    for pend_trade, placed_bar in pending_orders:
+        if pend_trade.side == 'BUY':
+            touched = bar_low <= pend_trade.entry_price
+            stop_touched = bar_low <= pend_trade.stop_price
+        else:
+            touched = bar_high >= pend_trade.entry_price
+            stop_touched = bar_high >= pend_trade.stop_price
+
+        if not touched:
+            if bar_idx - placed_bar >= LIMIT_ORDER_MAX_BARS:
+                if verbose:
+                    print(f"  [EXP]   {pend_trade.side} {pend_trade.pattern_type} "
+                          f"limit entry={pend_trade.entry_price:.0f} unfilled after "
+                          f"{LIMIT_ORDER_MAX_BARS} bars")
+            else:
+                still_pending.append((pend_trade, placed_bar))
+            continue
+
+        # Filled on this bar. Same-bar stop check: if the stop also traded
+        # within this bar's range, stop out immediately (touch-then-break).
+        if stop_touched:
+            # P0-style full close: ALL remaining portions exit at stop price
+            if pend_trade.side == 'BUY':
+                pend_trade.exit_price = pend_trade.stop_price - SLIPPAGE_TICKS
+                dx = pend_trade.exit_price - pend_trade.entry_price
+            else:
+                pend_trade.exit_price = pend_trade.stop_price + SLIPPAGE_TICKS
+                dx = pend_trade.entry_price - pend_trade.exit_price
+            if not pend_trade.tp1_hit:
+                pend_trade.pnl_tp1 = dx * pend_trade.position_size / 3 * CONTRACT_MULTIPLIER
+            if not pend_trade.tp2_hit:
+                pend_trade.pnl_tp2 = dx * pend_trade.position_size / 3 * CONTRACT_MULTIPLIER
+            pend_trade.pnl_tp3 = dx * (pend_trade.position_size / 3) * CONTRACT_MULTIPLIER
+            pend_trade.exit_date = pend_trade.entry_date
+            pend_trade.exit_reason = 'Stop loss (same bar as fill)'
+            pend_trade.closed = True
+            pend_trade.bars_held = 1
+            closed_trades.append(pend_trade)
+            if verbose:
+                print(f"  [FILL+STOP] {pend_trade.side} {pend_trade.pattern_type} "
+                      f"entry={pend_trade.entry_price:.0f} stop={pend_trade.stop_price:.0f} "
+                      f"same bar — closed at stop")
+        else:
+            open_trades.append(pend_trade)
+            if verbose:
+                print(f"  [FILL]  {pend_trade.side} {pend_trade.pattern_type} "
+                      f"limit entry={pend_trade.entry_price:.0f} stop={pend_trade.stop_price:.0f} "
+                      f"(bar {bar_idx}, placed {placed_bar})")
+    return still_pending
+
+
 def run_backtest(df_bars, df_day, verbose=False):
     """
     Walk through df_bars bar-by-bar. At each bar:
@@ -704,34 +769,19 @@ def run_backtest(df_bars, df_day, verbose=False):
         open_trades = still_open
 
         # ── 1b. Try to fill pending limit orders with this bar's range ──
-        still_pending = []
-        for pend_trade, placed_bar in pending_orders:
-            if pend_trade.side == 'BUY':
-                touched = bar_low <= pend_trade.entry_price
-            else:
-                touched = bar_high >= pend_trade.entry_price
-            if touched:
-                open_trades.append(pend_trade)
-                if verbose:
-                    print(f"  [FILL]  {pend_trade.side} {pend_trade.pattern_type} "
-                          f"limit entry={pend_trade.entry_price:.0f} stop={pend_trade.stop_price:.0f} "
-                          f"(bar {i}, placed {placed_bar})")
-            elif i - placed_bar >= LIMIT_ORDER_MAX_BARS:
-                if verbose:
-                    print(f"  [EXP]   {pend_trade.side} {pend_trade.pattern_type} "
-                          f"limit entry={pend_trade.entry_price:.0f} unfilled after "
-                          f"{LIMIT_ORDER_MAX_BARS} bars")
-            else:
-                still_pending.append((pend_trade, placed_bar))
-        pending_orders = still_pending
+        pending_orders = process_pending_orders(
+            pending_orders, i, bar_high, bar_low, open_trades,
+            closed_trades, verbose=verbose)
 
         # ── 2. Scan for new setups (if cooldown expired) ──
+        # NOTE (2026-09-08 Cursor review): pending limit orders do NOT block the
+        # scan. Live has no such restriction — a waiting limit order and a fresh
+        # breakout signal are independent. Only the cooldown window and an
+        # active (filled) position gate new entries.
         if i - last_trade_bar < TRADE_COOLDOWN:
             continue
         if open_trades:
             continue  # don't open new trades while one is active
-        if pending_orders:
-            continue  # one candidate at a time: waiting limit order blocks new scan
 
         # Find swing points on rolling window
         points = find_swings_ordered(window['High'].values, window['Low'].values, lookback=3)
