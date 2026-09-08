@@ -617,7 +617,8 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
 # ═══════════════════════════════════════════════════════════
 
 def process_pending_orders(pending_orders, bar_idx, bar_high, bar_low,
-                           open_trades, closed_trades, verbose=False):
+                           open_trades, closed_trades, verbose=False,
+                           last_trade_bar=None):
     """Fill/expire pending limit orders against the current bar's range.
 
     2026-09-08 Cursor review fix (a): when a limit order fills, the SAME bar's
@@ -627,8 +628,14 @@ def process_pending_orders(pending_orders, bar_idx, bar_high, bar_low,
     bar, inflating boundary results. Now a fill whose stop also trades on the
     fill bar is closed instantly at the stop (conservative).
 
-    Returns the updated pending list.
-    """
+    NOTE: intentionally asymmetric — only the STOP is checked on the fill bar,
+    NOT the TP levels. Rationale (2026-09-08, do not "fix" casually): the
+    dominant limit-mode death is touch-then-break, so the conservative side is
+    to assume the stop gets hit first intrabar when both trade. Checking TP on
+    the same bar would assume price ran straight to profit, which for a level
+    that just got crossed is the optimistic case. Backtest stays conservative.
+
+    Returns (updated_pending, last_trade_bar)."""
     still_pending = []
     for pend_trade, placed_bar in pending_orders:
         if pend_trade.side == 'BUY':
@@ -668,17 +675,21 @@ def process_pending_orders(pending_orders, bar_idx, bar_high, bar_low,
             pend_trade.closed = True
             pend_trade.bars_held = 1
             closed_trades.append(pend_trade)
+            if last_trade_bar is not None:
+                last_trade_bar = bar_idx
             if verbose:
                 print(f"  [FILL+STOP] {pend_trade.side} {pend_trade.pattern_type} "
                       f"entry={pend_trade.entry_price:.0f} stop={pend_trade.stop_price:.0f} "
                       f"same bar — closed at stop")
         else:
             open_trades.append(pend_trade)
+            if last_trade_bar is not None:
+                last_trade_bar = bar_idx
             if verbose:
                 print(f"  [FILL]  {pend_trade.side} {pend_trade.pattern_type} "
                       f"limit entry={pend_trade.entry_price:.0f} stop={pend_trade.stop_price:.0f} "
                       f"(bar {bar_idx}, placed {placed_bar})")
-    return still_pending
+    return still_pending, last_trade_bar
 
 
 def run_backtest(df_bars, df_day, verbose=False):
@@ -769,9 +780,9 @@ def run_backtest(df_bars, df_day, verbose=False):
         open_trades = still_open
 
         # ── 1b. Try to fill pending limit orders with this bar's range ──
-        pending_orders = process_pending_orders(
+        pending_orders, last_trade_bar = process_pending_orders(
             pending_orders, i, bar_high, bar_low, open_trades,
-            closed_trades, verbose=verbose)
+            closed_trades, verbose=verbose, last_trade_bar=last_trade_bar)
 
         # ── 2. Scan for new setups (if cooldown expired) ──
         # NOTE (2026-09-08 Cursor review): pending limit orders do NOT block the

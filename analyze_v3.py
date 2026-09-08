@@ -2436,19 +2436,32 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
         # 2026-09-08 walk-forward review (claude-fable-5-1 + Cursor 3-model):
         # limit-style entries have NO demonstrated edge — 2y walk-forward with
         # limit-fill verification shows boundary 0-15% win (both segments
-        # negative R), pullback/fib have ~0 fills. Keep generating + recording
-        # so paper_trade accumulates real fill samples, but stop pushing them
-        # to the user. 3 months of data → decide deletion. Reversible.
-        if mode in ('boundary', 'pullback', 'fib', 'fib0786'):
-            s['cron_push_eligible'] = False
+        # negative R), pullback/fib have ~0 fills.
+        #
+        # DESIGN (Cursor review round 2): cron_push_eligible keeps its meaning
+        # "executable by paper_trade" — it stays the discipline gate, so limit
+        # modes ARE still seeded and recorded (paper_trade accumulates real
+        # fill samples for the 3-month verdict). The PUSH layer reads the
+        # separate push_suppressed flag instead. Env LIMIT_MODE_PUSH=1
+        # restores pushing without a git revert.
+        suppress_push = mode in ('boundary', 'pullback', 'fib', 'fib0786')
+        if os.environ.get('LIMIT_MODE_PUSH') == '1':
+            suppress_push = False
+        if suppress_push:
+            s['push_suppressed'] = True
             s['limit_mode_blocked'] = True
             s['limit_mode_note'] = (
                 '🔒 限價模式經 walk-forward 證實無 edge（boundary 真 fill 後 0-15% '
-                '勝率, pullback/fib 近乎零成交）— 只記錄唔推送, 三個月後再裁決'
+                '勝率, pullback/fib 近乎零成交）— paper 照記錄, 唔推送; '
+                '三個月後再裁決 (LIMIT_MODE_PUSH=1 可恢復)'
             )
-        elif s['seedable']:
+        else:
+            s['push_suppressed'] = False
+        # cron_push_eligible = discipline gate for paper_trade (executable).
+        # seedable or limit-mode-with-levels passes; everything else False.
+        if s['seedable']:
             s['cron_push_eligible'] = base
-        elif mode in ('boundary', 'fib0786') and s.get('entry_price') is not None:
+        elif mode in ('boundary', 'pullback', 'fib', 'fib0786') and s.get('entry_price') is not None:
             s['cron_push_eligible'] = base
         else:
             s['cron_push_eligible'] = False

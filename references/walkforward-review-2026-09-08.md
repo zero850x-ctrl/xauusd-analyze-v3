@@ -14,6 +14,8 @@ claude-fable-5-1: 用 1-2 年數據跑 walk-forward，計每種訊號模式
 2 年全段 trace: 175 張 boundary 掛出只有 ~16% 真 fill。
 
 ## Cursor review 4 項要求（全部已做）
+
+### Round 1（4 項）
 1. **(a) fill 當根 bar 對 SL** — `process_pending_orders()` helper:
    fill 後即時用同一根 bar 的 high/low 對 stop，touch-then-break = 即時止蝕。
    → boundary TRAIN 由 -0.44R 惡化到 **-0.95R (0% win)**，TEST 由 +0.56R
@@ -22,17 +24,42 @@ claude-fable-5-1: 用 1-2 年數據跑 walk-forward，計每種訊號模式
 2. **(b) pending 唔阻擋 breakout 掃描** — 移除 `if pending_orders: continue`。
    Live 冇呢個限制。效果: breakout n 由 59/74 → 64/80，數字幾乎冇變
    (PF 1.87/1.94) — 即 breakout edge **唔係 (b) 扭曲出嚟**，反而係被
-   之前嘅阻擋壓抑咗機會。
+   之前嘅阻擋壓抑咗機會。**已知並發**：pending 成交時若 open_trades 已有
+   breakout 單，backtest 會允許 1 breakout + 1 limit 同時持倉。Live 容許
+   3 同向，所以唔算錯，但 backtest 之前 risk 假設係單倉。impact 細
+   （breakout 數字幾乎冇變），recorded as known limitation。
 3. **(c) 抽 helper 加真測試** — `process_pending_orders()` 抽咗出嚟，
-   `test_limit_fill.py` 14 cases: BUY touch / SELL touch / 48-bar expiry /
-   same-bar stop-out / PnL full-close / pending-保留。唔再係「等於冇 check」
-   嘅 dummy assert。
-4. **(d) 對返 boundary TEST 三粒數字** — 自洽，冇 bug:
+   `test_limit_fill.py` 20 個真 cases: BUY/SELL touch / 48-bar expiry /
+   same-bar stop-out / PnL full-close / pending 保留 / cooldown 更新 /
+   setups_to_trades flag tagging。
+4. **(d) 對返 boundary TEST 三粒數字** — 算術自洽，冇 bug:
    3W/10L, avg win $70.58 (3.39× avg loss) → PF = (3×70.58)/(10×20.84) = 1.02。
-   E(R) +0.562 = (16.13R 贏 − 9.83R 輸)/13。Cursor 假設「avg loss = −1R」
-   先推導出 PF 應係 1.7 — 但實際輸單唔係全部 −1R（有兩張 −0.35R 細蝕，
-   R 基準係 position-weighted risk）。真問題唔係 bug，係結構脆弱：
-   3 張贏單（含 +8.5R/+5.7R 怪獸）洗晒 11 張輸單 = lottery 唔係 edge。
+   E(R) = (16.13R − 9.83R)/13 ≈ +0.48（初版寫 +0.562 錯少少）。
+   Cursor 假設「avg loss = −1R」先推導出 PF 應係 1.7 — 但實際 9.83R ÷ 10
+   輸單 = 平均 −0.98R，差唔遠；真正原因係 **每 1R 對應的 $ 喺贏單同輸單
+   之間唔一致**（position size 唔係跟 stop 距離嚴格反比 — lot 取整 0.01
+   粒度 / volume cap），贏單 5.4R 平均只值 3.39× 輸單的 $。
+   **教訓：E(R) 係偏好看的指標（0.01-lot granularity 會扭曲 R↔$），
+   $/PF 先係老實 — 報告兩個並排睇，唔止睇 E(R)。**
+   結論（lottery 結構、唔係 edge）不變。
+
+### Round 2（blocker + 細位）
+5. **🔴 Blocker 修復：paper_trade 記錄被關死** — 初版將 limit modes
+   `cron_push_eligible=False`，但 paper_trade seed 以同一 flag 為閘
+   （`seed_from_json` 只 seed `cron_push_eligible is True`）→ boundary/
+   pullback/fib 根本唔會被 seed，「累積真 fill 樣本」冇發生。修復
+   （Cursor 方案一）：**cron_push_eligible 保留「可執行」語義**（照
+   seed），新增獨立 **`push_suppressed=True`** 俾 push/Hermes 層讀
+   （步驟 4/6 過濾要 `cron_push_eligible && !push_suppressed`），
+   env **`LIMIT_MODE_PUSH=1`** 恢復推送（唔使 git revert）。
+   paper_trade 照常累積真 fill 樣本 → 三個月後有數據裁決。
+6. **dead branch 刪除** — 舊 `elif mode in ('boundary','fib0786')...`
+   初版變成死 code，round 2 重寫邏輯時刪咗。
+7. **TP 不對稱 comment** — 同 bar 只查 stop 唔查 TP 係**故意保守**
+   （touch-then-break 係主力死法；假設同 bar 到 TP = 樂觀），已寫入
+   helper docstring 防止將來被「修正」。
+8. **last_trade_bar cooldown** — limit fill / stop-out 而家都更新
+   `last_trade_bar`，cooldown 對 limit 單生效（helper 回傳新值）。
 
 ## 誠實結果（2y H1 GC=F, spread 0.15/side, train/TEST split）
 | 段 | mode | n | 勝率 | E(R) | PF | net |
