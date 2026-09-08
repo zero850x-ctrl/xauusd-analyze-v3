@@ -400,13 +400,16 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
         traded_min_low = low if traded_min_low is None else min(traded_min_low, low)
         eff_stop = _effective_stop(stop, trail_stop, trail_active, is_sell)
 
+        tp_levels = [(tp1_hit, tp1)]
+        if not (momentum_hold and tp1_hit):
+            tp_levels.append((tp2_hit, tp2))
         if is_sell:
             stop_in = high >= eff_stop
-            tp_dists = [abs(lvl - bar_open) for hit, lvl in ((tp1_hit, tp1), (tp2_hit, tp2))
+            tp_dists = [abs(lvl - bar_open) for hit, lvl in tp_levels
                         if not hit and lvl > 0 and low <= lvl]
         else:
             stop_in = low <= eff_stop
-            tp_dists = [abs(lvl - bar_open) for hit, lvl in ((tp1_hit, tp1), (tp2_hit, tp2))
+            tp_dists = [abs(lvl - bar_open) for hit, lvl in tp_levels
                         if not hit and lvl > 0 and high >= lvl]
         stop_first = bool(stop_in and (not tp_dists or abs(eff_stop - bar_open) <= min(tp_dists)))
 
@@ -748,19 +751,17 @@ def _consecutive_losses(log):
     跨日唔算（之前嘅 bug：數晒成個 history，隔咗成星期嘅舊虧損會
     永久鎖死 anti-martingale，連敗永遠斷唔到 → 死鎖）。
     """
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     count = 0
-    last_loss_day = None
     for t in reversed(log.get("history", [])):
         if not _counts_toward_r(t):
             continue
         r = t.get("pnl_r", 0)
         if r < 0:
-            # 呢個係虧損單 — 如果佢同前一個虧損單唔同 UTC 日，就唔算連續
             closed = t.get("closed_time") or t.get("seeded_time") or ""
             day = closed[:10] if closed else None
-            if last_loss_day is not None and day != last_loss_day:
+            if day != today:
                 break
-            last_loss_day = day
             count += 1
         else:
             break
