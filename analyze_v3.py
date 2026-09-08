@@ -2433,6 +2433,38 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
         # Limit modes with a machine entry_price may also be pushed so Hermes
         # can place a pending order — paper_trade still requires seedable.
         base = cron_push_eligible(s)
+        # 2026-09-08 walk-forward review (claude-fable-5-1 + Cursor 3-model):
+        # limit-style entries have NO demonstrated edge — 2y walk-forward with
+        # limit-fill verification shows boundary 0-15% win (both segments
+        # negative R), pullback/fib have ~0 fills.
+        #
+        # DESIGN (Cursor review round 2): cron_push_eligible keeps its meaning
+        # "executable by paper_trade" — it stays the discipline gate, so limit
+        # modes ARE still seeded and recorded (paper_trade accumulates real
+        # fill samples for the 3-month verdict). The PUSH layer reads the
+        # separate push_suppressed flag instead. Env LIMIT_MODE_PUSH=1
+        # restores pushing without a git revert.
+        suppress_push = mode in ('boundary', 'pullback', 'fib', 'fib0786')
+        if os.environ.get('LIMIT_MODE_PUSH') == '1':
+            suppress_push = False
+        if suppress_push:
+            s['push_suppressed'] = True
+            s['limit_mode_blocked'] = True
+            s['limit_mode_note'] = (
+                '🔒 限價模式經 walk-forward 證實無 edge（boundary 真 fill 後 0-15% '
+                '勝率, pullback/fib 近乎零成交）— paper 照記錄, 唔推送; '
+                '三個月後再裁決 (LIMIT_MODE_PUSH=1 可恢復)'
+            )
+        else:
+            s['push_suppressed'] = False
+        # cron_push_eligible = discipline gate for paper_trade (executable).
+        # seedable or limit-mode-with-levels passes; everything else False.
+        # NOTE (Cursor round-2): keep this exactly on ('boundary','fib0786') as
+        # in main — widening to all 4 limit modes would make untriggered
+        # pullback/fib eligible once LIMIT_MODE_PUSH=1, which main never did.
+        # push_suppressed still covers all 4 modes, so the suppression layer
+        # is unaffected; this guard only limits what an explicit re-enable
+        # (LIMIT_MODE_PUSH=1) can surface.
         if s['seedable']:
             s['cron_push_eligible'] = base
         elif mode in ('boundary', 'fib0786') and s.get('entry_price') is not None:
@@ -4613,6 +4645,14 @@ def main():
             'candlestick_m30': candle_m30,
             'candlestick_daily': candle_day,
             'setups': setups,
+            # 2026-09-08 (Cursor round-2 follow-up): code-level push list so the
+            # cron prompt doesn't have to re-derive push eligibility by reading
+            # flags via natural language. Prompt reads ONLY this list.
+            'push_candidates': [
+                s for s in setups
+                if s.get('cron_push_eligible') is True
+                and s.get('push_suppressed') is not True
+            ],
         }
         json_path = output_path.replace('.md', '.json')
         with open(json_path, 'w', encoding='utf-8') as f:

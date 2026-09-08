@@ -189,13 +189,18 @@ CONTRACT_MULTIPLIER = 100  # $ per $1 move per 1.0 lot
 # P2 FIX: slippage & commission model for realistic backtest results
 SLIPPAGE_TICKS = 0.15  # $0.15 per side — gold bid-ask spread
 COMMISSION_PER_TRADE = 0.0  # $0 commission (broker uses spread only)
+# 2026-09-08 walk-forward review: limit-style entries (boundary/pullback/fib/
+# fib0786) must trade at their level before being counted. An order that never
+# fills (price never returns to the level) expires after this many bars.
+LIMIT_ORDER_MAX_BARS = 48  # 48 H1 bars = 2 days; 48 M30 bars = 1 day
 
 
 class Trade:
     """Represents a single trade with 3 TP levels."""
     def __init__(self, bar_idx, entry_date, side, pattern_type, entry_price,
                  stop_price, tp1_price, tp2_price, atr, position_size,
-                 daily_aligned, confidence, tp1_method):
+                 daily_aligned, confidence, tp1_method, entry_mode='breakout',
+                 limit_order=False):
         self.bar_idx = bar_idx
         self.entry_date = entry_date
         self.side = side  # 'BUY' or 'SELL'
@@ -209,6 +214,8 @@ class Trade:
         self.daily_aligned = daily_aligned
         self.confidence = confidence
         self.tp1_method = tp1_method
+        self.entry_mode = entry_mode
+        self.limit_order = limit_order
 
         # State: 3 portions of 1/3 each
         self.tp1_hit = False
@@ -508,11 +515,18 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
 
         entry_str = s.get('entry_trigger', '')
         already_broken = '已' in entry_str
+        # 2026-09-08 walk-forward review (claude-fable-5-1): limit-style
+        # entries (boundary/pullback/fib/fib0786) were treated as instantly
+        # filled at their level even when price never traded there — that
+        # inflated win rate/PF (boundary showed 92%/PF 143). Now they become
+        # pending limit orders; run_backtest fills them only when a later bar's
+        # range actually touches the entry level (see _LIMIT_FILL check).
+        is_limit_mode = entry_mode in ('boundary', 'pullback', 'fib', 'fib0786')
         if not already_broken:
             if s.get('seedable') or s.get('triggered'):
                 already_broken = True
-            elif entry_mode in ('boundary', 'fib0786'):
-                already_broken = True
+            elif is_limit_mode:
+                already_broken = True  # pending order — needs bar-touch to fill
             else:
                 continue
 
@@ -590,6 +604,8 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
             daily_aligned=aligned,
             confidence=confidence,
             tp1_method=tp1_method,
+            entry_mode=s.get('entry_mode', 'breakout'),
+            limit_order=is_limit_mode,
         )
         trades.append(trade)
 
@@ -599,6 +615,82 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
 # ═══════════════════════════════════════════════════════════
 # MAIN BACKTEST LOOP
 # ═══════════════════════════════════════════════════════════
+
+def process_pending_orders(pending_orders, bar_idx, bar_high, bar_low,
+                           open_trades, closed_trades, verbose=False,
+                           last_trade_bar=None):
+    """Fill/expire pending limit orders against the current bar's range.
+
+    2026-09-08 Cursor review fix (a): when a limit order fills, the SAME bar's
+    range is immediately checked against the stop. The classic boundary death
+    is "touch the level then break straight through it" — before this fix that
+    case was counted as a safe entry and the stop only registered on a later
+    bar, inflating boundary results. Now a fill whose stop also trades on the
+    fill bar is closed instantly at the stop (conservative).
+
+    NOTE: intentionally asymmetric — only the STOP is checked on the fill bar,
+    NOT the TP levels. Rationale (2026-09-08, do not "fix" casually): the
+    dominant limit-mode death is touch-then-break, so the conservative side is
+    to assume the stop gets hit first intrabar when both trade. Checking TP on
+    the same bar would assume price ran straight to profit, which for a level
+    that just got crossed is the optimistic case. Backtest stays conservative.
+
+    Returns (updated_pending, last_trade_bar)."""
+    still_pending = []
+    for pend_trade, placed_bar in pending_orders:
+        if pend_trade.side == 'BUY':
+            touched = bar_low <= pend_trade.entry_price
+            stop_touched = bar_low <= pend_trade.stop_price
+        else:
+            touched = bar_high >= pend_trade.entry_price
+            stop_touched = bar_high >= pend_trade.stop_price
+
+        if not touched:
+            if bar_idx - placed_bar >= LIMIT_ORDER_MAX_BARS:
+                if verbose:
+                    print(f"  [EXP]   {pend_trade.side} {pend_trade.pattern_type} "
+                          f"limit entry={pend_trade.entry_price:.0f} unfilled after "
+                          f"{LIMIT_ORDER_MAX_BARS} bars")
+            else:
+                still_pending.append((pend_trade, placed_bar))
+            continue
+
+        # Filled on this bar. Same-bar stop check: if the stop also traded
+        # within this bar's range, stop out immediately (touch-then-break).
+        if stop_touched:
+            # P0-style full close: ALL remaining portions exit at stop price
+            if pend_trade.side == 'BUY':
+                pend_trade.exit_price = pend_trade.stop_price - SLIPPAGE_TICKS
+                dx = pend_trade.exit_price - pend_trade.entry_price
+            else:
+                pend_trade.exit_price = pend_trade.stop_price + SLIPPAGE_TICKS
+                dx = pend_trade.entry_price - pend_trade.exit_price
+            if not pend_trade.tp1_hit:
+                pend_trade.pnl_tp1 = dx * pend_trade.position_size / 3 * CONTRACT_MULTIPLIER
+            if not pend_trade.tp2_hit:
+                pend_trade.pnl_tp2 = dx * pend_trade.position_size / 3 * CONTRACT_MULTIPLIER
+            pend_trade.pnl_tp3 = dx * (pend_trade.position_size / 3) * CONTRACT_MULTIPLIER
+            pend_trade.exit_date = pend_trade.entry_date
+            pend_trade.exit_reason = 'Stop loss (same bar as fill)'
+            pend_trade.closed = True
+            pend_trade.bars_held = 1
+            closed_trades.append(pend_trade)
+            if last_trade_bar is not None:
+                last_trade_bar = bar_idx
+            if verbose:
+                print(f"  [FILL+STOP] {pend_trade.side} {pend_trade.pattern_type} "
+                      f"entry={pend_trade.entry_price:.0f} stop={pend_trade.stop_price:.0f} "
+                      f"same bar — closed at stop")
+        else:
+            open_trades.append(pend_trade)
+            if last_trade_bar is not None:
+                last_trade_bar = bar_idx
+            if verbose:
+                print(f"  [FILL]  {pend_trade.side} {pend_trade.pattern_type} "
+                      f"limit entry={pend_trade.entry_price:.0f} stop={pend_trade.stop_price:.0f} "
+                      f"(bar {bar_idx}, placed {placed_bar})")
+    return still_pending, last_trade_bar
+
 
 def run_backtest(df_bars, df_day, verbose=False):
     """
@@ -615,6 +707,7 @@ def run_backtest(df_bars, df_day, verbose=False):
     total_bars = len(df_bars)
     closed_trades = []
     open_trades = []
+    pending_orders = []  # (trade, placed_bar_idx) — limit orders awaiting fill
     last_trade_bar = -TRADE_COOLDOWN  # cooldown tracker
 
     # Pre-compute daily trend for each bar date (use closest daily bar)
@@ -686,7 +779,16 @@ def run_backtest(df_bars, df_day, verbose=False):
                 still_open.append(trade)
         open_trades = still_open
 
+        # ── 1b. Try to fill pending limit orders with this bar's range ──
+        pending_orders, last_trade_bar = process_pending_orders(
+            pending_orders, i, bar_high, bar_low, open_trades,
+            closed_trades, verbose=verbose, last_trade_bar=last_trade_bar)
+
         # ── 2. Scan for new setups (if cooldown expired) ──
+        # NOTE (2026-09-08 Cursor review): pending limit orders do NOT block the
+        # scan. Live has no such restriction — a waiting limit order and a fresh
+        # breakout signal are independent. Only the cooldown window and an
+        # active (filled) position gate new entries.
         if i - last_trade_bar < TRADE_COOLDOWN:
             continue
         if open_trades:
@@ -754,13 +856,23 @@ def run_backtest(df_bars, df_day, verbose=False):
         if new_trades:
             # Take only the highest-priority trade (first in sorted setups)
             best = new_trades[0]
-            open_trades.append(best)
-            last_trade_bar = i
-            if verbose:
-                print(f"  [OPEN]  {best.side} {best.pattern_type} "
-                      f"entry={best.entry_price:.0f} stop={best.stop_price:.0f} "
-                      f"tp1={best.tp1_price:.0f} tp2={best.tp2_price:.0f} "
-                      f"pos={best.position_size} aligned={best.daily_aligned}")
+            if best.limit_order:
+                # Limit order: waits for a bar to trade at entry level.
+                # Skip if a same-direction limit order is already pending.
+                if not any(p.side == best.side for p, _ in pending_orders):
+                    pending_orders.append((best, i))
+                    if verbose:
+                        print(f"  [PEND]  {best.side} {best.pattern_type} "
+                              f"limit entry={best.entry_price:.0f} stop={best.stop_price:.0f} "
+                              f"tp1={best.tp1_price:.0f}")
+            else:
+                open_trades.append(best)
+                last_trade_bar = i
+                if verbose:
+                    print(f"  [OPEN]  {best.side} {best.pattern_type} "
+                          f"entry={best.entry_price:.0f} stop={best.stop_price:.0f} "
+                          f"tp1={best.tp1_price:.0f} tp2={best.tp2_price:.0f} "
+                          f"pos={best.position_size} aligned={best.daily_aligned}")
 
     # Close any remaining open trades at last bar
     last_close = float(df_bars['Close'].iloc[-1])
