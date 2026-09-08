@@ -81,10 +81,10 @@ check("stop-out 都更新 last_trade_bar", ltb == 11, f"ltb={ltb}")
 print("== 5. 未 touch → pending 保留 (scan 由 run_backtest 控制) ==")
 t5 = mk_trade("BUY", entry=4000, stop=3990)
 open_t, closed = [], []
-left, _ = process_pending_orders([(t5, 10)], bar_idx=11, bar_high=4002, bar_low=4001,  # low 4001 > entry 4000 → 唔 touch
-                                 open_trades=open_t, closed_trades=closed)
+left, ltb = process_pending_orders([(t5, 10)], bar_idx=11, bar_high=4002, bar_low=4001,  # low 4001 > entry 4000 → 唔 touch
+                                   open_trades=open_t, closed_trades=closed, last_trade_bar=42)
 check("未 touch → pending 保留", len(left) == 1 and len(open_t) == 0 and closed == [])
-check("未 touch → last_trade_bar 唔郁", True)
+check("未 touch → last_trade_bar 唔郁 (保持 42)", ltb == 42, f"ltb={ltb}")
 
 print("== 6. setups_to_trades 打 flag (boundary → limit_order) ==")
 setups = [{

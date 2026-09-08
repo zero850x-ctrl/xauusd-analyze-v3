@@ -2459,9 +2459,15 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
             s['push_suppressed'] = False
         # cron_push_eligible = discipline gate for paper_trade (executable).
         # seedable or limit-mode-with-levels passes; everything else False.
+        # NOTE (Cursor round-2): keep this exactly on ('boundary','fib0786') as
+        # in main — widening to all 4 limit modes would make untriggered
+        # pullback/fib eligible once LIMIT_MODE_PUSH=1, which main never did.
+        # push_suppressed still covers all 4 modes, so the suppression layer
+        # is unaffected; this guard only limits what an explicit re-enable
+        # (LIMIT_MODE_PUSH=1) can surface.
         if s['seedable']:
             s['cron_push_eligible'] = base
-        elif mode in ('boundary', 'pullback', 'fib', 'fib0786') and s.get('entry_price') is not None:
+        elif mode in ('boundary', 'fib0786') and s.get('entry_price') is not None:
             s['cron_push_eligible'] = base
         else:
             s['cron_push_eligible'] = False
@@ -4639,6 +4645,14 @@ def main():
             'candlestick_m30': candle_m30,
             'candlestick_daily': candle_day,
             'setups': setups,
+            # 2026-09-08 (Cursor round-2 follow-up): code-level push list so the
+            # cron prompt doesn't have to re-derive push eligibility by reading
+            # flags via natural language. Prompt reads ONLY this list.
+            'push_candidates': [
+                s for s in setups
+                if s.get('cron_push_eligible') is True
+                and s.get('push_suppressed') is not True
+            ],
         }
         json_path = output_path.replace('.md', '.json')
         with open(json_path, 'w', encoding='utf-8') as f:
