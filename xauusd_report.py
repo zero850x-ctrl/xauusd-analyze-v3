@@ -226,6 +226,7 @@ def main():
     ap.add_argument("--json", default=None, help="analyze report JSON 路徑")
     ap.add_argument("--no-dedup", action="store_true", help="跳過去重")
     ap.add_argument("--skip-paper", action="store_true", help="唔讀 paper 狀態")
+    ap.add_argument("--no-send", action="store_true", help="唔 call wa_conditional_push.sh（測試用）")
     args = ap.parse_args()
 
     json_path = args.json or os.path.join(REPORT_DIR, f"xauusd_v3_{datetime.now(HKT).strftime('%Y-%m-%d')}.json")
@@ -270,11 +271,21 @@ def main():
         out.append(build_status(data, gc_note, dedup_note))
         record_push(data, candidates)
         # 寫 /tmp/wa_push.txt — wa_conditional_push.sh 會 check push_candidates 先 send
+        body = "\n".join(out)
         try:
             with open("/tmp/wa_push.txt", "w") as f:
-                f.write("\n".join(out))
+                f.write(body)
         except OSError:
             pass
+        # 格式 A → 自動 call 硬閘（code 層推送，唔經 LLM 判斷）
+        if not args.no_send:
+            import subprocess
+            try:
+                subprocess.run(
+                    ["bash", os.path.expanduser("~/.hermes/scripts/wa_conditional_push.sh"), body],
+                    capture_output=True, text=True, timeout=60)
+            except Exception:
+                pass
     else:
         out.append("⏳ 無符合推送條件的高質量信號")
         if candidates == [] and not gc_note and not dups:
