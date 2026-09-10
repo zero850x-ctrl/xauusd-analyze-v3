@@ -98,10 +98,23 @@ def paper_stats():
         pat = (t.get("pattern") or "").replace("🚩 ", "").replace("🔺 ", "").replace("🔻 ", "")
         lines.append(f"{emoji} {pat} {label} {'+' if pnl >= 0 else ''}{round(pnl, 2)}R")
 
+    # LIVE 明細行：🔴/🟢 [形態] [方向] @ entry (SL/TP1) float
+    live_lines = []
+    for t in live:
+        pat = (t.get("pattern") or "").replace("🚩 ", "").replace("🔺 ", "").replace("🔻 ", "")
+        emoji = "🟢" if "BUY" in str(t.get("direction", "")).upper() else "🔴"
+        fp = t.get("floating_pnl")
+        fp_txt = f" float {'+' if fp is not None and fp >= 0 else ''}{fp:.2f}" if fp is not None else ""
+        live_lines.append(
+            f"{emoji} {pat} {t.get('direction')} @ {t.get('entry')} "
+            f"(SL {t.get('stop_loss')} / TP1 {t.get('tp1')}){fp_txt}"
+        )
+
     open_live = len(live)
     return {
         "n": n, "wins": wins, "losses": losses, "win_pct": win_pct,
-        "sum_r": sum_r, "today_r": today_r, "lines": lines, "open_live": open_live,
+        "sum_r": sum_r, "today_r": today_r, "lines": lines,
+        "open_live": open_live, "live_lines": live_lines,
     }
 
 
@@ -219,6 +232,9 @@ def build_status(data, gc_note=None, dedup_note=None):
     if paper["open_live"]:
         pt += f" | {paper['open_live']} LIVE"
     lines.append(pt)
+    # LIVE 明細行（每倉一行）—— 2026-09-10 用戶要求：淨睇數字唔知個倉係咩
+    for ll in paper["live_lines"]:
+        lines.append(f"  {ll}")
     # 馬丁
     if mart:
         lines.append(f"📋 馬丁: {mart['n']}筆已平倉 ({mart['wins']}W/{mart['losses']}L, "
