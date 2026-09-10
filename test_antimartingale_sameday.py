@@ -14,19 +14,31 @@ except Exception:
 
 import paper_trade as pt
 
-TODAY = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-YDAY = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
-DAY2 = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
+# 2026-09-11: the trade day is HKT everywhere (see paper_trade.HKT), so the
+# fixtures are built from HKT days and converted to UTC ISO strings. Using a
+# plain `f"{hkt_day}T10:00:00Z"` would land *after* the current instant whenever
+# the suite runs before 18:00 HKT, which trips the cooldown guard.
+_HKT = timezone(timedelta(hours=8))
+TODAY = datetime.now(_HKT).strftime("%Y-%m-%d")
+YDAY = (datetime.now(_HKT) - timedelta(days=1)).strftime("%Y-%m-%d")
+DAY2 = (datetime.now(_HKT) - timedelta(days=2)).strftime("%Y-%m-%d")
+
+
+def _utc_iso(hkt_day, hour=0, minute=5):
+    """UTC ISO ('...Z') for `hour:minute` HKT on `hkt_day`."""
+    d = datetime.strptime(hkt_day, "%Y-%m-%d").replace(
+        tzinfo=_HKT, hour=hour, minute=minute, second=0, microsecond=0)
+    return d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def mk_loss(day, pnl=-1.0):
-    return {"status": "CLOSED", "pnl_r": pnl, "closed_time": f"{day}T10:00:00Z",
-            "seeded_time": f"{day}T09:00:00Z", "verified": True}
+    return {"status": "CLOSED", "pnl_r": pnl, "closed_time": _utc_iso(day),
+            "seeded_time": _utc_iso(day), "verified": True}
 
 
 def mk_win(day, pnl=0.5):
-    return {"status": "CLOSED", "pnl_r": pnl, "closed_time": f"{day}T10:00:00Z",
-            "seeded_time": f"{day}T09:00:00Z", "verified": True}
+    return {"status": "CLOSED", "pnl_r": pnl, "closed_time": _utc_iso(day),
+            "seeded_time": _utc_iso(day), "verified": True}
 
 
 cases = []

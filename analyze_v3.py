@@ -2669,6 +2669,7 @@ def _counter_trend_note(side, daily_trend, h1_trend, prefix=''):
 
 # Broker timezone offset from UTC (hours). Override via BROKER_UTC_OFFSET_HOURS env.
 BROKER_UTC_OFFSET_HOURS = int(os.environ.get('BROKER_UTC_OFFSET_HOURS', '-3'))
+HKT_LOCAL = timezone(timedelta(hours=8))  # trade-day timezone (cron window)
 
 # 2026-09-04 post-spike chase gate (mentor 9/1-9/4, 132 trades):
 #   - 9/4: 金價 13:00-13:37 急插 4470→4375 (≈9.5 ATR) 後 2 小時內追沽 6 筆全滅
@@ -4024,7 +4025,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
     candle_day = candle_day or []
 
     current = float(df_m30['Close'].iloc[-1])
-    today = report_date or datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    today = report_date or datetime.now(HKT_LOCAL).strftime('%Y-%m-%d')
     
     # Indicators
     atr_m30 = _last_valid_float(df_m30['ATR'], 'M30 ATR')
@@ -4577,7 +4578,12 @@ def main():
              f"(> {SPIKE_ATR_MULT}×ATR) — blocking {'SELL' if spike_state['direction']=='down' else 'BUY'} pushes")
     
     utc_now = datetime.now(timezone.utc)
-    today = utc_now.strftime('%Y-%m-%d')
+    # 2026-09-11: trade day = HKT, matching the cron --output filename
+    # (`xauusd_v3_$(date +%Y-%m-%d).json`) and the 07:00-23:59 HKT schedule.
+    # While this was UTC, the JSON 'date' disagreed with its own filename
+    # between 00:00-07:59 HKT, so paper_trade's same-day dedupe treated a new
+    # 07:00 setup as a duplicate of the previous evening's entry.
+    today = datetime.now(HKT_LOCAL).strftime('%Y-%m-%d')
     broker_dt = utc_now + timedelta(hours=BROKER_UTC_OFFSET_HOURS)
     broker_date = broker_dt.strftime('%Y-%m-%d')
 

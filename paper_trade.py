@@ -27,8 +27,8 @@ Usage:
   python3 paper_trade.py --seed-only        # Only seed new paper trades from latest JSON
 """
 
-import json, os, sys, argparse, tempfile, copy, math
-from datetime import datetime, timezone
+import json, os, sys, argparse, tempfile, copy, math, glob
+from datetime import datetime, timezone, timedelta
 
 # Match backtest.py's adverse execution model.
 SLIPPAGE_TICKS = 0.15
@@ -48,9 +48,23 @@ LOG_PATH = os.path.expanduser("~/.hermes/reports/paper_trade_log.json")
 
 
 def _json_path():
-    """Analyze JSON path for UTC today (matches analyze_v3 report filename)."""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return os.path.expanduser(f"~/.hermes/reports/xauusd_v3_{today}.json")
+    """Analyze JSON path for *local* (HKT) today.
+
+    2026-09-11 fix: analyze_v3.py is invoked as
+    `--output ~/.hermes/reports/xauusd_v3_$(date +%Y-%m-%d).json`, i.e. the
+    LOCAL date. This function used the UTC date, so every cron run between
+    HKT 00:00-08:00 (UTC 16:00-24:00 of the *previous* day) loaded yesterday's
+    file — no eligible setups, nothing seeded, stale outcomes checked.
+    Observed: the 09-11 07:00 Double Top SELL was never paper-seeded.
+    """
+    local = os.path.expanduser(
+        f"~/.hermes/reports/xauusd_v3_{datetime.now().strftime('%Y-%m-%d')}.json")
+    if os.path.exists(local):
+        return local
+    # fallback: newest analyze JSON (covers weekend stubs / symlink gaps)
+    cands = sorted(glob.glob(os.path.expanduser("~/.hermes/reports/xauusd_v3_*.json")),
+                   key=os.path.getmtime, reverse=True)
+    return cands[0] if cands else local
 
 
 JSON_PATH = _json_path()  # resolved at import; main() re-resolves via _json_path()
@@ -199,10 +213,31 @@ def _calendar_date(val):
     return s
 
 
+HKT = timezone(timedelta(hours=8))
+
+
+def _hkt_day(ts):
+    """Trade-day (HKT) for an ISO timestamp written as UTC ('...Z' / '+00:00')."""
+    if not ts:
+        return None
+    try:
+        return (datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")
+                .replace(tzinfo=timezone.utc).astimezone(HKT).strftime("%Y-%m-%d"))
+    except ValueError:
+        return ts[:10] or None
+
+
 def _report_date(data):
-    """UTC report date from analyze JSON; fall back to UTC today if invalid."""
+    """Trade-day from analyze JSON; fall back to HKT today if invalid.
+
+    2026-09-11: the trade day is HKT (the cron window is 07:00-23:59 HKT and
+    the analyze filename uses `$(date +%Y-%m-%d)` = HKT). Previously the JSON
+    carried the UTC date, so between 00:00-07:59 HKT it disagreed with the
+    filename, and same-day dedupe folded the 09-11 07:00 Double Top into the
+    09-10 20:41 entry (which had already stopped out) — it never seeded.
+    """
     parsed = _calendar_date((data or {}).get("date"))
-    return parsed or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return parsed or datetime.now(HKT).strftime("%Y-%m-%d")
 
 
 def _signal_key(pattern, direction, entry_mode="breakout"):
@@ -778,12 +813,12 @@ def _parse_dt(val):
 def _daily_loss_r(log):
     """Sum of pnl_r for trusted CLOSED trades today. UNVERIFIED excluded.
 
-    2026-08-25: compare against the UTC date — seeded_date is written from
-    the analyze report date (UTC). Using machine-local time (HKT) made the
-    -3R daily-loss circuit breaker blind to same-day losses between
-    00:00–07:59 HKT, when local and UTC dates differ.
+    2026-08-25: compare against the report date written into seeded_date.
+    2026-09-11: that date is now HKT (was UTC) so the circuit breaker matches
+    the 07:00-23:59 HKT cron window instead of UTC midnight (08:00 HKT), which
+    split a single trading session across two "days".
     """
-    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    today = datetime.now(HKT).strftime('%Y-%m-%d')
     total = 0
     for t in log.get("trades", []):
         if t.get("status") == "CLOSED" and t.get("seeded_date") == today and _counts_toward_r(t):
@@ -797,13 +832,15 @@ def _daily_loss_r(log):
 
 
 def _consecutive_losses(log):
-    """Count consecutive losses closed on the same UTC day (anti same-day tilt).
+    """Count consecutive losses closed on the same HKT day (anti same-day tilt).
 
-    2026-09-03 (方案 C): 只防即日 tilt — 只數「喺同一 UTC 日平倉」嘅連續虧損。
+    2026-09-03 (方案 C): 只防即日 tilt — 只數「喺同一日平倉」嘅連續虧損。
     跨日唔算（之前嘅 bug：數晒成個 history，隔咗成星期嘅舊虧損會
     永久鎖死 anti-martingale，連敗永遠斷唔到 → 死鎖）。
+    2026-09-11: 日界由 UTC 改為 HKT（配合交易日定義），closed_time 本身
+    仍然係 UTC ISO，所以逐條轉 HKT 先比。
     """
-    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    today = datetime.now(HKT).strftime('%Y-%m-%d')
     count = 0
     for t in reversed(log.get("history", [])):
         if not _counts_toward_r(t):
@@ -811,7 +848,7 @@ def _consecutive_losses(log):
         r = t.get("pnl_r", 0)
         if r < 0:
             closed = t.get("closed_time") or t.get("seeded_time") or ""
-            day = closed[:10] if closed else None
+            day = _hkt_day(closed)
             if day != today:
                 break
             count += 1
