@@ -52,12 +52,24 @@ def m5m15_line(data):
     return " | ".join(parts) if parts else ""
 
 
+def _clean_price(value):
+    """剝走 JSON 值內嘅 $ 前綴同括號描述：'$4284 (1:1 RR, 止賺 1/3)' → '4284'"""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if "$" in s:
+        s = s.split("$")[-1]
+    s = s.split(" (")[0].strip()  # 剝走 '(描述)'
+    return s
+
+
 def paper_stats():
-    """正統 paper：CLOSED/W/L/勝率/sumR + 今日 PnL + CLOSED 明細行。"""
+    """正統 paper：LIVE + CLOSED/W/L/勝率/sumR + 今日 PnL + CLOSED 明細行。"""
     d = load_json(os.path.join(REPORT_DIR, "paper_trade_log.json"), required=False)
     history = d.get("history", []) if isinstance(d, dict) else []
+    live = d.get("trades", []) if isinstance(d, dict) else []
+    live = [t for t in live if t.get("status") == "LIVE"]
     closed = [t for t in history if t.get("status") == "CLOSED"]
-    open_ = [t for t in history if t.get("status") == "OPEN"]
     wins = sum(1 for t in closed if (t.get("pnl_r") or 0) > 0)
     losses = sum(1 for t in closed if (t.get("pnl_r") or 0) < 0)
     sum_r = round(sum(t.get("pnl_r") or 0 for t in closed), 2)
@@ -86,7 +98,7 @@ def paper_stats():
         pat = (t.get("pattern") or "").replace("🚩 ", "").replace("🔺 ", "").replace("🔻 ", "")
         lines.append(f"{emoji} {pat} {label} {'+' if pnl >= 0 else ''}{round(pnl, 2)}R")
 
-    open_live = len(open_)
+    open_live = len(live)
     return {
         "n": n, "wins": wins, "losses": losses, "win_pct": win_pct,
         "sum_r": sum_r, "today_r": today_r, "lines": lines, "open_live": open_live,
@@ -176,11 +188,11 @@ def build_format_a(data, candidates):
         emoji = "🟢" if is_buy else "🔴"
         pat = (s.get("pattern") or "").replace("🔺 ", "").replace("🔻 ", "")
         lines.append(f"{emoji} {clean_dir} {pat} {s.get('confidence') or ''}".rstrip())
-        lines.append(f"**入場: ${s.get('entry_price')}**")
-        lines.append(f"**止損: ${s.get('stop_loss')}**")
-        lines.append(f"**TP1: ${s.get('tp1')} (1/3)**")
+        lines.append(f"**入場: ${_clean_price(s.get('entry_price'))}**")
+        lines.append(f"**止損: ${_clean_price(s.get('stop_loss'))}**")
+        lines.append(f"**TP1: ${_clean_price(s.get('tp1'))} (1/3)**")
         if s.get("tp2"):
-            lines.append(f"**TP2: ${s.get('tp2')} (1/3)**")
+            lines.append(f"**TP2: ${_clean_price(s.get('tp2'))} (1/3)**")
         lines.append(f"R:R {s.get('rr_tp1')} | 入場方式: {s.get('entry_mode')}")
         lines.append(f"⚠️ 最大風險: ${s.get('risk_amount')} per trade")
         lines.append("")

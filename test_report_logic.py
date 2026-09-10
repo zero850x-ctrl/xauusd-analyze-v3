@@ -128,12 +128,43 @@ def t_martingale():
         check("馬丁檔案唔存在 → None（唔虛構）", True)
 
 
+def t_clean_price():
+    print("== 價錢清潔（$$ 格式 bug 回歸）==")
+    check("帶 $ 前綴", R._clean_price("$4375") == "4375")
+    check("帶 $ + 描述", R._clean_price("$4284 (1:1 RR, 止賺 1/3)") == "4284")
+    check("純數字", R._clean_price(4329.43) == "4329.43")
+    check("None", R._clean_price(None) is None)
+    a = R.build_format_a(make_data(push_candidates=[dict(SETUP)]), [dict(SETUP, stop_loss="$4375", tp1="$4284 (1:1 RR, 止賺 1/3)", tp2="$4236 (1.0 Fib ext, 止賺 1/3)")])
+    check("無 $$ 重複", "$$" not in a, [l for l in a.splitlines() if "止損" in l or "TP" in l])
+    check("止損乾淨", "**止損: $4375**" in a)
+    check("TP1 乾淨", "**TP1: $4284 (1/3)**" in a)
+    check("TP2 乾淨", "**TP2: $4236 (1/3)**" in a)
+
+
+def t_live_count():
+    print("== LIVE 計數（正倉入場顯示）==")
+    # paper log 有 trades list (LIVE) + history (CLOSED)
+    import tempfile as tf
+    tmpdir = tf.mkdtemp()
+    with open(os.path.join(tmpdir, "paper_trade_log.json"), "w") as f:
+        json.dump({"trades": [{"status": "LIVE", "id": "x1"}], "history": []}, f)
+    old = R.REPORT_DIR
+    R.REPORT_DIR = tmpdir
+    p = R.paper_stats()
+    R.REPORT_DIR = old
+    check("LIVE 1 被計到", p["open_live"] == 1, f"got {p['open_live']}")
+    import shutil
+    shutil.rmtree(tmpdir)
+
+
 if __name__ == "__main__":
     t_format_a()
     t_format_b_and_gc()
     t_dedup()
     t_wa_push_write()
     t_martingale()
+    t_clean_price()
+    t_live_count()
     print(f"\n結果: {CHECKS - len(FAIL)}/{CHECKS} pass")
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  ")
