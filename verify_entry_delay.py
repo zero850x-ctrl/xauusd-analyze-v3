@@ -219,6 +219,12 @@ def main():
     results = []
     try:
         for mode in modes:
+            # 2026-09-11: make_patch() captures bt.setups_to_trades as its
+            # `orig`. Without this reset, mode N wraps mode N-1's patched
+            # function and every mode inherits all earlier modes' effects
+            # (guard_0.5 and slip_0.5 came out byte-identical). Always patch
+            # on top of the TRUE original.
+            bt.setups_to_trades = orig_st
             guard_atr = 0.5
             if "guard_" in mode:
                 try:
