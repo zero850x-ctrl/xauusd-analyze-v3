@@ -34,25 +34,48 @@ def _df_day():
 
 
 def test_daily_window_legacy_includes_current_day():
-    win = bt.daily_window_for(_df_day(), dt.date(2026, 9, 10), completed_only=False)
+    win = bt.daily_window_for(_df_day(), dt.date(2026, 9, 10), mode="legacy")
     assert list(win["Close"]) == [1.0, 2.0, 3.0], list(win["Close"])
     # the 3.0 close is the FULL 09-10 candle — visible at 00:00 → look-ahead
 
 
-def test_daily_window_completed_only_excludes_current_day():
-    win = bt.daily_window_for(_df_day(), dt.date(2026, 9, 10), completed_only=True)
+def test_daily_window_completed_excludes_current_day():
+    win = bt.daily_window_for(_df_day(), dt.date(2026, 9, 10), mode="completed")
     assert list(win["Close"]) == [1.0, 2.0], list(win["Close"])
 
 
-def test_daily_window_follows_module_flag():
-    saved = bt.DAILY_TREND_COMPLETED_ONLY
+def test_daily_window_follows_env_mode():
+    """PR #39 replaced the module boolean with BT_DAILY_MODE + legacy env flags."""
+    keys = ("BT_DAILY_MODE", "BT_DAILY_COMPLETED_ONLY", "BT_DAILY_PARTIAL_CANDLE")
+    saved = {k: os.environ.get(k) for k in keys}
     try:
-        bt.DAILY_TREND_COMPLETED_ONLY = True
-        assert len(bt.daily_window_for(_df_day(), dt.date(2026, 9, 10))) == 2
-        bt.DAILY_TREND_COMPLETED_ONLY = False
+        for k in keys:
+            os.environ.pop(k, None)
+        assert bt.daily_mode() == "legacy"
         assert len(bt.daily_window_for(_df_day(), dt.date(2026, 9, 10))) == 3
+
+        os.environ["BT_DAILY_COMPLETED_ONLY"] = "1"
+        assert bt.daily_mode() == "completed"
+        assert len(bt.daily_window_for(_df_day(), dt.date(2026, 9, 10))) == 2
+
+        # explicit BT_DAILY_MODE wins over the legacy flags
+        os.environ["BT_DAILY_MODE"] = "legacy"
+        assert bt.daily_mode() == "legacy"
+        assert len(bt.daily_window_for(_df_day(), dt.date(2026, 9, 10))) == 3
+
+        os.environ["BT_DAILY_MODE"] = "null"  # invalid → loud, not silent
+        try:
+            bt.daily_mode()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid BT_DAILY_MODE must raise ValueError")
     finally:
-        bt.DAILY_TREND_COMPLETED_ONLY = saved
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def test_daily_window_none_passthrough():
