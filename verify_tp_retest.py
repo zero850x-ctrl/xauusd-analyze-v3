@@ -16,6 +16,8 @@ monkey-patched):
   confirm      entry = NEXT H1 bar close, and only if that bar still holds
                the breakout (BUY: close > breach, SELL: close < breach).
                Models "don't enter on the breakout bar, wait for it to hold".
+  sellhtf      study A: SELL only when the WEEKLY trend is down (BUY untouched)
+  htfalign     study A: both sides must agree with the weekly trend
   retest       limit order sitting at the breach level. Runs through the
                engine's NATIVE pending-order path (backtest.process_pending_orders):
                fills only when a later bar's range touches the level, stops
@@ -67,6 +69,7 @@ DATA_CSV = os.path.join(SCRIPT_DIR, "verify_data_paxg_5y.csv")
 DEFAULT_OUT = "verify_tp_retest_v3.json"
 RR = {"rr1.5": 1.5, "rr2.0": 2.0}
 LIMIT_MODES = ("boundary", "pullback", "fib", "fib0786")
+HTF_MODES = ("sellhtf", "htfalign")
 
 
 def _strip_weekend(df):
@@ -89,6 +92,40 @@ def load_bars(csv_path=DATA_CSV, max_bars=None):
     }).dropna(subset=["Close"])
     df_day = add_indicators(df_day)
     return df, df_day
+
+
+def weekly_trend_by_date(df_day):
+    """Higher-timeframe trend as of each date, from COMPLETED days only.
+
+    Study A (2026-09-12): the 5y no-look-ahead run showed the edge lives on one
+    side — BUY PF 1.60 (+$1,913) vs SELL PF 0.69 (-$948), permutation
+    p=0.0035. All 288 trades were already `aligned` on the DAILY filter, so the
+    hypothesis is that shorts need the BIGGER trend, not just the daily one.
+
+    For date D: weekly bars built from daily bars strictly before D (nothing
+    from D leaks in), then the last completed weekly close vs its 4-week SMA.
+    None = not enough history to have an opinion; the filter stays inert there
+    rather than silently dropping the first weeks of the sample.
+    """
+    out = {}
+    for d in sorted({ts.date() for ts in df_day.index}):
+        w = df_day[df_day.index.date < d]
+        if len(w) < 30:
+            out[d] = None
+            continue
+        wk = w.resample("W").agg({
+            "Open": "first", "High": "max", "Low": "min",
+            "Close": "last", "Volume": "sum",
+        }).dropna(subset=["Close"])
+        if len(wk) < 6:
+            out[d] = None
+            continue
+        ma = wk["Close"].rolling(4).mean().iloc[-1]
+        if pd.isna(ma):
+            out[d] = None
+            continue
+        out[d] = "BULLISH" if float(wk["Close"].iloc[-1]) > float(ma) else "BEARISH"
+    return out
 
 
 def _breach_for_trade(tr, setups):
@@ -114,7 +151,20 @@ def _breach_for_trade(tr, setups):
     return None
 
 
-def make_patch(df_bars, mode, stats):
+def _htf_blocks(mode, is_buy, weekly):
+    """Does the higher-timeframe trend veto this trade? (pure — unit tested)
+
+    None (not enough weekly history) never vetoes: the filter has no opinion, so
+    it must not silently drop the first weeks of the sample.
+    """
+    if weekly is None:
+        return False
+    if mode == "sellhtf":
+        return (not is_buy) and weekly != "BEARISH"
+    return weekly != ("BULLISH" if is_buy else "BEARISH")
+
+
+def make_patch(df_bars, mode, stats, htf=None):
     """Patched setups_to_trades implementing `mode`."""
     orig = bt.setups_to_trades
     bar_times = list(df_bars.index)
@@ -130,6 +180,27 @@ def make_patch(df_bars, mode, stats):
             risk = abs(tr.entry_price - tr.stop_price)
             if risk <= 0:
                 continue
+
+            # ── A: higher-timeframe side alignment ─────────────────────
+            if mode in HTF_MODES and htf is not None:
+                # run_backtest passes current_date (a Timestamp with a time
+                # component), while the map is keyed by datetime.date. Look it up
+                # with a Timestamp key and the lookup silently misses EVERY time
+                # -> htf_blocked stays 0 and the mode returns byte-identical
+                # numbers to baseline (the "wired but not plumbed" signature
+                # that this study keeps tripping over).
+                wt = htf.get(pd.Timestamp(bar_date).date())
+                if wt is None:
+                    stats["htf_no_opinion"] += 1
+                else:
+                    stats["htf_seen"] += 1
+                if _htf_blocks(mode, is_buy, wt):
+                    stats["htf_blocked"] += 1
+                    if is_buy:
+                        stats["htf_blocked_buy"] += 1
+                    else:
+                        stats["htf_blocked_sell"] += 1
+                    continue
 
             # native limit setups (boundary/fib/...) are left untouched in
             # every mode — the study is about breakout entries
@@ -229,11 +300,12 @@ def restore_sim_guard(bt_mod, orig):
     bt_mod.simulate_trade_on_bar = orig
 
 
-def run_mode(df_bars, df_day, mode, verbose=False):
+def run_mode(df_bars, df_day, mode, verbose=False, htf=None):
     stats = {"mode": mode, "tp2_bumped": 0, "confirm_rejected": 0,
              "retest_placed": 0, "ladder_invalid": 0, "no_next_bar": 0,
-             "breach_missing": 0}
-    patched, orig = make_patch(df_bars, mode, stats)
+             "breach_missing": 0, "htf_blocked": 0, "htf_blocked_buy": 0,
+             "htf_blocked_sell": 0, "htf_seen": 0, "htf_no_opinion": 0}
+    patched, orig = make_patch(df_bars, mode, stats, htf=htf)
     orig_sim = install_sim_guard(bt)
     bt.setups_to_trades = patched
     try:
@@ -348,14 +420,25 @@ def main():
             "retest_impl": "native_pending_orders",
             "limit_order_max_bars": bt.LIMIT_ORDER_MAX_BARS,
             "daily_trend_completed_only": bool(getattr(bt, "DAILY_TREND_COMPLETED_ONLY", False)),
+            "daily_trend_partial_candle": bool(
+                getattr(bt, "DAILY_TREND_PARTIAL_CANDLE", False)),
             "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
     }
     all_trades = {}
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    htf = None
+    if any(m in HTF_MODES for m in modes):
+        t_h = time.time()
+        htf = weekly_trend_by_date(df_day)
+        known = [v for v in htf.values() if v]
+        print(f"weekly HTF map: {len(htf)} dates ({len(known)} with an opinion) "
+              f"in {time.time()-t_h:.0f}s", flush=True)
+        all_res["_meta"]["htf_definition"] = (
+            "weekly close vs 4-week SMA, completed daily bars only")
     for mode in modes:
         t1 = time.time()
-        stats, trades = run_mode(df_bars, df_day, mode)
+        stats, trades = run_mode(df_bars, df_day, mode, htf=htf)
         s = stats["stats"]
         all_res[mode] = stats
         all_trades[mode] = trades
@@ -366,6 +449,14 @@ def main():
         extra = {k: v for k, v in stats.items() if k not in ("stats", "mode") and v}
         if extra:
             print(f"  notes: {extra}", flush=True)
+        if mode in HTF_MODES and htf is not None and not stats.get("htf_seen"):
+            # 2026-09-12: the first cut of this mode did exactly this and looked
+            # like "the weekly filter makes no difference". It was a broken dict
+            # key. Never let an inert filter pass as a finding.
+            print(f"  !! WARNING [{mode}]: the weekly gate never had an opinion "
+                  f"({stats.get('htf_no_opinion', 0)} lookups all missed) — the "
+                  f"mode is INERT, do not read these numbers as a result",
+                  flush=True)
 
     if "baseline" in all_trades:
         for mode in modes:
