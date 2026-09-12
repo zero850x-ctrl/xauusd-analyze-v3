@@ -1,3 +1,5 @@
 
 # 5y backtest data (Binance PAXGUSDT) — regenerate with verify_entry_delay.py
 verify_data_paxg*.csv
+# per-trade dumps written by verify_tp_retest.py (large; summary JSON is tracked)
+verify_tp_retest*_trades.json

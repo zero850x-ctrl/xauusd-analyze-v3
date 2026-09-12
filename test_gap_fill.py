@@ -63,10 +63,56 @@ def test_exit_fill_missing_open_falls_back_to_level():
     assert pt._exit_fill(4328.0, float("nan"), True, True) == 4328.0 + SLIP
 
 
-def test_exit_fill_never_returns_none_for_finite_level():
-    for lvl in (1.0, 4328.0, 5000.5):
-        out = pt._exit_fill(lvl, 4000.0, True, True)
-        assert isinstance(out, float) and out == out  # not None, not NaN
+def test_exit_fill_missing_open_clamps_into_bar_range():
+    """No open but a known range: the level is clamped into [low, high] so an
+    unknown open can never yield a fill the bar did not trade (review #1)."""
+    # SELL stop 4328 gapped over, bar [4333.67, 4341.17], open unknown → low
+    assert abs(pt._exit_fill(4328.0, None, True, True,
+                             bar_low=4333.67, bar_high=4341.17)
+               - (4333.67 + SLIP)) < 1e-9
+    # BUY stop 4458 gapped under, bar [4440, 4452], open unknown → high
+    assert abs(pt._exit_fill(4458.0, float("nan"), False, True,
+                             bar_low=4440.0, bar_high=4452.0)
+               - (4452.0 - SLIP)) < 1e-9
+    # level inside the range → untouched
+    assert abs(pt._exit_fill(4335.0, None, True, True,
+                             bar_low=4333.67, bar_high=4341.17)
+               - (4335.0 + SLIP)) < 1e-9
+
+
+def test_exit_fill_always_inside_bar_range():
+    """Invariant behind the whole fix: whenever the level is reachable in the
+    bar (stop_in / tp touched), the fill lies inside [low-SLIP, high+SLIP] —
+    with a real open, with no open, for both sides and both exit kinds."""
+    bars = [(4333.67, 4341.17), (4300.0, 4310.0), (4290.0, 4350.0)]
+    levels = [4280.0, 4300.0, 4305.0, 4328.0, 4341.17, 4360.0]
+    for lo, hi in bars:
+        for lvl in levels:
+            for is_sell in (True, False):
+                for is_stop in (True, False):
+                    # reachable?  SELL stop: high>=lvl; SELL target: low<=lvl
+                    # BUY stop: low<=lvl; BUY target: high>=lvl
+                    if is_sell == is_stop:
+                        reachable = hi >= lvl
+                    else:
+                        reachable = lo <= lvl
+                    if not reachable:
+                        continue
+                    for op in (None, lo, hi, (lo + hi) / 2):
+                        px = pt._exit_fill(lvl, op, is_sell, is_stop,
+                                           bar_low=lo, bar_high=hi)
+                        assert lo - SLIP - 1e-9 <= px <= hi + SLIP + 1e-9, (
+                            f"fill {px} outside [{lo},{hi}] lvl={lvl} op={op} "
+                            f"sell={is_sell} stop={is_stop}")
+
+
+def test_exit_fill_rejects_non_finite_level():
+    for bad in (None, float("nan")):
+        try:
+            pt._exit_fill(bad, 4000.0, True, True)
+        except ValueError:
+            continue
+        raise AssertionError(f"_exit_fill accepted level={bad!r}")
 
 
 # ── end-to-end: the exact stuck trade from 2026-09-11 ────────────────────
@@ -95,11 +141,8 @@ def test_gap_stop_now_closes_instead_of_sticking():
     assert sim["pnl_r"] < -1.0, "gapping past the stop costs more than -1R"
 
 
-def test_guard_still_rejects_a_lying_fill():
-    """_guard_close must keep its teeth: a fill outside the traded range and
-    not explainable by the bar open is still refused."""
-    assert pt._simulate_staged_exit  # module loaded
-    # close price identical to a fill that the bar never traded
+def test_untouched_stop_does_not_trigger():
+    """A stop the bar never reached must not fire (sanity, not a guard test)."""
     seed = pd.Timestamp("2026-09-11T04:01:28Z")
     bars = _df([
         _bar(pd.Timestamp("2026-09-11T04:30:00Z"), 4333.67, 4341.17, 4333.67, 4340.0),
@@ -108,6 +151,65 @@ def test_guard_still_rejects_a_lying_fill():
     sim = pt._simulate_staged_exit(bars, 4303.56, 4400.0, 4279.0, 4242.0,
                                    "SELL", 12.23, seed_dt=seed, data_source="paxg")
     assert sim["closed"] is False, "stop above the bar high must not trigger"
+
+
+def test_missing_open_gap_stop_still_closes_verified():
+    """Review #1: the incident bar with NO open must still close, verified.
+
+    Before the fix the simulator substituted `entry` for a missing open, so
+    _exit_fill saw a fake open below the stop and filled at 4328.15 — outside
+    [4333.67, 4341.17] → _guard_close False → LIVE forever, again."""
+    seed = pd.Timestamp("2026-09-11T04:01:28Z")
+    bars = _df([
+        _bar(pd.Timestamp("2026-09-11T04:30:00Z"), float("nan"), 4341.17, 4333.67, 4340.0),
+    ])
+    sim = pt._simulate_staged_exit(bars, 4303.56, 4328.0, 4279.0, 4242.0,
+                                   "SELL", 12.23, seed_dt=seed, data_source="paxg")
+    assert sim["closed"] is True
+    assert sim["result"] == "SL"
+    assert sim["verified"] is True, f"got close_price={sim.get('close_price')}"
+    # level clamped to the bar low (the only in-range price ≤ the level)
+    assert abs(sim["close_price"] - (4333.67 + SLIP)) < 0.01
+
+
+def test_missing_open_in_profit_trail_keeps_profit():
+    """Review #1 (Fable reproduction): SELL in profit, trail at 4290, bar
+    [4285, 4295] with NaN open. The old entry-proxy dragged the trail fill up
+    to entry+SLIP = 4300.15 (outside the bar → unverified, pnl 0.66 → 0.33)."""
+    seed = pd.Timestamp("2026-09-11T04:01:28Z")
+    bars = _df([
+        _bar(pd.Timestamp("2026-09-11T04:30:00Z"), float("nan"), 4295.0, 4285.0, 4292.0),
+    ])
+    state = {"tp1_hit": True, "trail_active": True, "trail_stop": 4290.0,
+             "r_tp1": 1.0 / 3.0, "bars_held": 5}
+    sim = pt._simulate_staged_exit(bars, 4300.0, 4320.0, 4280.0, 4260.0,
+                                   "SELL", 10.0, seed_dt=seed, data_source="paxg",
+                                   init_state=state)
+    assert sim["closed"] is True
+    assert sim["result"] == "Trail"
+    assert sim["verified"] is True, f"got close_price={sim.get('close_price')}"
+    assert abs(sim["close_price"] - (4290.0 + SLIP)) < 0.01
+    # 1/3 banked at TP1 (+0.333R) + 2/3 at trail: (4300-4290.15)/20 = 0.4925R
+    assert abs(sim["pnl_r"] - (1.0 / 3.0 + 0.4925 * 2.0 / 3.0)) < 0.02
+
+
+def test_tp_gap_fills_at_open_end_to_end():
+    """BUY target gapped over: TP1 fills at the (better) open, the tail stays
+    LIVE with BE armed — exercises the target branch of _exit_fill inside the
+    simulator, not just the unit helper."""
+    seed = pd.Timestamp("2026-09-03T13:19:41Z")
+    bars = _df([
+        _bar(pd.Timestamp("2026-09-03T13:30:00Z"), 4520.0, 4525.0, 4518.0, 4522.0),
+    ])
+    sim = pt._simulate_staged_exit(bars, 4486.86, 4458.0, 4515.0, 4544.0,
+                                   "BUY", 14.19, seed_dt=seed, data_source="paxg")
+    assert sim["closed"] is False
+    assert sim["tp1_hit"] is True
+    risk = 4486.86 - 4458.0
+    expected_r_tp1 = ((4520.0 - SLIP) - 4486.86) / risk / 3.0
+    assert abs(sim["r_tp1"] - expected_r_tp1) < 1e-3
+    assert sim["r_tp1"] > (4515.0 - SLIP - 4486.86) / risk / 3.0  # better than level fill
+    assert sim["trail_active"] is True
 
 
 def test_buy_gap_stop_closes():

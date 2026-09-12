@@ -189,7 +189,7 @@ def _finite_px(val):
     return x
 
 
-def _exit_fill(level, bar_open, is_sell, is_stop):
+def _exit_fill(level, bar_open, is_sell, is_stop, bar_low=None, bar_high=None):
     """Gap-aware exit fill — never a price the bar did not trade.
 
     If the bar OPENED beyond the trigger level, the exit happens at the open
@@ -201,12 +201,28 @@ def _exit_fill(level, bar_open, is_sell, is_stop):
     guard) the next bar can *gap* past the stop, so filling at the stop price
     produces a fill outside the bar's traded range — _guard_close then rejects
     it forever and the trade never closes.
+
+    Note the incident fill is deliberately pessimistic: a real stop order
+    would usually have filled inside the skipped seed bar, but the simulator
+    cannot see that bar without look-ahead, so it books the next bar's open.
+    pnl_r < -1 on a gap stop is expected, not a bug.
+
+    2026-09-12 review (3-model consensus): `bar_open` must be the RAW open
+    (None/NaN when the feed lacks it), never a proxy such as the entry price.
+    With no open the fill falls back to the level clamped into the bar's
+    [bar_low, bar_high] range when those are given — an unknown open must not
+    produce a fill the bar never traded, or the stuck-LIVE bug returns.
     """
     lvl = _finite_px(level)
-    assert lvl is not None, "exit trigger level must be finite"
+    if lvl is None:
+        raise ValueError("exit trigger level must be finite")
     op = _finite_px(bar_open)
     if op is None:
         px = lvl
+        lo = _finite_px(bar_low)
+        hi = _finite_px(bar_high)
+        if lo is not None and hi is not None and lo <= hi:
+            px = min(max(px, lo), hi)
     elif is_sell:
         px = max(lvl, op) if is_stop else min(lvl, op)
     else:
@@ -469,9 +485,12 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
         high = _finite_px(row.get('high'))
         low = _finite_px(row.get('low'))
         close_px = _finite_px(row.get('close'))
-        bar_open = _finite_px(row.get('open'))
-        if bar_open is None:
-            bar_open = entry
+        # raw_open feeds the gap-aware fills (None when the feed has no open);
+        # bar_open is only a neutral proxy for the intrabar-ordering distances.
+        # Never pass the proxy into _exit_fill — a fake "open == entry" drags
+        # gap fills back outside the traded range (2026-09-12 review).
+        raw_open = _finite_px(row.get('open'))
+        bar_open = raw_open if raw_open is not None else entry
         if high is None or low is None or close_px is None or high < low:
             continue
 
@@ -495,7 +514,8 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
         stop_first = bool(stop_in and (not tp_dists or abs(eff_stop - bar_open) <= min(tp_dists)))
 
         if stop_in and stop_first:
-            fill = _exit_fill(eff_stop, bar_open, is_sell, is_stop=True)
+            fill = _exit_fill(eff_stop, raw_open, is_sell, is_stop=True,
+                              bar_low=low, bar_high=high)
             r_exit = (entry - fill) / risk if is_sell else (fill - entry) / risk
             portions_open = 3 - (1 if tp1_hit else 0) - (1 if tp2_hit else 0)
             total_r = r_tp1 + r_tp2 + r_exit * portions_open / 3.0
@@ -515,12 +535,16 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
 
         if not tp1_hit and tp1 > 0 and ((is_sell and low <= tp1) or (not is_sell and high >= tp1)):
             tp1_hit = True
-            fill = _exit_fill(tp1, bar_open, is_sell, is_stop=False)
+            fill = _exit_fill(tp1, raw_open, is_sell, is_stop=False,
+                              bar_low=low, bar_high=high)
             r_tp1 = ((entry - fill) / risk if is_sell else (fill - entry) / risk) / 3.0
             # Momentum-hold: arm breakeven stop for the tail right after TP1;
             # the later trail block may tighten it further as profit grows.
             # BE is offset by SLIPPAGE_TICKS so the simulated fill lands on
-            # entry exactly (a stop *at* entry fills at entry∓slippage = loss).
+            # entry exactly when price trades through it (a stop *at* entry
+            # fills at entry∓slippage = loss). A bar that GAPS through BE
+            # fills at open∓slippage instead — a small realised loss, which
+            # is the honest outcome.
             if momentum_hold and not trail_active:
                 trail_active = True
                 trail_stop = (entry - SLIPPAGE_TICKS) if is_sell else (entry + SLIPPAGE_TICKS)
@@ -529,7 +553,8 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
         # the tail exits via trail (or timeout) so winners can run.
         if not tp2_hit and not (momentum_hold and tp1_hit) and tp2 > 0 and not stop_in and ((is_sell and low <= tp2) or (not is_sell and high >= tp2)):
             tp2_hit = True
-            fill = _exit_fill(tp2, bar_open, is_sell, is_stop=False)
+            fill = _exit_fill(tp2, raw_open, is_sell, is_stop=False,
+                              bar_low=low, bar_high=high)
             r_tp2 = ((entry - fill) / risk if is_sell else (fill - entry) / risk) / 3.0
 
         if bars_held >= MAX_BARS_HELD:

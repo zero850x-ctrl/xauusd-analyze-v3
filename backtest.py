@@ -193,6 +193,14 @@ COMMISSION_PER_TRADE = 0.0  # $0 commission (broker uses spread only)
 # fib0786) must trade at their level before being counted. An order that never
 # fills (price never returns to the level) expires after this many bars.
 LIMIT_ORDER_MAX_BARS = 48  # 48 H1 bars = 2 days; 48 M30 bars = 1 day
+# 2026-09-12 review (GPT-5.6 finding, verified): the daily-trend filter used
+# `df_day.index.date <= bar_date`, i.e. the CURRENT day's full candle — at
+# 01:00 the trend already knows that day's close (look-ahead into the
+# ALIGNED gate / priority). BT_DAILY_COMPLETED_ONLY=1 restricts the daily
+# window to completed days (`< bar_date`). Default stays 0 so existing
+# baselines are not silently re-based; flip the default once the walk-forward
+# numbers have been re-run under it.
+DAILY_TREND_COMPLETED_ONLY = os.environ.get('BT_DAILY_COMPLETED_ONLY', '0') == '1'
 
 
 class Trade:
@@ -692,6 +700,22 @@ def process_pending_orders(pending_orders, bar_idx, bar_high, bar_low,
     return still_pending, last_trade_bar
 
 
+def daily_window_for(df_day, bar_date, completed_only=None):
+    """Daily bars visible to the trend filter at an intraday bar on `bar_date`.
+
+    completed_only=True  → days strictly before bar_date (no look-ahead).
+    completed_only=False → legacy: includes bar_date's own (full) candle.
+    None → follow DAILY_TREND_COMPLETED_ONLY (env BT_DAILY_COMPLETED_ONLY).
+    """
+    if df_day is None:
+        return None
+    if completed_only is None:
+        completed_only = DAILY_TREND_COMPLETED_ONLY
+    if completed_only:
+        return df_day[df_day.index.date < bar_date]
+    return df_day[df_day.index.date <= bar_date]
+
+
 def run_backtest(df_bars, df_day, verbose=False):
     """
     Walk through df_bars bar-by-bar. At each bar:
@@ -732,7 +756,7 @@ def run_backtest(df_bars, df_day, verbose=False):
         # ── Daily trend (as of this bar's date) ──
         bar_date = current_date.date()
         if bar_date not in daily_trend_cache:
-            daily_window = df_day[df_day.index.date <= bar_date] if df_day is not None else None
+            daily_window = daily_window_for(df_day, bar_date)
             if daily_window is not None and len(daily_window) >= 30:
                 daily_trend_cache[bar_date] = analyze_daily_trend(daily_window)
             else:
