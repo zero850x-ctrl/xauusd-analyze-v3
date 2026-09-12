@@ -161,20 +161,47 @@ def make_patch(df_bars, mode, stats):
     return patched, orig
 
 
+def install_sim_guard(bt):
+    """Never simulate a trade before or at its own entry bar.
+
+    run_backtest appends a new trade on the breakout bar `i` and then calls
+    simulate_trade_on_bar for every open trade on EVERY following bar, with no
+    regard for when the entry actually happened. Baseline entries happen on bar
+    `i`, so starting at `i+1` is correct. `confirm`/`retest` entries land
+    several bars later, so simulating from the breakout bar fabricates fills
+    that never happened (look-ahead). Skip any bar at or before the entry bar.
+    """
+    orig = bt.simulate_trade_on_bar
+
+    def patched(trade, high, low, close, atr, bar_open=None, exit_date=None):
+        if exit_date is not None and trade.entry_date is not None:
+            if exit_date <= trade.entry_date:
+                return False
+        return orig(trade, high, low, close, atr, bar_open, exit_date=exit_date)
+
+    bt.simulate_trade_on_bar = patched
+    return orig
+
+
+def restore_sim_guard(bt, orig):
+    bt.simulate_trade_on_bar = orig
+
+
 def run_mode(df_bars, df_day, mode, verbose=False):
     stats = {"mode": mode, "tp2_bumped": 0, "confirm_rejected": 0,
              "retest_unfilled": 0, "retest_filled": 0, "ladder_invalid": 0,
              "no_next_bar": 0}
     patched, orig = make_patch(df_bars, mode, stats)
+    orig_sim = install_sim_guard(bt)
     bt.setups_to_trades = patched
     try:
         trades = bt.run_backtest(df_bars, df_day, verbose=verbose)
     finally:
         bt.setups_to_trades = orig      # reset every mode (chain-bug guard)
+        restore_sim_guard(bt, orig_sim)
     res = bt.compute_stats(trades, starting_capital=10000)
     stats["stats"] = res
     return stats, trades
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -198,9 +225,9 @@ def main():
         s = stats["stats"]
         all_res[mode] = stats
         print(f"\n[{mode}] {time.time()-t1:.0f}s  {s.get('total_trades')} trades")
-        print(f"  win {s.get('win_rate')}  E(R) {s.get('expectancy_r')}  "
-              f"PF {s.get('profit_factor')}  PnL {s.get('total_pnl')}  "
-              f"maxDD {s.get('max_drawdown')}", flush=True)
+        print(f"  win {s.get('win_rate')}  PF {s.get('profit_factor')}  "
+              f"E$ {s.get('expectancy')}  net$ {s.get('net_pnl')}  "
+              f"maxDD {s.get('max_drawdown')}  avgR {s.get('avg_rr')}", flush=True)
         extra = {k: v for k, v in stats.items() if k not in ("stats", "mode") and v}
         if extra:
             print(f"  notes: {extra}", flush=True)
