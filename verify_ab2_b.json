@@ -1,0 +1,63 @@
+{
+  "_meta": {
+    "harness": "verify_tp_retest.py",
+    "git_head": "a30d2bd",
+    "data_csv": "verify_data_paxg_5y.csv",
+    "data_md5": "c7fbb6ad92431028f9f3d741f4c3c4c0",
+    "bars": 31316,
+    "period": "2021-09-09 16:00:00 .. 2026-09-10 14:00:00",
+    "look_ahead_guard": true,
+    "retest_impl": "native_pending_orders",
+    "limit_order_max_bars": 48,
+    "daily_trend_completed_only": true,
+    "daily_trend_partial_candle": true,
+    "generated_utc": "2026-09-12T11:54:18Z"
+  },
+  "baseline": {
+    "mode": "baseline",
+    "tp2_bumped": 0,
+    "confirm_rejected": 0,
+    "retest_placed": 0,
+    "ladder_invalid": 0,
+    "no_next_bar": 0,
+    "breach_missing": 0,
+    "htf_blocked": 0,
+    "htf_blocked_buy": 0,
+    "htf_blocked_sell": 0,
+    "htf_seen": 0,
+    "htf_no_opinion": 0,
+    "stats": {
+      "total_trades": 349,
+      "wins": 160,
+      "losses": 189,
+      "breakevens": 0,
+      "win_rate": 45.8,
+      "loss_rate": 54.2,
+      "avg_win": 54.17,
+      "avg_loss": -42.07,
+      "profit_factor": 1.09,
+      "expectancy": 2.05,
+      "net_pnl": 716.9,
+      "starting_capital": 10000,
+      "ending_capital": 10716.9,
+      "return_pct": 7.17,
+      "max_drawdown": 1142.29,
+      "max_drawdown_pct": 11.4,
+      "sharpe_ratio": 0.61,
+      "avg_bars_held": 20.6,
+      "max_win_streak": 6,
+      "max_loss_streak": 9,
+      "avg_rr": -0.01,
+      "exit_reasons": {
+        "Stop loss": 173,
+        "Trailing stop": 156,
+        "Stop loss (same bar as fill)": 15,
+        "Timeout (100 bars)": 4,
+        "End of data": 1
+      },
+      "tp1_hit_rate": 49.0,
+      "tp2_hit_rate": 11.2,
+      "trail_activated_rate": 44.7
+    }
+  }
+}

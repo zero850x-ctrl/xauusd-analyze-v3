@@ -3,6 +3,7 @@
 
 Covers legacy / completed / partial via BT_DAILY_MODE (and legacy env aliases).
 Static AST checks + synthetic-frame unit tests (no CSV required).
+Dynamic CSV tests skip cleanly when verify_data_paxg_5y.csv is absent.
 """
 import os
 import sys
@@ -171,8 +172,66 @@ def test_daily_window_for_called_more_than_once_per_date():
     )
 
 
+def test_partial_mode_builds_a_growing_current_day():
+    """Partial mode must change the current-day row within a session."""
+    if not os.path.exists(DATA_CSV):
+        raise unittest.SkipTest("study CSV not present")
+
+    import verify_tp_retest as vt
+    df_bars, df_day = vt.load_bars(csv_path=DATA_CSV, max_bars=600)
+
+    seen = []
+    orig_trend = bt.analyze_daily_trend
+
+    def spy(dw):
+        seen.append((dw.index[-1].normalize(),
+                     float(dw["Close"].iloc[-1]),
+                     float(dw["High"].iloc[-1]),
+                     float(dw["Low"].iloc[-1])))
+        return orig_trend(dw)
+
+    bt.analyze_daily_trend = spy
+    try:
+        os.environ["BT_DAILY_MODE"] = "partial"
+        bt.run_backtest(df_bars, df_day, verbose=False)
+    finally:
+        bt.analyze_daily_trend = orig_trend
+        os.environ.pop("BT_DAILY_MODE", None)
+
+    assert seen, "partial mode produced no daily windows at all"
+
+    by_day = {}
+    for day, close, hi, lo in seen:
+        by_day.setdefault(day, []).append((close, hi, lo))
+    multi = {d: v for d, v in by_day.items() if len(v) > 1}
+    assert multi, (
+        f"only {len(seen)} window(s) for {len(by_day)} day(s) — partial mode "
+        "is still cached per date, so it cannot model a growing candle"
+    )
+
+    day, rows = max(multi.items(), key=lambda kv: len(kv[1]))
+    closes = {round(c, 4) for c, _, _ in rows}
+    assert len(closes) > 1, (
+        f"current-day Close never changed across {len(rows)} windows on {day.date()}"
+    )
+
+    full = df_day[df_day.index.date == day.date()]
+    assert len(full) == 1
+    full_close = float(full["Close"].iloc[0])
+    full_hi = float(full["High"].iloc[0])
+    full_lo = float(full["Low"].iloc[0])
+    assert closes != {round(full_close, 4)}, (
+        f"partial Close equals the COMPLETED day's close ({full_close}) for every "
+        "window — that is the legacy full-candle look-ahead"
+    )
+    for c, hi, lo in rows:
+        assert hi <= full_hi + 1e-9 and lo >= full_lo - 1e-9, (
+            f"partial row range [{lo}, {hi}] exceeds the completed day "
+            f"[{full_lo}, {full_hi}]"
+        )
+
+
 if __name__ == "__main__":
-    import unittest
     fails = skipped = 0
     for name, fn in sorted(globals().items()):
         if not name.startswith("test_") or not callable(fn):
@@ -189,6 +248,6 @@ if __name__ == "__main__":
         except Exception as e:
             fails += 1
             print(f"  ERROR {name}: {type(e).__name__}: {e}")
-    print(f"\n{sum(1 for k,v in globals().items() if k.startswith('test_')) - fails - skipped} passed, "
+    print(f"\n{sum(1 for k, v in globals().items() if k.startswith('test_')) - fails - skipped} passed, "
           f"{skipped} skipped, {fails} failed")
     sys.exit(1 if fails else 0)

@@ -193,6 +193,23 @@ COMMISSION_PER_TRADE = 0.0  # $0 commission (broker uses spread only)
 # fib0786) must trade at their level before being counted. An order that never
 # fills (price never returns to the level) expires after this many bars.
 LIMIT_ORDER_MAX_BARS = 48  # 48 H1 bars = 2 days; 48 M30 bars = 1 day
+# 2026-09-12 review (GPT-5.6 finding, verified): the daily-trend filter used
+# `df_day.index.date <= bar_date`, i.e. the CURRENT day's full candle — at
+# 01:00 the trend already knows that day's close (look-ahead into the
+# ALIGNED gate / priority). BT_DAILY_COMPLETED_ONLY=1 restricts the daily
+# window to completed days (`< bar_date`). Default stays 0 so existing
+# baselines are not silently re-based; flip the default once the walk-forward
+# numbers have been re-run under it.
+DAILY_TREND_COMPLETED_ONLY = os.environ.get('BT_DAILY_COMPLETED_ONLY', '0') == '1'
+# 2026-09-12 study B: the LIVE pipeline never sees a completed current-day
+# candle. fetch_data() pulls the daily frame from the chart at an intraday
+# moment, so its last row is a PARTIAL candle aggregated from the bars so far.
+# Neither legacy (`<= bar_date`: full candle) nor completed-only (`< bar_date`:
+# day dropped entirely) models that, so both describe a pipeline that does not
+# exist. BT_DAILY_PARTIAL_CANDLE=1 builds the partial row from df_bars up to
+# (and including) the current bar, evaluated PER BAR because live's candle grows
+# through the day. Default 0 — existing baselines are not silently re-based.
+DAILY_TREND_PARTIAL_CANDLE = os.environ.get('BT_DAILY_PARTIAL_CANDLE', '0') == '1'
 
 # Daily-window mode for run_backtest (trend filter + kline enrichment).
 #   legacy    — includes the current day's FULL candle (`<= bar_date`; look-ahead)
