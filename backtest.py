@@ -211,6 +211,39 @@ DAILY_TREND_COMPLETED_ONLY = os.environ.get('BT_DAILY_COMPLETED_ONLY', '0') == '
 # through the day. Default 0 — existing baselines are not silently re-based.
 DAILY_TREND_PARTIAL_CANDLE = os.environ.get('BT_DAILY_PARTIAL_CANDLE', '0') == '1'
 
+# Daily-window mode for run_backtest (trend filter + kline enrichment).
+#   legacy    — includes the current day's FULL candle (`<= bar_date`; look-ahead)
+#   completed — completed days only (`< bar_date`)
+#   partial   — completed days + current day as a PARTIAL row from intraday bars
+#               up to the current bar (live-equivalent; per-bar cache)
+# Prefer BT_DAILY_MODE=legacy|completed|partial. Legacy env BT_DAILY_COMPLETED_ONLY
+# and BT_DAILY_PARTIAL_CANDLE are still honoured when BT_DAILY_MODE is unset;
+# if both legacy env flags are 1, partial wins (same as before).
+_VALID_DAILY_MODES = frozenset(('legacy', 'completed', 'partial'))
+
+
+def daily_mode():
+    """Effective daily-window mode for this process."""
+    explicit = os.environ.get('BT_DAILY_MODE', '').strip().lower()
+    if explicit:
+        if explicit not in _VALID_DAILY_MODES:
+            raise ValueError(
+                f"BT_DAILY_MODE must be one of {sorted(_VALID_DAILY_MODES)}, got {explicit!r}")
+        return explicit
+    partial = os.environ.get('BT_DAILY_PARTIAL_CANDLE', '0') == '1'
+    completed = os.environ.get('BT_DAILY_COMPLETED_ONLY', '0') == '1'
+    if partial:
+        return 'partial'
+    if completed:
+        return 'completed'
+    return 'legacy'
+
+
+# Backward compat for harnesses that read these booleans in _meta JSON.
+def _daily_mode_flags():
+    m = daily_mode()
+    return m == 'completed', m == 'partial'
+
 
 class Trade:
     """Represents a single trade with 3 TP levels."""
@@ -709,30 +742,31 @@ def process_pending_orders(pending_orders, bar_idx, bar_high, bar_low,
     return still_pending, last_trade_bar
 
 
-def daily_window_for(df_day, bar_date, completed_only=None):
+def daily_window_for(df_day, bar_date, mode=None):
     """Daily bars visible to the trend filter at an intraday bar on `bar_date`.
 
-    completed_only=True  → days strictly before bar_date (no look-ahead).
-    completed_only=False → legacy: includes bar_date's own (full) candle.
-    None → follow DAILY_TREND_COMPLETED_ONLY (env BT_DAILY_COMPLETED_ONLY).
+    mode='legacy'    → includes bar_date's own (full) candle (look-ahead).
+    mode='completed' → days strictly before bar_date.
+    mode=None        → follow daily_mode() / env flags.
     """
     if df_day is None:
         return None
-    if completed_only is None:
-        completed_only = DAILY_TREND_COMPLETED_ONLY
-    if completed_only:
+    if mode is None:
+        mode = daily_mode()
+    if mode == 'completed':
         return df_day[df_day.index.date < bar_date]
-    return df_day[df_day.index.date <= bar_date]
+    if mode == 'legacy':
+        return df_day[df_day.index.date <= bar_date]
+    raise ValueError(f"daily_window_for does not handle mode={mode!r} — use daily_window_at")
 
 
 def partial_daily_window(df_day, df_bars, bar_idx):
-    """Daily frame the LIVE pipeline sees at `bar_idx` (study B).
+    """Daily frame the LIVE pipeline sees at `bar_idx` (partial mode).
 
     Completed days + the current day as a PARTIAL candle aggregated from the
-    intraday bars up to and including `bar_idx`. Only O/H/L/C/V are built: both
-    consumers read nothing else (analyze_daily_trend -> Close for SMA/RSI,
-    detect_candlestick_patterns -> O/H/L/C), so recomputing indicators at one
-    call per bar would be pure waste.
+    intraday bars up to and including `bar_idx`. Only O/H/L/C/V are built;
+    consumers recompute indicators from Close (analyze_daily_trend) or read
+    raw OHLC (detect_candlestick_patterns).
     """
     if df_day is None:
         return None
@@ -756,12 +790,15 @@ def partial_daily_window(df_day, df_bars, bar_idx):
 def daily_window_at(df_day, df_bars, bar_idx, bar_date):
     """THE entry point for every daily window at a bar.
 
-    partial-candle mode -> live-equivalent partial current-day row,
-    otherwise -> daily_window_for() (legacy or completed-only).
+    partial mode → live-equivalent partial current-day row;
+    otherwise      → daily_window_for() (legacy or completed).
     """
     if df_day is None:
         return None
-    if DAILY_TREND_PARTIAL_CANDLE and df_bars is not None and bar_idx is not None:
+    if daily_mode() == 'partial':
+        if df_bars is None or bar_idx is None:
+            # Caller omitted intraday context — fall back to legacy (documented).
+            return daily_window_for(df_day, bar_date, mode='legacy')
         return partial_daily_window(df_day, df_bars, bar_idx)
     return daily_window_for(df_day, bar_date)
 
@@ -788,9 +825,12 @@ def run_backtest(df_bars, df_day, verbose=False):
     # This simulates "what we knew at that point in time"
     daily_trend_cache = {}
 
+    dm = daily_mode()
     print(f"\n[*] Starting backtest: {total_bars} bars, warmup={WARMUP_BARS}")
     print(f"    Position sizes: via _volume_risk_tier (aligned≈0.02, mild=0.01, severe=0.005)")
     print(f"    Contract multiplier: ${CONTRACT_MULTIPLIER}/$1 per 1.0 lot")
+    print(f"    Daily window mode: {dm}"
+          + (" (current-day full candle = look-ahead)" if dm == 'legacy' else ""))
     print()
 
     for i in range(WARMUP_BARS, total_bars):
@@ -805,10 +845,8 @@ def run_backtest(df_bars, df_day, verbose=False):
 
         # ── Daily trend (as of this bar's date) ──
         bar_date = current_date.date()
-        # In partial-candle mode the daily state changes on EVERY bar (live's
-        # candle is still growing), so the cache is keyed by the bar timestamp
-        # instead of the date. Otherwise one computation per date, as before.
-        trend_key = current_date if DAILY_TREND_PARTIAL_CANDLE else bar_date
+        # Partial mode: daily state changes every bar (live's candle grows).
+        trend_key = current_date if dm == 'partial' else bar_date
         if trend_key not in daily_trend_cache:
             daily_window = daily_window_at(df_day, df_bars, i, bar_date)
             if daily_window is not None and len(daily_window) >= 30:
@@ -904,13 +942,6 @@ def run_backtest(df_bars, df_day, verbose=False):
         # attach kline_confirmed/counter_trend_severity/seedable fields.
         try:
             candle_m30 = detect_candlestick_patterns(window, lookback=12)
-            # 2026-09-12 review (second call site): this daily window feeds
-            # _inject_kline_scores -> kline_confirmed, which the strict cron gate
-            # requires. It was still slicing `df_day.index.date <= bar_date`,
-            # i.e. the CURRENT day's full candle, so BT_DAILY_COMPLETED_ONLY could
-            # be on while this path kept looking ahead. Route it through the same
-            # helper as the trend filter — every daily window must come from
-            # daily_window_for().
             day_window = daily_window_at(df_day, df_bars, i, bar_date)
             candle_day = detect_candlestick_patterns(day_window, lookback=8) if day_window is not None and not day_window.empty else []
             _inject_kline_scores(

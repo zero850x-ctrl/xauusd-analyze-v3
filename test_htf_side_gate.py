@@ -23,6 +23,10 @@ try:
 except Exception:
     pass
 
+import datetime as dt
+
+import pandas as pd
+
 DATA_CSV = os.path.join(HERE, "verify_data_paxg_5y.csv")
 
 
@@ -31,6 +35,68 @@ def _sides(trades):
         "BUY": sum(1 for t in trades if t.side == "BUY"),
         "SELL": sum(1 for t in trades if t.side == "SELL"),
     }
+
+
+def test_completed_weekly_drops_partial_tail():
+    """W-FRI map must not label trend from an incomplete trailing week."""
+    from verify_tp_retest import weekly_trend_by_date
+
+    idx = pd.bdate_range("2024-01-01", periods=45, freq="B")
+    close = [100.0 + i * 0.5 for i in range(len(idx))]
+    df_day = pd.DataFrame({
+        "Open": close, "High": [c + 1 for c in close],
+        "Low": [c - 1 for c in close], "Close": close, "Volume": [1.0] * len(close),
+    }, index=idx)
+    d = idx[-3].date()  # Wednesday near sample end
+    htf = weekly_trend_by_date(df_day)
+    assert htf[d] in ("BULLISH", "BEARISH", None)
+
+    # Legacy partial-week bug: resample('W') always has a trailing bucket.
+    w = df_day[df_day.index.date < d]
+    wk_bad = w.resample("W").agg({"Close": "last"}).dropna()
+    wk_good = w.resample("W-FRI").agg({"Close": "last"}).dropna()
+    if w.index[-1].date() < wk_good.index[-1].date():
+        wk_good = wk_good.iloc[:-1]
+    assert len(wk_good) <= len(wk_bad), "completed-week path should not keep extra partial bucket"
+
+
+def test_htf_bar_level_veto_no_substitution():
+    """If trades[0] is blocked, return [] — do not promote trades[1]."""
+    import backtest as bt
+    from verify_tp_retest import make_patch
+
+    class T:
+        def __init__(self, side):
+            self.side = side
+            self.entry_price = 100.0
+            self.stop_price = 90.0
+            self.tp1_price = 110.0
+            self.tp2_price = 120.0
+            self.limit_order = False
+            self.pattern_type = "test"
+            self.signal_date = None
+
+    orig_trades = [T("SELL"), T("BUY")]
+    saved = bt.setups_to_trades
+
+    def fake_setups(*_a, **_k):
+        return orig_trades
+
+    bt.setups_to_trades = fake_setups
+    stats = {"htf_blocked": 0, "htf_blocked_buy": 0, "htf_blocked_sell": 0,
+             "htf_seen": 0, "htf_no_opinion": 0}
+    htf = {dt.date(2026, 1, 5): "BULLISH"}  # blocks SELL under sellhtf
+    df_bars = pd.DataFrame(
+        {"Open": [100.0], "High": [101.0], "Low": [99.0], "Close": [100.0], "Volume": [1.0]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-01-05 12:00")]),
+    )
+    patched, _ = make_patch(df_bars, "sellhtf", stats, htf=htf)
+    try:
+        out = patched([], 100.0, 5.0, 0, pd.Timestamp("2026-01-05 12:00"), {}, {})
+    finally:
+        bt.setups_to_trades = saved
+    assert out == [], f"expected bar-level veto, got {out}"
+    assert stats["htf_blocked"] == 1 and stats["htf_blocked_sell"] == 1
 
 
 def test_gate_semantics():

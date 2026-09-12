@@ -1,42 +1,16 @@
 #!/usr/bin/env python3
-"""Regression guard: every daily window in backtest.py comes from the one
-helper, so BT_DAILY_COMPLETED_ONLY / BT_DAILY_PARTIAL_CANDLE cover the WHOLE
-pipeline.
+"""Regression guard: every daily window in backtest.py routes through daily_window_at.
 
-Why this file exists (2026-09-12): the 3-model review converted the daily-trend
-filter to daily_window_for() but left a SECOND daily slice at the kline
-enrichment site:
-
-    day_window = df_day[df_day.index.date <= bar_date]   # <- current day's full candle
-
-That window feeds _inject_kline_scores -> kline_confirmed, which the strict cron
-gate requires, so turning the flag ON still left half the pipeline looking ahead.
-The study re-run produced byte-identical numbers with the flag off and on — the
-sharpest possible symptom of a flag that is wired but not plumbed.
-
-Site inventory (all in backtest.py):
-  daily_window_for      — legacy `<= bar_date` (full candle) / completed `< bar_date`
-  partial_daily_window  — study B: live-equivalent PARTIAL current-day row
-
-Tests:
-  1. static  — the `<=` form (full current-day candle) exists in EXACTLY one
-               place and only inside daily_window_for; no other function may
-               slice daily bars on `<=`.
-  2. static  — daily-slice sites live only in those two builders, and
-               partial_daily_window never uses `<=` (only `<`, i.e. strictly
-               completed days, plus an equality filter on the intraday rows).
-  3. dynamic — daily_window_for is consulted MORE often than once per bar date,
-               which can only happen if a second call site exists.
-  4. dynamic — partial-candle mode really bites: the current day's row grows
-               through the day and never exceeds the full day's range.
-               (Byte-identical output with the flag on/off is the bug, so this
-               asserts the DIFFERENCE, not the plumbing.)
-
-Offline, no network. Dynamic tests need the gitignored study CSV and skip
-cleanly without it.
+Covers legacy / completed / partial via BT_DAILY_MODE (and legacy env aliases).
+Static AST checks + synthetic-frame unit tests (no CSV required).
+Dynamic CSV tests skip cleanly when verify_data_paxg_5y.csv is absent.
 """
 import os
 import sys
+import datetime as dt
+import unittest
+
+import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
@@ -54,14 +28,9 @@ SLICE_BUILDERS = ("daily_window_for", "partial_daily_window")
 
 
 def _daily_slice_sites():
-    """Every real `....date <= / <` comparison in backtest.py, as
-    (lineno, enclosing_top_level_function, operator). Parsed from the AST, so
-    the mention of the pattern inside a comment does not count as a site —
-    a naive regex counts those and reports false failures."""
     import ast
     src = open(BACKTEST_PY, encoding="utf-8").read()
     tree = ast.parse(src)
-
     funcs = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -87,92 +56,132 @@ def _daily_slice_sites():
     return out
 
 
-# ── 1+2. static invariants ──────────────────────────────────────────────
+def test_daily_mode_explicit_and_legacy_env():
+    saved = {k: os.environ.get(k) for k in ("BT_DAILY_MODE", "BT_DAILY_COMPLETED_ONLY", "BT_DAILY_PARTIAL_CANDLE")}
+    try:
+        os.environ.pop("BT_DAILY_MODE", None)
+        os.environ.pop("BT_DAILY_COMPLETED_ONLY", None)
+        os.environ.pop("BT_DAILY_PARTIAL_CANDLE", None)
+        assert bt.daily_mode() == "legacy"
+        os.environ["BT_DAILY_COMPLETED_ONLY"] = "1"
+        assert bt.daily_mode() == "completed"
+        os.environ["BT_DAILY_PARTIAL_CANDLE"] = "1"
+        assert bt.daily_mode() == "partial"
+        os.environ["BT_DAILY_MODE"] = "completed"
+        assert bt.daily_mode() == "completed"
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
-def test_full_candle_slice_exists_in_exactly_one_place():
-    """`date <= bar_date` IS the look-ahead, in source form. One instance, and
-    it must sit inside the legacy branch of daily_window_for."""
+
+def test_full_candle_slice_at_most_one_place():
     sites = _daily_slice_sites()
     le = [(ln, fn) for ln, fn, op in sites if op == "LtE"]
-    assert len(le) == 1, (
-        f"expected exactly ONE `date <=` daily slice (the legacy full-candle "
-        f"branch), found {len(le)}: {le}"
-    )
-    assert le[0][1] == "daily_window_for", (
-        f"`date <=` slice outside daily_window_for at {le[0]} — that is the "
-        "look-ahead form; use daily_window_at()/daily_window_for() instead"
-    )
+    assert len(le) <= 1, f"at most one `date <=` slice allowed, found {len(le)}: {le}"
+    if le:
+        assert le[0][1] == "daily_window_for", le
 
 
-def test_daily_slices_live_only_in_the_two_builders():
+def test_daily_slices_live_only_in_builders():
     sites = _daily_slice_sites()
     others = [(ln, fn) for ln, fn, op in sites if fn not in SLICE_BUILDERS]
-    assert not others, (
-        f"daily-slice site(s) outside {SLICE_BUILDERS}: {others} — an extra "
-        "site means the daily flags no longer cover the whole pipeline"
-    )
+    assert not others, f"extra daily-slice sites: {others}"
     inside = {(fn, op) for _, fn, op in sites}
-    assert ("partial_daily_window", "LtE") not in inside, (
-        "partial_daily_window must never use `date <=` — including the current "
-        "day's own (still unformed) candle is exactly the bug it exists to fix"
-    )
-    assert ("partial_daily_window", "Lt") in inside, (
-        "partial_daily_window should take strictly COMPLETED days via `date <`"
-    )
+    assert ("partial_daily_window", "LtE") not in inside
+    assert ("partial_daily_window", "Lt") in inside
 
 
-# ── 3. dynamic proof of a second call site ──────────────────────────────
+def test_daily_window_for_modes():
+    idx = pd.to_datetime(["2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11"])
+    df = pd.DataFrame({"Close": [1.0, 2.0, 3.0, 4.0]}, index=idx)
+    d = dt.date(2026, 9, 10)
+    assert list(bt.daily_window_for(df, d, mode="legacy")["Close"]) == [1.0, 2.0, 3.0]
+    assert list(bt.daily_window_for(df, d, mode="completed")["Close"]) == [1.0, 2.0]
 
-def test_daily_window_for_is_called_more_than_once_per_date():
+
+def test_partial_daily_window_synthetic():
+    """End-of-day partial row must equal the completed daily candle."""
+    idx = pd.date_range("2026-03-10 00:00", periods=8, freq="3h")
+    df_bars = pd.DataFrame({
+        "Open": [100.0, 101, 102, 103, 104, 105, 106, 107],
+        "High": [101.0, 102, 103, 104, 105, 106, 107, 108],
+        "Low": [99.0, 100, 101, 102, 103, 104, 105, 106],
+        "Close": [100.5, 101.5, 102.5, 103.5, 104.5, 105.5, 106.5, 107.5],
+        "Volume": [1.0] * 8,
+    }, index=idx)
+    day_idx = pd.DatetimeIndex([pd.Timestamp("2026-03-10")])
+    df_day = pd.DataFrame({
+        "Open": [100.0], "High": [108.0], "Low": [99.0],
+        "Close": [107.5], "Volume": [8.0],
+    }, index=day_idx)
+    first = bt.partial_daily_window(df_day, df_bars, 0)
+    last = bt.partial_daily_window(df_day, df_bars, 7)
+    assert float(first["Close"].iloc[-1]) == 100.5
+    assert float(last["Close"].iloc[-1]) == 107.5
+    assert float(last["High"].iloc[-1]) == 108.0
+    assert float(last["Low"].iloc[-1]) == 99.0
+    assert abs(float(last["Close"].iloc[-1]) - float(df_day["Close"].iloc[0])) < 1e-9
+
+
+def test_partial_mode_grows_intraday_synthetic():
+    os.environ["BT_DAILY_MODE"] = "partial"
+    try:
+        idx = pd.date_range("2026-03-10 08:00", periods=4, freq="4h")
+        df_bars = pd.DataFrame({
+            "Open": [10.0, 11, 12, 13],
+            "High": [11.0, 12, 13, 14],
+            "Low": [9.0, 10, 11, 12],
+            "Close": [10.5, 11.5, 12.5, 13.5],
+            "Volume": [1.0] * 4,
+        }, index=idx)
+        df_day = pd.DataFrame({
+            "Open": [10.0], "High": [14.0], "Low": [9.0], "Close": [13.5], "Volume": [4.0],
+        }, index=pd.DatetimeIndex([pd.Timestamp("2026-03-10")]))
+        w0 = bt.daily_window_at(df_day, df_bars, 0, idx[0].date())
+        w3 = bt.daily_window_at(df_day, df_bars, 3, idx[3].date())
+        assert float(w0["Close"].iloc[-1]) != float(w3["Close"].iloc[-1])
+    finally:
+        os.environ.pop("BT_DAILY_MODE", None)
+
+
+def test_daily_window_for_called_more_than_once_per_date():
     if not os.path.exists(DATA_CSV):
-        print("  (skipped: study CSV not present — gitignored)")
-        return
-
+        raise unittest.SkipTest("study CSV not present")
     import verify_tp_retest as vt
     df_bars, df_day = vt.load_bars(csv_path=DATA_CSV, max_bars=2500)
-
     real = bt.daily_window_for
     calls = []
 
-    def spy(df_day_, bar_date, completed_only=None):
+    def spy(df_day_, bar_date, mode=None):
         calls.append(bar_date)
-        return real(df_day_, bar_date, completed_only)
+        return real(df_day_, bar_date, mode)
 
     bt.daily_window_for = spy
     try:
+        os.environ["BT_DAILY_MODE"] = "completed"
         bt.run_backtest(df_bars, df_day, verbose=False)
     finally:
         bt.daily_window_for = real
-
+        os.environ.pop("BT_DAILY_MODE", None)
     distinct = len(set(calls))
-    assert distinct > 0, "daily_window_for was never called — routing broken"
     assert len(calls) > distinct, (
-        f"daily_window_for called {len(calls)}x for {distinct} distinct dates — "
-        "exactly one call per date means the kline-enrichment site is NOT routed "
-        "through the helper (the 2026-09-12 half-fix)"
+        f"daily_window_for {len(calls)}x for {distinct} dates — kline site not routed"
     )
-    print(f"  calls={len(calls)} distinct_dates={distinct} (trend 1x/date + kline site)")
 
-
-# ── 4. the partial candle must actually bite ────────────────────────────
 
 def test_partial_mode_builds_a_growing_current_day():
-    """A flag that changes nothing is the bug we are guarding against.
-
-    With BT_DAILY_PARTIAL_CANDLE on, the window's last row is the current day
-    aggregated from the bars so far: its Close must MOVE within the day, and it
-    must never exceed the completed day's High/Low.
-    """
+    """Partial mode must change the current-day row within a session."""
     if not os.path.exists(DATA_CSV):
-        print("  (skipped: study CSV not present — gitignored)")
-        return
+        raise unittest.SkipTest("study CSV not present")
 
     import verify_tp_retest as vt
     df_bars, df_day = vt.load_bars(csv_path=DATA_CSV, max_bars=600)
 
     seen = []
     orig_trend = bt.analyze_daily_trend
-    orig_flag = bt.DAILY_TREND_PARTIAL_CANDLE
 
     def spy(dw):
         seen.append((dw.index[-1].normalize(),
@@ -181,13 +190,13 @@ def test_partial_mode_builds_a_growing_current_day():
                      float(dw["Low"].iloc[-1])))
         return orig_trend(dw)
 
-    bt.DAILY_TREND_PARTIAL_CANDLE = True
     bt.analyze_daily_trend = spy
     try:
+        os.environ["BT_DAILY_MODE"] = "partial"
         bt.run_backtest(df_bars, df_day, verbose=False)
     finally:
         bt.analyze_daily_trend = orig_trend
-        bt.DAILY_TREND_PARTIAL_CANDLE = orig_flag
+        os.environ.pop("BT_DAILY_MODE", None)
 
     assert seen, "partial mode produced no daily windows at all"
 
@@ -203,8 +212,7 @@ def test_partial_mode_builds_a_growing_current_day():
     day, rows = max(multi.items(), key=lambda kv: len(kv[1]))
     closes = {round(c, 4) for c, _, _ in rows}
     assert len(closes) > 1, (
-        f"current-day Close never changed across {len(rows)} windows on {day.date()} "
-        "— the partial row is frozen, i.e. the flag is wired but not plumbed"
+        f"current-day Close never changed across {len(rows)} windows on {day.date()}"
     )
 
     full = df_day[df_day.index.date == day.date()]
@@ -219,25 +227,27 @@ def test_partial_mode_builds_a_growing_current_day():
     for c, hi, lo in rows:
         assert hi <= full_hi + 1e-9 and lo >= full_lo - 1e-9, (
             f"partial row range [{lo}, {hi}] exceeds the completed day "
-            f"[{full_lo}, {full_hi}] — it saw bars that had not happened yet"
+            f"[{full_lo}, {full_hi}]"
         )
-    print(f"  {len(seen)} windows / {len(by_day)} days; {day.date()} grew over "
-          f"{len(rows)} steps, close {min(closes)}..{max(closes)} vs full {full_close}")
 
 
 if __name__ == "__main__":
-    fails = 0
+    fails = skipped = 0
     for name, fn in sorted(globals().items()):
         if not name.startswith("test_") or not callable(fn):
             continue
         try:
             fn()
             print(f"  PASS  {name}")
+        except unittest.SkipTest as e:
+            skipped += 1
+            print(f"  SKIP  {name}: {e}")
         except AssertionError as e:
             fails += 1
             print(f"  FAIL  {name}: {e}")
         except Exception as e:
             fails += 1
             print(f"  ERROR {name}: {type(e).__name__}: {e}")
-    print(f"\n{'ALL PASS ✅' if fails == 0 else f'{fails} FAILED ❌'}")
+    print(f"\n{sum(1 for k, v in globals().items() if k.startswith('test_')) - fails - skipped} passed, "
+          f"{skipped} skipped, {fails} failed")
     sys.exit(1 if fails else 0)

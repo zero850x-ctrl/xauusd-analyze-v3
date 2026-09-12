@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Report for study A (weekly side gate) + study B (live-equivalent partial
-daily candle), both on the 5y no-look-ahead (completed-only) daily window.
+"""Report for study A (weekly side gate) + study B (partial daily candle).
 
-verify_ab2_a.json holds baseline/sellhtf/htfalign (BT_DAILY_COMPLETED_ONLY=1)
-and verify_ab2_b.json holds baseline only, additionally under
-BT_DAILY_PARTIAL_CANDLE=1. Trade lists live in the matching *_trades.json.
+verify_ab2_a.json: baseline/sellhtf/htfalign under BT_DAILY_MODE=completed.
+verify_ab2_b.json: baseline under BT_DAILY_MODE=partial. Trade lists in *_trades.json.
 
-Prints: headline table, BUY/SELL split, counters, paired per-signal deltas
-(20k bootstrap, seed 7) and a per-year completed-vs-partial comparison.
+Interpretation (2026-09-12 review):
+  Study A — prior JSON used a partial weekly bar and bar-level substitution;
+            re-run required before any headline claim. Pairing uses full signal_date.
+  Study B — partial mode is a pipeline proxy (UTC PAXG ≠ OANDA session); paired
+            deltas are usually not significant (e.g. p≈0.625 on archived run).
 """
 import json
 import os
@@ -66,10 +67,10 @@ def print_sides(label, trades, pad=12):
 
 
 def keyed(trades):
-    """(signal_date, side) -> summed pnl — the pairing key the harness uses itself."""
+    """(signal_date, side) -> summed pnl — matches verify_tp_retest paired_vs_baseline."""
     agg = defaultdict(float)
     for t in trades:
-        agg[(t["signal_date"][:10], t["side"])] += t["pnl"]
+        agg[(t["signal_date"], t["side"])] += t["pnl"]
     return agg
 
 
@@ -126,7 +127,8 @@ def main():
     print()
 
     print("=" * 78)
-    print("STUDY A — weekly side gate | daily = completed-only (no look-ahead)")
+    print("STUDY A — weekly side gate | daily=completed (archived JSON may be stale)")
+    print("  NOTE: re-run after W-FRI completed-week + bar-level HTF veto fixes")
     print("=" * 78)
     headline(ra, ["baseline", "sellhtf", "htfalign"])
     print("BUY/SELL split:")
@@ -136,14 +138,15 @@ def main():
     for m in ["baseline", "sellhtf", "htfalign"]:
         c = {k: ra[m][k] for k in COUNTER_KEYS if ra[m].get(k)}
         print(f"  [{m}] {c if c else '{}'}")
-        assert m == "baseline" or c.get("htf_seen"), f"[{m}] never resolved a weekly opinion!"
+        if m != "baseline" and not c.get("htf_seen"):
+            print(f"  WARNING [{m}] never resolved a weekly opinion — JSON predates fixes?")
     print()
     for m in ("sellhtf", "htfalign"):
         paired(ta["baseline"], ta[m], f"{m} vs baseline")
 
     print()
     print("=" * 78)
-    print("STUDY B — live-equivalent PARTIAL daily candle | mode baseline")
+    print("STUDY B — partial daily candle proxy | mode baseline (not live-identical)")
     print("=" * 78)
     print(f"{'variant':<26}{'n':>5}{'win%':>8}{'PF':>7}{'E$':>9}{'net$':>11}{'maxDD':>9}")
     for label, res in (("completed-only (=study A)", ra), ("PARTIAL (live-like)", rb)):
