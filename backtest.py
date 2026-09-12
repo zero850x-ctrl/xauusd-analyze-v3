@@ -850,7 +850,14 @@ def run_backtest(df_bars, df_day, verbose=False):
         # attach kline_confirmed/counter_trend_severity/seedable fields.
         try:
             candle_m30 = detect_candlestick_patterns(window, lookback=12)
-            day_window = df_day[df_day.index.date <= bar_date] if df_day is not None else df_day
+            # 2026-09-12 review (second call site): this daily window feeds
+            # _inject_kline_scores -> kline_confirmed, which the strict cron gate
+            # requires. It was still slicing `df_day.index.date <= bar_date`,
+            # i.e. the CURRENT day's full candle, so BT_DAILY_COMPLETED_ONLY could
+            # be on while this path kept looking ahead. Route it through the same
+            # helper as the trend filter — every daily window must come from
+            # daily_window_for().
+            day_window = daily_window_for(df_day, bar_date)
             candle_day = detect_candlestick_patterns(day_window, lookback=8) if day_window is not None and not day_window.empty else []
             _inject_kline_scores(
                 setups, candle_m30, candle_day,
