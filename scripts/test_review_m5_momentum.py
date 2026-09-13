@@ -2,6 +2,7 @@
 """Act-on fixes from multi-model review (m5 + momentum-hold)."""
 import os
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
 import numpy as np
@@ -11,6 +12,28 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import analyze_v3 as av
 import paper_trade as pt
 from paper_trade import HKT
+
+# 2026-09-12T20:00:00Z == 2026-09-13 04:00 HKT — an instant where the HKT date
+# (today) and the UTC date (still yesterday) disagree. Used with the frozen
+# clock below so a day-boundary test has teeth at ANY run hour instead of only
+# during 00:00-08:00 HKT.
+BOUNDARY_UTC = datetime(2026, 9, 12, 20, 0, tzinfo=timezone.utc)
+
+
+@contextmanager
+def frozen_clock(instant):
+    """Freeze paper_trade's wall clock (test-only seam; no prod code involved)."""
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz) if tz else instant.replace(tzinfo=None)
+
+    original = pt.datetime
+    pt.datetime = _Frozen
+    try:
+        yield
+    finally:
+        pt.datetime = original
 
 
 def test_rebound_insufficient_has_stable_schema():
@@ -41,40 +64,37 @@ def test_post_spike_state_ignores_nan():
 def test_consecutive_losses_resets_across_hkt_days():
     """Day boundary for the loss streak is HKT (2026-09-11), not UTC.
 
-    Regression: the fixtures were built from UTC day strings and used a
-    seconds-less "10:00Z" stamp that _hkt_day() cannot parse (it falls back to
-    the raw UTC date slice). Between 00:00-08:00 HKT the UTC date is still
-    yesterday, so the newest loss landed on the "wrong" day and the streak
-    came back 0 instead of 1. Times are 04:00Z = 12:00 HKT, i.e. the HKT day
-    always equals the UTC day, so the fixture is stable at any run hour.
+    2026-09-13: this test used to stamp every loss at 04:00Z (= 12:00 HKT),
+    where the HKT and UTC dates are identical — a regression that sourced
+    "today" from the UTC date (the 09-11 bug) passed it silently. The clock is
+    now frozen at 2026-09-12T20:00:00Z = 2026-09-13 04:00 HKT, where the HKT
+    date is today and the UTC date is still yesterday, so the assertion fails
+    at any run hour if "today" comes from UTC while the stamps stay HKT.
+
+    The stamps are also seconds-complete ("T20:00:00Z"): _hkt_day() cannot
+    parse a seconds-less "T20:00Z" and falls back to a raw UTC date slice.
     """
-    hkt_today = datetime.now(HKT)
-    today = hkt_today.strftime("%Y-%m-%d")
-    yesterday = (hkt_today - timedelta(days=1)).strftime("%Y-%m-%d")
-    log = {
-        "history": [
-            {"pnl_r": -1.0, "closed_time": f"{yesterday}T04:00:00Z", "verified": True},
-            {"pnl_r": -1.0, "closed_time": f"{today}T04:00:00Z", "verified": True},
+    with frozen_clock(BOUNDARY_UTC):
+        # two losses closed at 04:00 / 05:00 HKT today → streak alive
+        log = {
+            "history": [
+                {"pnl_r": -1.0, "closed_time": "2026-09-12T20:00:00Z", "verified": True},
+                {"pnl_r": -1.0, "closed_time": "2026-09-12T21:00:00Z", "verified": True},
+            ]
+        }
+        assert pt._consecutive_losses(log) == 2
+
+        # 23:59:59 HKT yesterday is a different HKT day → nothing carried over
+        log["history"] = [
+            {"pnl_r": -1.0, "closed_time": "2026-09-12T15:59:59Z", "verified": True}]
+        assert pt._consecutive_losses(log) == 0
+
+        # a win today ends the streak
+        log["history"] = [
+            {"pnl_r": -1.0, "closed_time": "2026-09-12T20:00:00Z", "verified": True},
+            {"pnl_r": 0.8, "closed_time": "2026-09-12T21:00:00Z", "verified": True},
         ]
-    }
-    assert pt._consecutive_losses(log) == 1
-
-    # a second loss on the same HKT day keeps the streak alive
-    log["history"].append(
-        {"pnl_r": -1.0, "closed_time": f"{today}T05:00:00Z", "verified": True})
-    assert pt._consecutive_losses(log) == 2
-
-    # only yesterday's loss → nothing carried over into today
-    log["history"] = [
-        {"pnl_r": -1.0, "closed_time": f"{yesterday}T04:00:00Z", "verified": True}]
-    assert pt._consecutive_losses(log) == 0
-
-    # a win today ends the streak
-    log["history"] = [
-        {"pnl_r": -1.0, "closed_time": f"{today}T04:00:00Z", "verified": True},
-        {"pnl_r": 0.8, "closed_time": f"{today}T05:00:00Z", "verified": True},
-    ]
-    assert pt._consecutive_losses(log) == 0
+        assert pt._consecutive_losses(log) == 0
 
 
 if __name__ == "__main__":

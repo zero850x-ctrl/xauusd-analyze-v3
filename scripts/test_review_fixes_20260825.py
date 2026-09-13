@@ -6,7 +6,8 @@ must not call gold-api. M15 venue is covered by test_paxg_fallback.py.
 """
 import os
 import sys
-from datetime import datetime, timezone, timedelta
+from contextlib import contextmanager
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
@@ -16,6 +17,27 @@ except Exception:
     pass
 
 import paper_trade as pt
+
+# 2026-09-12T20:00:00Z == 2026-09-13 04:00 HKT — the HKT date is today while the
+# UTC date is still yesterday, so "today" sourced from UTC is detectable at any
+# run hour (it used to be detectable only between 00:00-08:00 HKT).
+BOUNDARY_UTC = datetime(2026, 9, 12, 20, 0, tzinfo=timezone.utc)
+
+
+@contextmanager
+def frozen_clock(instant):
+    """Freeze paper_trade's wall clock (test-only seam; no prod code involved)."""
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz) if tz else instant.replace(tzinfo=None)
+
+    original = pt.datetime
+    pt.datetime = _Frozen
+    try:
+        yield
+    finally:
+        pt.datetime = original
 
 
 def check(name, cond):
@@ -110,22 +132,52 @@ def test_json_path_local():
             check("json path defaults to constructed local path", path == expected)
 
 
+def test_hkt_day_boundary_is_hkt_not_utc():
+    """16:00Z is 00:00 HKT — _hkt_day() must cut the day on HKT, not UTC.
+
+    2026-09-13: clock-independent on purpose. The sibling tests stamp times
+    where the HKT and UTC dates coincide (04:00Z = 12:00 HKT), so a day
+    boundary that reverted to UTC kept passing them. These stamps straddle the
+    HKT midnight, so the UTC answer differs from the HKT answer by
+    construction — no dependency on when the suite runs.
+    """
+    check("b1 15:59:59Z is still 09-12 HKT",
+          pt._hkt_day("2026-09-12T15:59:59Z") == "2026-09-12")
+    check("b2 16:00:00Z is already 09-13 HKT (00:00 HKT)",
+          pt._hkt_day("2026-09-12T16:00:00Z") == "2026-09-13")
+    check("b3 20:00:00Z is 09-13 HKT (04:00 HKT)",
+          pt._hkt_day("2026-09-12T20:00:00Z") == "2026-09-13")
+    check("b4 23:59:59Z is 09-13 HKT (07:59 HKT)",
+          pt._hkt_day("2026-09-12T23:59:59Z") == "2026-09-13")
+    check("b5 date-only fallback preserved", pt._hkt_day("2026-09-12") == "2026-09-12")
+    check("b6 empty is None", pt._hkt_day("") is None)
+
+
 def test_daily_loss_hkt():
-    hkt_now = datetime.now(pt.HKT)
-    today_hkt = hkt_now.strftime("%Y-%m-%d")
-    log = {
-        "trades": [],
-        "history": [
-            {"id": f"{today_hkt}-01", "status": "CLOSED", "seeded_date": today_hkt,
-             "pnl_r": -3.0, "verified": True},
-        ],
-    }
-    check("2a hkt-dated loss counted", pt._daily_loss_r(log) == -3.0)
-    tomorrow = (hkt_now + timedelta(days=1)).strftime("%Y-%m-%d")
-    log["history"][0]["seeded_date"] = tomorrow
-    check("2b non-today excluded", pt._daily_loss_r(log) == 0.0)
-    log["history"][0].update({"seeded_date": today_hkt, "verified": False})
-    check("2c unverified excluded", pt._daily_loss_r(log) == 0.0)
+    """2026-09-11: the daily-loss circuit breaker uses the HKT trade day.
+
+    2026-09-13: the clock is frozen at 2026-09-12T20:00:00Z (04:00 HKT on
+    09-13) and the seeds are literal date strings, so sourcing "today" from UTC
+    flips them from counted to excluded at ANY run hour. The previous version
+    derived its seeds from datetime.now(pt.HKT) and only had teeth between
+    00:00-08:00 HKT.
+    """
+    with frozen_clock(BOUNDARY_UTC):
+        log = {
+            "trades": [],
+            "history": [
+                {"id": "2026-09-13-01", "status": "CLOSED", "seeded_date": "2026-09-13",
+                 "pnl_r": -3.0, "verified": True},
+            ],
+        }
+        check("2a hkt-dated loss counted", pt._daily_loss_r(log) == -3.0)
+        # 09-12 is the UTC date of the frozen instant; in HKT it is yesterday
+        log["history"][0]["seeded_date"] = "2026-09-12"
+        check("2b utc-dated seed excluded", pt._daily_loss_r(log) == 0.0)
+        log["history"][0]["seeded_date"] = "2026-09-14"
+        check("2c tomorrow excluded", pt._daily_loss_r(log) == 0.0)
+        log["history"][0].update({"seeded_date": "2026-09-13", "verified": False})
+        check("2d unverified excluded", pt._daily_loss_r(log) == 0.0)
 
 
 def test_series_last_close_helper():
@@ -141,6 +193,7 @@ if __name__ == "__main__":
         test_tv_paxg_trusted,
         test_gcf_dollar_band,
         test_json_path_local,
+        test_hkt_day_boundary_is_hkt_not_utc,
         test_daily_loss_hkt,
         test_series_last_close_helper,
     ]
