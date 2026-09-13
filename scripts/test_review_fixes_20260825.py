@@ -87,27 +87,32 @@ def test_gcf_dollar_band():
     )
 
 
-def test_json_path_utc():
-    utc_today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def test_json_path_local():
+    """2026-09-11: _json_path() resolves the LOCAL (HKT) date, matching the
+    analyze_v3 --output filename written by cron (`$(date +%Y-%m-%d)`). It
+    falls back to the newest analyze JSON if today's file is missing."""
+    local_today = datetime.now(pt.HKT).strftime("%Y-%m-%d")
     path = pt._json_path()
-    check("json path uses UTC date", utc_today in path)
+    check("json path exists", os.path.exists(path))
+    if os.path.exists(os.path.expanduser(f"~/.hermes/reports/xauusd_v3_{local_today}.json")):
+        check("json path uses local (HKT) date", local_today in path)
 
 
-def test_daily_loss_utc():
-    utc_now = datetime.now(timezone.utc)
-    today_utc = utc_now.strftime("%Y-%m-%d")
+def test_daily_loss_hkt():
+    hkt_now = datetime.now(pt.HKT)
+    today_hkt = hkt_now.strftime("%Y-%m-%d")
     log = {
         "trades": [],
         "history": [
-            {"id": f"{today_utc}-01", "status": "CLOSED", "seeded_date": today_utc,
+            {"id": f"{today_hkt}-01", "status": "CLOSED", "seeded_date": today_hkt,
              "pnl_r": -3.0, "verified": True},
         ],
     }
-    check("2a utc-dated loss counted", pt._daily_loss_r(log) == -3.0)
-    tomorrow = (utc_now + timedelta(days=1)).strftime("%Y-%m-%d")
+    check("2a hkt-dated loss counted", pt._daily_loss_r(log) == -3.0)
+    tomorrow = (hkt_now + timedelta(days=1)).strftime("%Y-%m-%d")
     log["history"][0]["seeded_date"] = tomorrow
     check("2b non-today excluded", pt._daily_loss_r(log) == 0.0)
-    log["history"][0].update({"seeded_date": today_utc, "verified": False})
+    log["history"][0].update({"seeded_date": today_hkt, "verified": False})
     check("2c unverified excluded", pt._daily_loss_r(log) == 0.0)
 
 
@@ -123,8 +128,8 @@ if __name__ == "__main__":
     tests = [
         test_tv_paxg_trusted,
         test_gcf_dollar_band,
-        test_json_path_utc,
-        test_daily_loss_utc,
+        test_json_path_local,
+        test_daily_loss_hkt,
         test_series_last_close_helper,
     ]
     failed = 0

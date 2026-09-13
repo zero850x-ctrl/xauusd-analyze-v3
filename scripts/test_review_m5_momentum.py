@@ -10,6 +10,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import analyze_v3 as av
 import paper_trade as pt
+from paper_trade import HKT
 
 
 def test_rebound_insufficient_has_stable_schema():
@@ -37,16 +38,43 @@ def test_post_spike_state_ignores_nan():
     assert av._post_spike_state(closes, atr=1.0) is None
 
 
-def test_consecutive_losses_resets_across_utc_days():
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+def test_consecutive_losses_resets_across_hkt_days():
+    """Day boundary for the loss streak is HKT (2026-09-11), not UTC.
+
+    Regression: the fixtures were built from UTC day strings and used a
+    seconds-less "10:00Z" stamp that _hkt_day() cannot parse (it falls back to
+    the raw UTC date slice). Between 00:00-08:00 HKT the UTC date is still
+    yesterday, so the newest loss landed on the "wrong" day and the streak
+    came back 0 instead of 1. Times are 04:00Z = 12:00 HKT, i.e. the HKT day
+    always equals the UTC day, so the fixture is stable at any run hour.
+    """
+    hkt_today = datetime.now(HKT)
+    today = hkt_today.strftime("%Y-%m-%d")
+    yesterday = (hkt_today - timedelta(days=1)).strftime("%Y-%m-%d")
     log = {
         "history": [
-            {"pnl_r": -1.0, "closed_time": f"{yesterday}T10:00:00Z", "verified": True},
-            {"pnl_r": -1.0, "closed_time": f"{today}T10:00:00Z", "verified": True},
+            {"pnl_r": -1.0, "closed_time": f"{yesterday}T04:00:00Z", "verified": True},
+            {"pnl_r": -1.0, "closed_time": f"{today}T04:00:00Z", "verified": True},
         ]
     }
     assert pt._consecutive_losses(log) == 1
+
+    # a second loss on the same HKT day keeps the streak alive
+    log["history"].append(
+        {"pnl_r": -1.0, "closed_time": f"{today}T05:00:00Z", "verified": True})
+    assert pt._consecutive_losses(log) == 2
+
+    # only yesterday's loss → nothing carried over into today
+    log["history"] = [
+        {"pnl_r": -1.0, "closed_time": f"{yesterday}T04:00:00Z", "verified": True}]
+    assert pt._consecutive_losses(log) == 0
+
+    # a win today ends the streak
+    log["history"] = [
+        {"pnl_r": -1.0, "closed_time": f"{today}T04:00:00Z", "verified": True},
+        {"pnl_r": 0.8, "closed_time": f"{today}T05:00:00Z", "verified": True},
+    ]
+    assert pt._consecutive_losses(log) == 0
 
 
 if __name__ == "__main__":
@@ -54,7 +82,7 @@ if __name__ == "__main__":
         test_rebound_insufficient_has_stable_schema,
         test_rebound_closed_bar_uses_utc_not_local,
         test_post_spike_state_ignores_nan,
-        test_consecutive_losses_resets_across_utc_days,
+        test_consecutive_losses_resets_across_hkt_days,
     ]
     failed = 0
     for fn in tests:

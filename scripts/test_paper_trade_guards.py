@@ -70,7 +70,7 @@ def test_counts_toward_r():
 
 
 def test_daily_loss_skips_unverified():
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(pt.HKT).strftime("%Y-%m-%d")
     log = {
         "trades": [],
         "history": [
@@ -146,7 +146,7 @@ def test_calendar_and_report_date():
     assert pt._calendar_date(None) is None
     assert pt._calendar_date("2026-08-24T12:00:00Z") == "2026-08-24"
     assert pt._calendar_date("not-a-date") is None
-    assert pt._report_date({"date": ""}) == datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    assert pt._report_date({"date": ""}) == datetime.now(pt.HKT).strftime("%Y-%m-%d")
     assert pt._report_date({"date": "2026-08-24"}) == "2026-08-24"
 
 
