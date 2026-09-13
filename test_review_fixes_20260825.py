@@ -91,11 +91,23 @@ def test_json_path_local():
     """2026-09-11: _json_path() resolves the LOCAL (HKT) date, matching the
     analyze_v3 --output filename written by cron (`$(date +%Y-%m-%d)`). It
     falls back to the newest analyze JSON if today's file is missing."""
+    import glob
     local_today = datetime.now(pt.HKT).strftime("%Y-%m-%d")
     path = pt._json_path()
-    check("json path exists", os.path.exists(path))
-    if os.path.exists(os.path.expanduser(f"~/.hermes/reports/xauusd_v3_{local_today}.json")):
-        check("json path uses local (HKT) date", local_today in path)
+    check("json path under reports", "xauusd_v3_" in path and path.endswith(".json"))
+    today_path = os.path.expanduser(f"~/.hermes/reports/xauusd_v3_{local_today}.json")
+    if os.path.exists(today_path):
+        check("json path uses local (HKT) date", path == today_path)
+    else:
+        cands = sorted(
+            glob.glob(os.path.expanduser("~/.hermes/reports/xauusd_v3_*.json")),
+            key=os.path.getmtime, reverse=True)
+        if cands:
+            check("json path falls back to newest", path == cands[0])
+        else:
+            expected = os.path.expanduser(
+                f"~/.hermes/reports/xauusd_v3_{datetime.now().strftime('%Y-%m-%d')}.json")
+            check("json path defaults to constructed local path", path == expected)
 
 
 def test_daily_loss_hkt():
