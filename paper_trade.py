@@ -44,7 +44,21 @@ except Exception:
     _tv = None
     _TV_AVAILABLE = False
 
-LOG_PATH = os.path.expanduser("~/.hermes/reports/paper_trade_log.json")
+# 2026-09-14: overridable so verification scripts / test harnesses can point at a
+# sandbox file instead of the live ledger. Unset ⇒ live path (cron unchanged).
+LOG_PATH = os.path.expanduser(
+    os.environ.get("XAUUSD_PAPER_LOG") or "~/.hermes/reports/paper_trade_log.json"
+)
+
+# ── Seed shape guard (2026-09-14) ──────────────────────────────────────────
+# An entry this far from the report's price is fixture / stale data, not a
+# market setup. Incident: 2026-09-13 09:13 HKT a verification script proxied the
+# paper_trade module, so the test harness's `save_log` stub landed on the proxy
+# and the real `save_log` wrote two test-fixture BUYs (entry 3400, SL 3300,
+# quality "?") into the live ledger while XAUUSD traded ~4332. They then held
+# the "opposite LIVE — no stacking" gate shut (and faked +9.5R floating on BUY)
+# until they were found on 09-14.
+MAX_ENTRY_DRIFT_PCT = 0.10
 
 
 def _json_path():
@@ -646,7 +660,9 @@ def save_log(log):
 # Independent state file — never touches the main paper_trade_log.
 # Informational only: no push gate impact.
 # ═══════════════════════════════════════════════════════════
-MARTINGALE_PATH = os.path.expanduser("~/.hermes/reports/paper_martingale.json")
+MARTINGALE_PATH = os.path.expanduser(
+    os.environ.get("XAUUSD_PAPER_MARTINGALE") or "~/.hermes/reports/paper_martingale.json"
+)
 MART_LOT0 = 0.01
 MART_MAX_LEVEL = 3            # 0.01 → 0.02 → 0.04 (study: 3 levels capture all gains)
 MART_HOLD_MINUTES = 10        # snapshot close at ~10 min hold
@@ -1016,6 +1032,41 @@ def discipline_check(log, direction, volume, sl_price, entry_price, atr):
     return True, "✅"
 
 
+def _entry_shape_ok(entry, stop, price, is_sell):
+    """Reject fixture-shaped / stale seeds. Returns (ok: bool, reason: str).
+
+    2026-09-14: added after two test-fixture trades (entry 3400 vs a 4332 market)
+    were written into the live ledger and sat there for a day. `price` is the
+    report's spot; when it is missing only the stop-side checks apply.
+    """
+    try:
+        entry_f = float(str(entry).replace("$", "").replace(",", "").strip())
+        stop_f = float(str(stop).replace("$", "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return False, f"🚫 entry/stop 唔係數字 (entry={entry!r} stop={stop!r})"
+    if entry_f <= 0 or stop_f <= 0:
+        return False, f"🚫 entry/stop 唔係正數 (entry={entry_f:g} stop={stop_f:g})"
+    if price:
+        try:
+            price_f = float(price)
+        except (TypeError, ValueError):
+            price_f = 0.0
+        if price_f > 0:
+            drift = abs(entry_f - price_f) / price_f
+            if drift > MAX_ENTRY_DRIFT_PCT:
+                return False, (
+                    f"🚫 entry {entry_f:g} 離現價 {price_f:g} 有 {drift * 100:.1f}% "
+                    f"(> {MAX_ENTRY_DRIFT_PCT * 100:.0f}%) — 疑似 fixture / 過期數據"
+                )
+    if entry_f == stop_f:
+        return False, f"🚫 entry {entry_f:g} 同止損一樣"
+    if is_sell and stop_f < entry_f:
+        return False, f"🚫 SELL 止損 {stop_f:g} 喺 entry {entry_f:g} 下面 — 錯誤方向"
+    if not is_sell and stop_f > entry_f:
+        return False, f"🚫 BUY 止損 {stop_f:g} 喺 entry {entry_f:g} 上面 — 錯誤方向"
+    return True, "ok"
+
+
 def seed_trades(data, setups=None):
     """Create paper trades from analyze_v3 JSON setups (only cron_push_eligible ones)."""
     if setups is None:
@@ -1073,6 +1124,11 @@ def seed_trades(data, setups=None):
             # Reject a stale setup if the latest report price has already
             # crossed its protective stop.
             report_price = float(current_price) if current_price else None
+            shape_ok, shape_why = _entry_shape_ok(entry, stop, report_price, is_sell)
+            if not shape_ok:
+                skipped += 1
+                print(f"  {shape_why} ({s.get('pattern', '?')}) — 拒絕 seed")
+                continue
             if report_price is not None and ((is_sell and report_price >= stop) or
                                               (not is_sell and report_price <= stop)):
                 skipped += 1

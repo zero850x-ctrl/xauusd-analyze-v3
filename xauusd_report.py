@@ -22,7 +22,14 @@ from datetime import datetime, timedelta, timezone
 REPORT_DIR = os.path.expanduser("~/.hermes/reports")
 HKT = timezone(timedelta(hours=8))
 DEDUP_ENTRY_PCT = 0.004  # 0.4% — 同一訊號 entry 微調判重
-HISTORY_LOG = os.path.join(REPORT_DIR, "push_history.json")
+# push_history.json 路徑 — env 覆寫（XAUUSD_PUSH_HISTORY）俾測試/驗證 script
+# sandbox 用；unset（cron 正常情況）⇒ 照用 live 路徑，零改動。
+# 2026-09-14：test_report_logic.py 之前會直接寫 live 檔（fixture 4434 污染去重記錄）。
+HISTORY_LOG = os.environ.get("XAUUSD_PUSH_HISTORY") or os.path.join(REPORT_DIR, "push_history.json")
+# 2026-09-14: a LIVE row whose entry is this far from spot is bad / fixture data —
+# print ⚠️ STALE 而唔印由假 entry 算出嘅浮盈。Incident: two test-fixture BUYs at
+# 3400 reported "2 LIVE … float +948" while XAUUSD traded ~4332.
+MAX_ENTRY_DRIFT_PCT = 0.10
 
 
 def load_json(path, required=True):
@@ -63,8 +70,12 @@ def _clean_price(value):
     return s
 
 
-def paper_stats():
-    """正統 paper：LIVE + CLOSED/W/L/勝率/sumR + 今日 PnL + CLOSED 明細行。"""
+def paper_stats(spot=None):
+    """正統 paper：LIVE + CLOSED/W/L/勝率/sumR + 今日 PnL + CLOSED 明細行。
+
+    `spot` = 報告現價。有現價時，LIVE 倉嘅 entry 離現價太遠（> MAX_ENTRY_DRIFT_PCT）
+    就當壞數據：標 ⚠️ STALE、唔印浮盈（2026-09-14 fixture 污染事件）。
+    """
     d = load_json(os.path.join(REPORT_DIR, "paper_trade_log.json"), required=False)
     history = d.get("history", []) if isinstance(d, dict) else []
     live = d.get("trades", []) if isinstance(d, dict) else []
@@ -100,9 +111,26 @@ def paper_stats():
 
     # LIVE 明細行：🔴/🟢 [形態] [方向] @ entry (SL/TP1) float
     live_lines = []
+    stale_live = []
     for t in live:
         pat = (t.get("pattern") or "").replace("🚩 ", "").replace("🔺 ", "").replace("🔻 ", "")
         emoji = "🟢" if "BUY" in str(t.get("direction", "")).upper() else "🔴"
+        drift = None
+        if spot is not None:
+            try:
+                entry_v = float(str(t.get("entry")).replace("$", "").replace(",", ""))
+                spot_v = float(spot)
+                if spot_v > 0:
+                    drift = abs(entry_v - spot_v) / spot_v
+            except (TypeError, ValueError):
+                drift = None
+        if drift is not None and drift > MAX_ENTRY_DRIFT_PCT:
+            stale_live.append({"id": t.get("id"), "entry": t.get("entry"), "drift_pct": round(drift * 100, 1)})
+            live_lines.append(
+                f"{emoji} {pat} {t.get('direction')} @ {t.get('entry')} — "
+                f"⚠️ STALE 離現價 {drift * 100:.0f}%（疑似壞數據，唔計浮盈）"
+            )
+            continue
         fp = t.get("floating_pnl")
         fp_txt = f" float {'+' if fp is not None and fp >= 0 else ''}{fp:.2f}" if fp is not None else ""
         live_lines.append(
@@ -114,7 +142,7 @@ def paper_stats():
     return {
         "n": n, "wins": wins, "losses": losses, "win_pct": win_pct,
         "sum_r": sum_r, "today_r": today_r, "lines": lines,
-        "open_live": open_live, "live_lines": live_lines,
+        "open_live": open_live, "live_lines": live_lines, "stale_live": stale_live,
     }
 
 
@@ -216,7 +244,7 @@ def build_format_a(data, candidates):
 def build_status(data, gc_note=None, dedup_note=None):
     source = data.get("data_source") or "TradingView"
     m5m15 = m5m15_line(data)
-    paper = paper_stats()
+    paper = paper_stats(data.get("price"))
     mart = martingale_stats()
 
     lines = ["📊 STATUS",
@@ -235,6 +263,11 @@ def build_status(data, gc_note=None, dedup_note=None):
     # LIVE 明細行（每倉一行）—— 2026-09-10 用戶要求：淨睇數字唔知個倉係咩
     for ll in paper["live_lines"]:
         lines.append(f"  {ll}")
+    # 壞數據警示（2026-09-14）：LIVE 倉 entry 離現價 >10% ⇒ 唔可以靜靜咁當正常倉
+    if paper["stale_live"]:
+        ids = ", ".join(str(s.get("id")) for s in paper["stale_live"])
+        lines.append(f"⚠️ {len(paper['stale_live'])} 個 LIVE 倉離現價 "
+                     f"> {MAX_ENTRY_DRIFT_PCT * 100:.0f}%（{ids}）— 疑似壞數據，請查 paper_trade_log.json")
     # 馬丁
     if mart:
         lines.append(f"📋 馬丁: {mart['n']}筆已平倉 ({mart['wins']}W/{mart['losses']}L, "
@@ -280,7 +313,7 @@ def main():
                       f"訊號已推送（entry ${s.get('entry_price')} 微調，非新訊號）")
 
     # 4. Paper/馬丁狀態（格式 C 行）
-    paper = paper_stats()
+    paper = paper_stats(data.get("price"))
     mart = martingale_stats()
     c_lines = list(paper["lines"])
     if args.skip_paper:

@@ -297,6 +297,81 @@ def test_seed_breakout_and_pullback_can_stack():
     assert [t["id"] for t in out["trades"]] == [f"{today}-01", f"{today}-02"]
 
 
+def test_entry_shape_ok_unit():
+    """2026-09-14: entry/stop shape guard (unit)."""
+    ok, why = pt._entry_shape_ok(3400, 3300, 4332.78, False)
+    assert not ok and "離現價" in why, why
+    ok, why = pt._entry_shape_ok(4333.0, 4300.0, 4332.78, False)
+    assert ok, why
+    ok, why = pt._entry_shape_ok("$3,400", "$3,300", None, False)
+    assert ok, why  # no spot ⇒ only the stop-side checks apply
+    ok, why = pt._entry_shape_ok(3400, 3400, None, False)
+    assert not ok, why
+    ok, why = pt._entry_shape_ok(3400, 3450, None, False)
+    assert not ok and "錯誤方向" in why, why  # BUY stop above entry
+    ok, why = pt._entry_shape_ok(3400, 3350, None, True)
+    assert not ok and "錯誤方向" in why, why  # SELL stop below entry
+    ok, why = pt._entry_shape_ok("abc", 3300, None, False)
+    assert not ok, why
+    ok, why = pt._entry_shape_ok(100.0, 90.0, 110.0, False)   # 9.09% off
+    assert ok, why
+    ok, why = pt._entry_shape_ok(100.0, 90.0, 111.3, False)   # 10.15% off
+    assert not ok, why
+
+
+def test_seed_refuses_fixture_entry_far_from_price():
+    """Regression for the 2026-09-13 live-ledger pollution: a fixture entry 3400
+    must not be seeded while the report price is 4332."""
+    log = {"trades": [], "history": []}
+    saved = []
+    orig = {
+        "load": pt.load_log, "save": pt.save_log,
+        "danger": pt._runtime_danger_blocked, "daily": pt._daily_loss_r,
+        "disc": pt.discipline_check,
+    }
+    pt.load_log = lambda: log
+    pt.save_log = lambda x: saved.append(copy.deepcopy(x))
+    pt._runtime_danger_blocked = lambda data=None: False
+    pt._daily_loss_r = lambda _log: 0
+    pt.discipline_check = lambda *a, **k: (True, "ok")
+    try:
+        ok = pt.seed_trades({"date": "2026-08-24", "price": 4332.78, "atr_30m": 13.4},
+                            [_buy_setup()])
+    finally:
+        pt.load_log = orig["load"]
+        pt.save_log = orig["save"]
+        pt._runtime_danger_blocked = orig["danger"]
+        pt._daily_loss_r = orig["daily"]
+        pt.discipline_check = orig["disc"]
+    assert not ok
+    assert all(s["trades"] == [] for s in saved), saved
+
+
+def test_log_paths_env_override():
+    """XAUUSD_PAPER_LOG / XAUUSD_PAPER_MARTINGALE keep verification runs off the
+    live ledger; unset ⇒ live paths (so cron behaviour is unchanged)."""
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = here if os.path.exists(os.path.join(here, "paper_trade.py")) else os.path.dirname(here)
+    code = "import paper_trade as pt; print(pt.LOG_PATH); print(pt.MARTINGALE_PATH)"
+    env = dict(os.environ, XAUUSD_PAPER_LOG="/tmp/xauusd_guard_check.json",
+               XAUUSD_PAPER_MARTINGALE="/tmp/xauusd_guard_mart.json")
+    out = subprocess.run([sys.executable, "-c", code], cwd=root, env=env,
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    lines = out.stdout.strip().splitlines()
+    assert lines[0] == "/tmp/xauusd_guard_check.json", lines
+    assert lines[1] == "/tmp/xauusd_guard_mart.json", lines
+    env2 = {k: v for k, v in os.environ.items()
+            if k not in ("XAUUSD_PAPER_LOG", "XAUUSD_PAPER_MARTINGALE")}
+    out2 = subprocess.run([sys.executable, "-c", code], cwd=root, env=env2,
+                          capture_output=True, text=True)
+    assert out2.returncode == 0, out2.stderr
+    lines2 = out2.stdout.strip().splitlines()
+    assert lines2[0].endswith("/.hermes/reports/paper_trade_log.json"), lines2
+    assert lines2[1].endswith("/.hermes/reports/paper_martingale.json"), lines2
+
+
 if __name__ == "__main__":
     tests = [
         test_norm_dir,
@@ -316,6 +391,9 @@ if __name__ == "__main__":
         test_seed_id_after_history_close,
         test_seed_skips_live_and_closed_same_key,
         test_seed_breakout_and_pullback_can_stack,
+        test_entry_shape_ok_unit,
+        test_seed_refuses_fixture_entry_far_from_price,
+        test_log_paths_env_override,
     ]
     failed = 0
     for fn in tests:

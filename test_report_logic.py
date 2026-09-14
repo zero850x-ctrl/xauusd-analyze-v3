@@ -6,11 +6,24 @@
 """
 import json
 import os
+import shutil
 import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import xauusd_report as R
+
+# ── 隔離（2026-09-14）：所有 push_history 寫入一律去 sandbox ──
+# 之前 t_dedup 收尾會還原 HISTORY_LOG 去 live 路徑，之後 t_wa_push_write
+# 用 fixture（Double Bottom BUY @4434）call record_push → 寫真 live
+# push_history.json，污染去重記錄（同日真訊號 entry 落 4434±0.4% 會被吞）。
+_SANDBOX_DIR = tempfile.mkdtemp(prefix="push_history_sandbox_")
+SANDBOX_HISTORY = os.path.join(_SANDBOX_DIR, "push_history.json")
+LIVE_HISTORY = os.path.expanduser(os.path.join(R.REPORT_DIR, "push_history.json"))
+os.environ["XAUUSD_PUSH_HISTORY"] = SANDBOX_HISTORY
+R.HISTORY_LOG = SANDBOX_HISTORY
+# 成個 test run 開頭嘅 live 檔快照 —— run 完一定唔可以變（見 t_live_history_untouched）
+_LIVE_SNAPSHOT = open(LIVE_HISTORY, "rb").read() if os.path.exists(LIVE_HISTORY) else None
 
 FAIL = []
 CHECKS = 0
@@ -101,7 +114,7 @@ def t_dedup():
     keep, dup = R.dedup_check(None, cand3, enabled=True)
     check("方向相反 → 唔係 dup", len(dup) == 0 and len(keep) == 1)
     os.unlink(hist_path)
-    R.HISTORY_LOG = os.path.join(R.REPORT_DIR, "push_history.json")
+    R.HISTORY_LOG = SANDBOX_HISTORY  # 還原去 sandbox（唔可以還原去 live）
 
 
 def t_wa_push_write():
@@ -157,7 +170,70 @@ def t_live_count():
     shutil.rmtree(tmpdir)
 
 
+def t_stale_live_flag():
+    print("== LIVE 壞數據旗標（2026-09-14 fixture 污染事件）==")
+    import shutil
+    import tempfile as tf
+    tmpdir = tf.mkdtemp()
+    phantoms = [
+        {"status": "LIVE", "id": "2026-08-24-03", "pattern": "🚩 Bull Flag (牛旗)",
+         "direction": "🟢 BUY", "entry": "3400.0", "stop_loss": "3300.0",
+         "tp1": "3450.0", "floating_pnl": 948.01},
+        {"status": "LIVE", "id": "good-1", "pattern": "🔺 Double Bottom (雙底)",
+         "direction": "🔴 SELL", "entry": "4330.0", "stop_loss": "4360.0",
+         "tp1": "4270.0", "floating_pnl": 12.5},
+    ]
+    with open(os.path.join(tmpdir, "paper_trade_log.json"), "w") as f:
+        json.dump({"trades": phantoms, "history": []}, f)
+    old = R.REPORT_DIR
+    R.REPORT_DIR = tmpdir
+    try:
+        p = R.paper_stats(4332.78)
+        no_spot = R.paper_stats()
+        status = R.build_status(make_data(price=4332.78))
+    finally:
+        R.REPORT_DIR = old
+    shutil.rmtree(tmpdir)
+    live_txt = "\n".join(p["live_lines"])
+    check("STALE 倉標 ⚠️", "⚠️ STALE" in live_txt, p["live_lines"])
+    check("STALE 倉唔印假浮盈", "948" not in live_txt, live_txt)
+    check("STALE 倉 id 正確", [s["id"] for s in p["stale_live"]] == ["2026-08-24-03"],
+          p["stale_live"])
+    check("正常倉照印浮盈", "float +12.50" in live_txt, live_txt)
+    check("正常倉唔誤判", all(s["id"] != "good-1" for s in p["stale_live"]))
+    check("STATUS 有壞數據警示行", "疑似壞數據" in status, status)
+    check("冇現價唔誤報", no_spot["stale_live"] == [], no_spot["stale_live"])
+
+
+def t_push_history_sandboxed():
+    print("== push_history sandbox（唔可以寫 live）==")
+    check("HISTORY_LOG 指向 sandbox 而唔係 live",
+          os.path.realpath(R.HISTORY_LOG) != os.path.realpath(LIVE_HISTORY),
+          f"HISTORY_LOG={R.HISTORY_LOG}")
+    check("env XAUUSD_PUSH_HISTORY 生效",
+          os.path.realpath(os.environ.get("XAUUSD_PUSH_HISTORY", "")) == os.path.realpath(SANDBOX_HISTORY))
+    before = open(LIVE_HISTORY, "rb").read() if os.path.exists(LIVE_HISTORY) else None
+    d = make_data(push_candidates=[dict(SETUP)])
+    R.record_push(d, d["push_candidates"])
+    after = open(LIVE_HISTORY, "rb").read() if os.path.exists(LIVE_HISTORY) else None
+    check("record_push 之後 live push_history 一個 byte 都冇變", before == after)
+    check("sandbox 檔收到記錄",
+          os.path.exists(SANDBOX_HISTORY) and os.path.getsize(SANDBOX_HISTORY) > 2
+          and "4434" in open(SANDBOX_HISTORY).read())
+
+
+def t_live_history_untouched():
+    """收尾防線：任何 test 中途把 HISTORY_LOG 撥返 live 都會被呢個 test 抓到。"""
+    print("== 收尾：live push_history 全程未變 ==")
+    check("HISTORY_LOG 仍然指向 sandbox",
+          os.path.realpath(R.HISTORY_LOG) == os.path.realpath(SANDBOX_HISTORY),
+          f"HISTORY_LOG={R.HISTORY_LOG}")
+    now = open(LIVE_HISTORY, "rb").read() if os.path.exists(LIVE_HISTORY) else None
+    check("live push_history 內容同 run 前一樣", now == _LIVE_SNAPSHOT)
+
+
 if __name__ == "__main__":
+    t_push_history_sandboxed()  # 放最前：驗 module-level 隔離有生效
     t_format_a()
     t_format_b_and_gc()
     t_dedup()
@@ -165,6 +241,9 @@ if __name__ == "__main__":
     t_martingale()
     t_clean_price()
     t_live_count()
+    t_stale_live_flag()
+    t_live_history_untouched()  # 收尾防線（要喺所有 test 之後）
+    shutil.rmtree(_SANDBOX_DIR, ignore_errors=True)
     print(f"\n結果: {CHECKS - len(FAIL)}/{CHECKS} pass")
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  ")
