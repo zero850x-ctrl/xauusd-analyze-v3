@@ -88,7 +88,10 @@ def test_discipline_stacking():
     assert ok, "first same-direction stack should pass"
     no, reason = pt.discipline_check(one, "🔴 SELL", 0.01, 3500.0, 3400.0, atr)
     assert not no and "Opposite" in reason
-    # 3rd tranche = pyramiding: needs an existing same-dir LIVE ≥ +1R floating
+    # 2026-09-09: PYRAMID_FREE_TRANCHES=2 → the 3rd same-direction tranche needs
+    # an existing same-direction trade at ≥ +1R floating (no scaling into a loser),
+    # so it is blocked by the pyramiding rule rather than the concurrency cap.
+    # The cap still binds at 3 LIVE same-direction — see `three` below.
     winner = {"status": "LIVE", "direction": "🟢 BUY", "entry": 3400.0,
               "stop_loss": 3300.0, "floating_pnl": 120.0}
     two_flat = {"trades": [
