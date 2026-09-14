@@ -157,6 +157,41 @@ def t_live_count():
     shutil.rmtree(tmpdir)
 
 
+def t_stale_live_flag():
+    print("== LIVE 壞數據旗標（2026-09-14 fixture 污染事件）==")
+    import shutil
+    import tempfile as tf
+    tmpdir = tf.mkdtemp()
+    phantoms = [
+        {"status": "LIVE", "id": "2026-08-24-03", "pattern": "🚩 Bull Flag (牛旗)",
+         "direction": "🟢 BUY", "entry": "3400.0", "stop_loss": "3300.0",
+         "tp1": "3450.0", "floating_pnl": 948.01},
+        {"status": "LIVE", "id": "good-1", "pattern": "🔺 Double Bottom (雙底)",
+         "direction": "🔴 SELL", "entry": "4330.0", "stop_loss": "4360.0",
+         "tp1": "4270.0", "floating_pnl": 12.5},
+    ]
+    with open(os.path.join(tmpdir, "paper_trade_log.json"), "w") as f:
+        json.dump({"trades": phantoms, "history": []}, f)
+    old = R.REPORT_DIR
+    R.REPORT_DIR = tmpdir
+    try:
+        p = R.paper_stats(4332.78)
+        no_spot = R.paper_stats()
+        status = R.build_status(make_data(price=4332.78))
+    finally:
+        R.REPORT_DIR = old
+    shutil.rmtree(tmpdir)
+    live_txt = "\n".join(p["live_lines"])
+    check("STALE 倉標 ⚠️", "⚠️ STALE" in live_txt, p["live_lines"])
+    check("STALE 倉唔印假浮盈", "948" not in live_txt, live_txt)
+    check("STALE 倉 id 正確", [s["id"] for s in p["stale_live"]] == ["2026-08-24-03"],
+          p["stale_live"])
+    check("正常倉照印浮盈", "float +12.50" in live_txt, live_txt)
+    check("正常倉唔誤判", all(s["id"] != "good-1" for s in p["stale_live"]))
+    check("STATUS 有壞數據警示行", "疑似壞數據" in status, status)
+    check("冇現價唔誤報", no_spot["stale_live"] == [], no_spot["stale_live"])
+
+
 if __name__ == "__main__":
     t_format_a()
     t_format_b_and_gc()
@@ -165,6 +200,7 @@ if __name__ == "__main__":
     t_martingale()
     t_clean_price()
     t_live_count()
+    t_stale_live_flag()
     print(f"\n結果: {CHECKS - len(FAIL)}/{CHECKS} pass")
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  ")
