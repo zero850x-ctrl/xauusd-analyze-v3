@@ -68,6 +68,10 @@ python3 paper_trade.py
 # 歷史 backtest
 python3 paper_trade.py --backtest
 
-# Guard 離線測試
+# Guard 離線測試（單一檔；全部測試請用下面嘅 run_tests.sh）
 python3 scripts/test_paper_trade_guards.py
+
+# 全部測試 —— 掃 repo root 同 scripts/ 兩邊（root 13 + scripts 7 = 20 個）
+bash run_tests.sh
 ```
+> 跑測試一律用 `bash run_tests.sh`（唔好自己 `python3 test_*.py`：root glob 會漏晒 `scripts/` 嗰批 stacking / seed / path-overlay 斷言）。exit 0 = 全部 test pass 而且 run 期間冇 test 寫到 `~/.hermes/reports/*.json`。
