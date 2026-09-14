@@ -22,7 +22,10 @@ from datetime import datetime, timedelta, timezone
 REPORT_DIR = os.path.expanduser("~/.hermes/reports")
 HKT = timezone(timedelta(hours=8))
 DEDUP_ENTRY_PCT = 0.004  # 0.4% — 同一訊號 entry 微調判重
-HISTORY_LOG = os.path.join(REPORT_DIR, "push_history.json")
+# push_history.json 路徑 — env 覆寫（XAUUSD_PUSH_HISTORY）俾測試/驗證 script
+# sandbox 用；unset（cron 正常情況）⇒ 照用 live 路徑，零改動。
+# 2026-09-14：test_report_logic.py 之前會直接寫 live 檔（fixture 4434 污染去重記錄）。
+HISTORY_LOG = os.environ.get("XAUUSD_PUSH_HISTORY") or os.path.join(REPORT_DIR, "push_history.json")
 # 2026-09-14: a LIVE row whose entry is this far from spot is bad / fixture data —
 # print ⚠️ STALE 而唔印由假 entry 算出嘅浮盈。Incident: two test-fixture BUYs at
 # 3400 reported "2 LIVE … float +948" while XAUUSD traded ~4332.
