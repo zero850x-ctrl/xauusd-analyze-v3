@@ -5,9 +5,10 @@ paper_trade judged every close on whatever series `_fetch_m30` returned. Its
 TradingView branch passed `TVInterval.min_30`, which the installed tvdatafeed
 does not have (the member is `in_30_minute`); the AttributeError was swallowed
 by the fallback chain, so EVERY tick silently fell through to PAXG-USD.
-PAXG runs a median $2.24 above spot on the high (138 M30 bars, 09-10→09-14),
-enough to trip a stop the traded venue never touched: trade 2026-09-14-01 was
-booked SL -1.0R @4320.15 by PAXG while spot's overnight high was 4317.83.
+PAXG (a 24/7 token, not the OANDA spot the report trades) ran rich of spot —
+on the tie-bar that closed trade 2026-09-14-01 its M30 high printed 4323.09
+while OANDA spot never exceeded 4317.83, so a stop the traded venue never
+touched was booked as SL -1.0R @4320.15.
 
 These tests are offline: bars and source are injected, state is a temp file.
 """

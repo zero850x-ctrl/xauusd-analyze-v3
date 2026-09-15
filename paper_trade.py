@@ -1159,6 +1159,37 @@ def seed_trades(data, setups=None):
     return new_count > 0
 
 
+# 2026-09-15: tvDatafeed builds its DataFrame index with
+# `datetime.datetime.fromtimestamp(...)` (tvDatafeed/main.py:143) → the naive
+# stamps it hands back are LOCAL time (HKT on this box), NOT UTC. Every
+# consumer here compares bar times against UTC (seeded_time / now), so a raw TV
+# series was shifted +8h: the exit sim walked bars from 8 hours BEFORE the
+# trade existed and booked stops off pre-entry prices (09-15: 2026-09-14-01
+# re-closed −1.28R on a bar that printed before the seed). Convert local → UTC
+# at the source, and warn (never silently shift) if the newest bar looks stale.
+_LOCAL_TZ = datetime.now().astimezone().tzinfo
+
+
+def _tv_bars_to_utc(bars, stale_minutes=90):
+    """tvDatafeed's naive bar stamps are local time → return UTC-naive times."""
+    dt = bars['datetime']
+    if getattr(dt.dt, 'tz', None) is not None:
+        dt = dt.dt.tz_convert('UTC')                      # already tz-aware
+    else:
+        dt = dt.dt.tz_localize(_LOCAL_TZ).dt.tz_convert('UTC')
+    bars = bars.copy()
+    bars['datetime'] = dt.dt.tz_localize(None)
+    try:
+        newest = bars['datetime'].max()
+        lag = (datetime.now(timezone.utc).replace(tzinfo=None) - newest).total_seconds() / 60.0
+        if lag > stale_minutes:
+            print(f"  ⚠️ TV bars stale: newest bar {newest}Z is {lag:.0f}min behind now "
+                  f"— alignment unverified")
+    except Exception:
+        pass
+    return bars
+
+
 def _fetch_m30(start, end):
     """Fetch M30 OHLC data for the given date range via yfinance or TradingView.
 
@@ -1187,12 +1218,13 @@ def _fetch_m30(start, end):
             if bars is not None and not bars.empty:
                 bars = bars.reset_index()
                 if 'datetime' in bars.columns:
-                    # 2026-08-07 fix: normalize to UTC before stripping tz so
-                    # bar times compare chronologically with seeded_time (UTC).
-                    if bars['datetime'].dt.tz is not None:
-                        bars['datetime'] = bars['datetime'].dt.tz_convert('UTC').dt.tz_localize(None)
+                    # 2026-08-07/2026-09-15: tvDatafeed stamps are LOCAL time
+                    # (fromtimestamp) — normalise local → UTC so bar times
+                    # compare chronologically with seeded_time (UTC).
+                    bars = _tv_bars_to_utc(bars)
                 data_source = "tv"
-                print(f"  📊 TradingView M30: {len(bars)} bars")
+                print(f"  📊 TradingView M30: {len(bars)} bars "
+                      f"(last {bars['datetime'].iloc[-1]}Z)")
         except Exception as e:
             print(f"  ⚠️ TradingView fetch failed: {e}")
 
