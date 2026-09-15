@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Offline tests for the 2026-08-25 review fixes (no network).
 
-Series basis uses GC_F_BASIS_FAIL_USD ($40). live_spot is injected — verifier
-must not call gold-api. M15 venue is covered by test_paxg_fallback.py.
+2026-09-15: the series-basis band (GC_F_BASIS_FAIL_USD $40, paxg trusted) is
+replaced by a venue policy — only the signal's own spot feed may decide a
+close. Venue behaviour is covered end-to-end by scripts/test_outcome_venue.py;
+this file keeps the policy unit-level and guards against the band creeping
+back. M15 venue is covered by test_paxg_fallback.py.
 """
 import os
 import sys
@@ -46,67 +49,20 @@ def check(name, cond):
     print(f"OK {name}")
 
 
-def test_tv_paxg_trusted():
-    check("1a tv passes", pt._spot_close_verified(4643.59, 4675.63, 14.43, "tv", {}) is True)
-    check(
-        "1b paxg passes regardless of close-vs-spot gap",
-        pt._spot_close_verified(4643.59, 4675.63, 14.43, "paxg", {"price": 4675.63}) is True,
-    )
+def test_close_venue_policy():
+    """2026-09-15: closes are decided by the signal's own venue only.
 
-
-def test_gcf_dollar_band():
-    spot_json = {"intraday_source": "TradingView (OANDA:XAUUSD)", "price": 4650.0}
-    gc_json = {"data_source": "Yahoo Finance GC=F (紐約期貨)", "price": 4710.0}
-
-    check(
-        "1c $20 premium (normal) passes",
-        pt._spot_close_verified(
-            4643.59, 4650.0, 14.43, "gc_f", spot_json,
-            series_last_close=4670.0, live_spot=4650.0,
-        ) is True,
-    )
-    check(
-        "1d $40 on the fail band still passes (inclusive)",
-        pt._spot_close_verified(
-            4655.00, 4650.0, 14.43, "gc_f", spot_json,
-            series_last_close=4690.0, live_spot=4650.0,
-        ) is True,
-    )
-    check(
-        "1e $45 rollover fails closed",
-        pt._spot_close_verified(
-            4655.00, 4650.0, 14.43, "gc_f", spot_json,
-            series_last_close=4695.0, live_spot=4650.0,
-        ) is False,
-    )
-    check(
-        "1f futures JSON + no live spot fails closed",
-        pt._spot_close_verified(
-            4643.59, gc_json["price"], 14.43, "gc_f", gc_json,
-            series_last_close=4713.70, live_spot=None,
-        ) is False,
-    )
-    check(
-        "1g missing series last fails closed (no fill-vs-quote fallback)",
-        pt._spot_close_verified(
-            4649.80, 4650.0, 14.43, "gc_f", spot_json,
-            series_last_close=None, live_spot=4650.0,
-        ) is False,
-    )
-    check(
-        "1h NaN series last fails closed",
-        pt._spot_close_verified(
-            4649.80, 4650.0, 14.43, "gc_f", spot_json,
-            series_last_close=float("nan"), live_spot=4650.0,
-        ) is False,
-    )
-    check(
-        "1i json-spot fallback when live_spot omitted",
-        pt._spot_close_verified(
-            4643.59, 4655.85, 14.43, "gc_f", spot_json,
-            series_last_close=4656.20, live_spot=None,
-        ) is True,
-    )
+    Replaces the 1a-1i basis band (paxg trusted "regardless of gap", gc_f
+    trusted within $40). Both are different venues: PAXG-USD ran a median
+    $2.24 above spot on the high over 138 M30 bars, enough to trip a stop spot
+    never touched — 2026-09-14-01 booked SL -1.0R @4320.15 while spot's high
+    was 4317.83. Non-spot series now defer to the next spot tick.
+    """
+    check("1a tv passes", pt._close_venue_confirmed("tv") is True)
+    check("1b paxg no longer decisive", pt._close_venue_confirmed("paxg") is False)
+    check("1c gc_f no longer decisive", pt._close_venue_confirmed("gc_f") is False)
+    check("1d unknown source fails closed", pt._close_venue_confirmed("") is False)
+    check("1e missing source fails closed", pt._close_venue_confirmed(None) is False)
 
 
 def test_json_path_local():
@@ -180,22 +136,28 @@ def test_daily_loss_hkt():
         check("2d unverified excluded", pt._daily_loss_r(log) == 0.0)
 
 
-def test_series_last_close_helper():
-    import pandas as pd
-    bars = pd.DataFrame({"close": [4700.0, 4701.5]})
-    check("series last finite", pt._series_last_close(bars) == 4701.5)
-    nan_bars = pd.DataFrame({"close": [4700.0, float("nan")]})
-    check("series last nan is None", pt._series_last_close(nan_bars) is None)
+def test_venue_policy_is_single_source_of_truth():
+    """2026-09-15: the gc_f $40 basis band is gone, not just bypassed.
+
+    The band grew out of trusting a fallback series; keeping it alive behind a
+    venue gate would leave two rules for one question. Non-spot series must
+    have no way to decide a close — mirrored in scripts/test_outcome_venue.py
+    (end-to-end gate) so the policy cannot silently drift.
+    """
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "paper_trade.py"), encoding="utf-8").read()
+    check("gc_f basis band removed", "GC_F_BASIS_FAIL_USD" not in src)
+    check("old verifier removed", "_spot_close_verified" not in src)
+    check("single decisive venue declared", 'CLOSE_DECISIVE_SOURCES = ("tv",)' in src)
 
 
 if __name__ == "__main__":
     tests = [
-        test_tv_paxg_trusted,
-        test_gcf_dollar_band,
+        test_close_venue_policy,
+        test_venue_policy_is_single_source_of_truth,
         test_json_path_local,
         test_hkt_day_boundary_is_hkt_not_utc,
         test_daily_loss_hkt,
-        test_series_last_close_helper,
     ]
     failed = 0
     for fn in tests:
