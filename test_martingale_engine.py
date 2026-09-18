@@ -333,6 +333,100 @@ def test_env_flag_parsing():
     print("test_env_flag_parsing: ✅ all assertions passed (only literal '1' disables)")
 
 
+def test_stale_level_reset():
+    """Deployment hazard (2026-09-18): while the gate blocks, `level` freezes —
+    a blocked signal is not a loss. The first aligned tape after a long drought
+    must NOT open at the frozen level. Dormancy is forced through the `trades`
+    timestamps, never the wall clock."""
+    if os.path.exists(pt.MARTINGALE_PATH):
+        os.remove(pt.MARTINGALE_PATH)
+
+    def state_with(level, hours_ago, open_pos=None, trades=1):
+        """Write a state file, then LOAD it — never hand a half-stale in-memory
+        dict to the cycle (the cycle reloads from disk anyway)."""
+        tr = [] if not trades else [
+            {"close_time": (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat(),
+             "win": False, "level": level}]
+        with open(pt.MARTINGALE_PATH, "w") as f:
+            json.dump({"level": level, "max_level": 3, "open": open_pos, "trades": tr,
+                       "cur_loss_streak": level, "longest_loss_streak": level,
+                       "n_wins": 20, "n_losses": level, "equity_usd": -30.0}, f)
+        return pt.load_martingale_state()
+
+    TH = pt.MART_STALE_LEVEL_HOURS
+
+    # 1. fresh streak → no release, and the frozen level is used (max size)
+    st = state_with(2, 2.0)
+    st = pt.run_martingale_cycle(fresh_data(True, "s-fresh", 4400.0, 4401.0))
+    assert st["open"] is not None and st["open"]["lot"] == 0.04, st["open"]
+    assert st["open"]["level"] == 2, "a 2h dormancy is not stale"
+    assert st["stale_level_resets"] == 0
+
+    # 2. dormant past the threshold → released, so it opens at BASE size
+    st = state_with(2, TH + 1)
+    st = pt.run_martingale_cycle(fresh_data(True, "s-stale", 4400.0, 4401.0))
+    assert st["stale_level_resets"] == 1, "a drought past the threshold must release"
+    assert st["level"] == 0
+    assert st["open"] is not None and st["open"]["lot"] == 0.01, \
+        f"stale streak must open at base size, got {st['open']}"
+    assert st["last_stale_reset_at"] is not None, "the release must be auditable"
+    # only `level` moves — the loss record stays raw
+    assert st["n_losses"] == 2 and st["cur_loss_streak"] == 2, "counters must stay raw"
+
+    # 3. a position that closes THIS tick refreshes the streak → no release.
+    #    This is the ordering guarantee (release runs after the close step).
+    st = state_with(2, TH + 50, open_pos={
+        "signal_time": "old", "open_time": ripe_iso(15), "entry": 4400.0,
+        "lot": 0.04, "level": 2})
+    st = pt.run_martingale_cycle(fresh_data(False, None, None, 4390.0, setups=[]))
+    assert st["open"] is None, "the stale position must close"
+    assert st["stale_level_resets"] == 0, "the close itself refreshed the streak"
+    assert st["cur_loss_streak"] == 3, "the close counts as a real loss"
+    assert st["n_losses"] == 3
+    assert st["level"] == 0, "top-level loss resets to 0 the normal way (not via staleness)"
+
+    # 3b. the same close at a NON-top level keeps the incremented level — proving
+    #     the release really is skipped, not accidentally applied
+    st = state_with(0, TH + 50, open_pos={
+        "signal_time": "old", "open_time": ripe_iso(15), "entry": 4400.0,
+        "lot": 0.01, "level": 0})
+    st = pt.run_martingale_cycle(fresh_data(False, None, None, 4390.0, setups=[]))
+    assert st["stale_level_resets"] == 0 and st["level"] == 1, \
+        f"a fresh loss must leave level 1, got level={st['level']}"
+
+    # 4. level 0 is never 'released' (nothing to release)
+    st = state_with(0, TH + 50)
+    st = pt.run_martingale_cycle(fresh_data(True, "s-lvl0", 4400.0, 4401.0))
+    assert st["stale_level_resets"] == 0, "level 0 has nothing to release"
+    assert st["open"]["lot"] == 0.01
+
+    # 5. no trades at all (inconsistent state) → leave it alone rather than guess
+    st = state_with(2, 0, trades=0)
+    st = pt.run_martingale_cycle(fresh_data(True, "s-notrades", 4400.0, 4401.0))
+    assert st["stale_level_resets"] == 0, "no close history → no basis to release"
+    assert st["open"]["level"] == 2
+
+    # 6. MART_STALE_LEVEL_HOURS=0 disables the rule entirely
+    saved = pt.MART_STALE_LEVEL_HOURS
+    st = state_with(2, 999.0)
+    pt.MART_STALE_LEVEL_HOURS = 0
+    try:
+        st = pt.run_martingale_cycle(fresh_data(True, "s-off", 4400.0, 4401.0))
+        assert st["stale_level_resets"] == 0 and st["open"]["lot"] == 0.04, \
+            "0 must disable the rule"
+    finally:
+        pt.MART_STALE_LEVEL_HOURS = saved
+
+    # 7. the release survives a save/load round-trip (it must persist to disk)
+    st = state_with(2, TH + 1)
+    pt.run_martingale_cycle(fresh_data(True, "s-persist", 4400.0, 4401.0))
+    st = pt.load_martingale_state()
+    assert st["stale_level_resets"] == 1 and st["level"] == 0, "release must persist"
+    assert st["last_stale_reset_at"] is not None
+    print("test_stale_level_reset: ✅ all assertions passed")
+
+
+test_stale_level_reset()
 test_aligned_gate()
 test_producer_contract()
 test_env_flag_parsing()

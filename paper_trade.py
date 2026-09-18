@@ -687,6 +687,25 @@ MART_RESET_AFTER_MAX = True
 # MART_ALIGNED_OFF=1 restores the old always-on behaviour without a revert.
 MART_REQUIRE_ALIGNED = os.environ.get("MART_ALIGNED_OFF") != "1"
 
+# 2026-09-18 (deployment hazard): while the gate blocks, `level` — and the loss
+# streak itself — simply freeze, because a blocked signal is not a loss. Held
+# long enough, the FIRST aligned tape after the drought would open at the frozen
+# level (up to 4× size) to recover a streak that belongs to a different regime.
+# A streak is therefore held at most MART_STALE_LEVEL_HOURS, measured from the
+# last CLOSE (not the last open): once the engine has been dormant that long the
+# next position starts from base size again.
+#
+# 14h is read off the live ledger, not chosen for taste (52 trades, 5 days):
+# median gap between consecutive trades 0.74h, largest 11.75h, and EVERY gap
+# above 8h was the structural overnight break (trading day ends ~22:20 HKT,
+# restarts ~08:15 HKT). 14h therefore clears the largest benign gap by ~19%, so
+# normal operation cannot trip it, while a weekend or any multi-day block does.
+# Verified against history: replaying all 52 trades, a 14h rule fires 0 times and
+# leaves every recorded level untouched (12h also fires 0 times but sits only
+# 0.25h above the largest benign gap; 8h would have altered 2 trades).
+# 0 disables the rule entirely.
+MART_STALE_LEVEL_HOURS = float(os.environ.get("MART_STALE_LEVEL_HOURS", "14"))
+
 
 def _martingale_aligned(setups, side="BUY"):
     """True when the main strategy has an ALIGNED setup in `side`'s direction.
@@ -822,6 +841,8 @@ def _martingale_fresh_state():
         "n_blocked_unaligned": 0,     # option B: S3 signals skipped for lack of an ALIGNED main setup
         "n_blocked_no_setups": 0,     # option B: signal BARS whose payload had no usable setups list
         "last_no_setups_bar": None,   # option B: dedupe the counter above (per bar, not per tick)
+        "stale_level_resets": 0,      # levels released for dormancy (not for a win)
+        "last_stale_reset_at": None,
         "shadow": [],                 # option B: counterfactual entries for blocked signals
         "shadow_trades": [],
         "shadow_equity_usd": 0.0,
@@ -840,7 +861,8 @@ def load_martingale_state():
                       "max_drawdown_usd", "n_wins", "n_losses", "cur_loss_streak",
                       "longest_loss_streak", "n_blocked_unaligned",
                       "n_blocked_no_setups", "last_no_setups_bar", "shadow",
-                      "shadow_trades", "shadow_equity_usd"):
+                      "shadow_trades", "shadow_equity_usd", "stale_level_resets",
+                      "last_stale_reset_at"):
                 st.setdefault(k, _martingale_fresh_state()[k])
             # Normalise the shadow book at the boundary so nothing downstream has
             # to care: the first cut of the option-B branch wrote a single dict,
@@ -882,6 +904,47 @@ def _mart_elapsed_minutes(open_time_iso, now):
         return (now - t).total_seconds() / 60.0
     except Exception:
         return MART_HOLD_MINUTES + 1  # unparseable → treat as ripe
+
+
+def _mart_last_close_dt(st):
+    """Close time of the most recent finished martingale trade, or None.
+
+    Named `_mart_` on purpose: the module already has `_last_close_dt(log)` for
+    the main ledger, whose dicts are shaped differently (`history` vs `trades`).
+    """
+    trades = st.get("trades") or []
+    if not trades:
+        return None
+    last = trades[-1]
+    if not isinstance(last, dict):
+        return None
+    return _parse_dt(last.get("close_time") or last.get("open_time"))
+
+
+def _maybe_stale_level_reset(st, now):
+    """Drop a frozen level once the streak has been dormant too long.
+
+    Called AFTER the close step and BEFORE the open step, so the decision uses
+    the freshest knowledge: a position that closed this tick refreshes the
+    streak (gap ≈ 0, no reset), while a level inherited from an earlier regime
+    across a weekend or a multi-day gate block is released. Only `level` moves —
+    the loss counters stay a raw record of consecutive losses — and returns True
+    when a reset happened.
+    """
+    if MART_STALE_LEVEL_HOURS <= 0 or st.get("level", 0) == 0:
+        return False
+    last = _mart_last_close_dt(st)
+    if last is None:
+        return False
+    hours = (now - last).total_seconds() / 3600.0
+    if hours < MART_STALE_LEVEL_HOURS:
+        return False
+    print(f"[馬丁] 🕰 級{st['level']+1} 已閒置 {hours:.1f}h "
+          f"(> {MART_STALE_LEVEL_HOURS:g}h) — 重設返級1 (streak 屬另一個 regime)")
+    st["level"] = 0
+    st["stale_level_resets"] = st.get("stale_level_resets", 0) + 1
+    st["last_stale_reset_at"] = now.isoformat()
+    return True
 
 
 def run_martingale_cycle(data):
@@ -965,6 +1028,11 @@ def run_martingale_cycle(data):
                   f"${entry_px:.1f} → ${exit_px:.1f} = {'✅ +$%.2f' % pnl if win else '❌ -$%.2f' % -pnl}")
             st["open"] = None
 
+    # ---- 1b. Release a frozen level before sizing the next position ----
+    # Runs after the close step (so a position that just closed counts as fresh)
+    # and before the open step (so the lot size uses the released level).
+    _maybe_stale_level_reset(st, now)
+
     # ---- 2. Open on new S3 signal ----
     # 2026-09-08 review: fill at the LIVE price at this cron tick, not at the
     # signal bar's close. The bar closed up to ~10 min before this tick, so
@@ -1024,6 +1092,7 @@ def run_martingale_cycle(data):
           f"勝率 {wr} ({st['n_wins']}/{n}) | 最長連蝕 {st['longest_loss_streak']}"
           + (f" | ⏭未對齊 {st['n_blocked_unaligned']}" if st.get("n_blocked_unaligned") else "")
           + (f" | ⚠️無 setups {st['n_blocked_no_setups']}" if st.get("n_blocked_no_setups") else "")
+          + (f" | 🕰閒置重設 {st['stale_level_resets']}" if st.get("stale_level_resets") else "")
           + _shadow_status(st))
 
     save_martingale_state(st)
