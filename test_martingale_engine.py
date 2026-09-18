@@ -334,36 +334,43 @@ def test_env_flag_parsing():
 
 
 def test_stale_level_reset():
-    """Deployment hazard (2026-09-18): while the gate blocks, `level` freezes —
-    a blocked signal is not a loss. The first aligned tape after a long drought
-    must NOT open at the frozen level. Dormancy is forced through the `trades`
-    timestamps, never the wall clock."""
+    """Dormancy rule (2026-09-18). Dormancy is driven through the `trades`
+    timestamps; only the fixtures' *base* time is wall-clock, and every margin is
+    hours, so none of this is clock-sensitive."""
     if os.path.exists(pt.MARTINGALE_PATH):
         os.remove(pt.MARTINGALE_PATH)
 
-    def state_with(level, hours_ago, open_pos=None, trades=1):
-        """Write a state file, then LOAD it — never hand a half-stale in-memory
+    def mk_trade(open_h, close_h, win=False, level=0):
+        n = datetime.now(timezone.utc)
+        return {"open_time": (n - timedelta(hours=open_h)).isoformat(),
+                "close_time": (n - timedelta(hours=close_h)).isoformat(),
+                "win": win, "level": level}
+
+    def write_state(level, trades, open_pos=None):
+        """Write a state file then LOAD it — never hand a half-stale in-memory
         dict to the cycle (the cycle reloads from disk anyway)."""
-        tr = [] if not trades else [
-            {"close_time": (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat(),
-             "win": False, "level": level}]
         with open(pt.MARTINGALE_PATH, "w") as f:
-            json.dump({"level": level, "max_level": 3, "open": open_pos, "trades": tr,
-                       "cur_loss_streak": level, "longest_loss_streak": level,
-                       "n_wins": 20, "n_losses": level, "equity_usd": -30.0}, f)
+            json.dump({"level": level, "max_level": 3, "open": open_pos,
+                       "trades": trades, "cur_loss_streak": level,
+                       "longest_loss_streak": level, "n_wins": 20,
+                       "n_losses": level, "equity_usd": -30.0}, f)
         return pt.load_martingale_state()
 
+    def pos(mins_ago, lot, level):
+        return {"signal_time": "old", "open_time": ripe_iso(mins_ago),
+                "entry": 4400.0, "lot": lot, "level": level}
+
     TH = pt.MART_STALE_LEVEL_HOURS
+    assert TH > 0, "these tests assume the rule is enabled"
 
     # 1. fresh streak → no release, and the frozen level is used (max size)
-    st = state_with(2, 2.0)
+    st = write_state(2, [mk_trade(3, 2, level=1)])
     st = pt.run_martingale_cycle(fresh_data(True, "s-fresh", 4400.0, 4401.0))
     assert st["open"] is not None and st["open"]["lot"] == 0.04, st["open"]
-    assert st["open"]["level"] == 2, "a 2h dormancy is not stale"
-    assert st["stale_level_resets"] == 0
+    assert st["stale_level_resets"] == 0, "a 3h-old trade is not dormant"
 
     # 2. dormant past the threshold → released, so it opens at BASE size
-    st = state_with(2, TH + 1)
+    st = write_state(2, [mk_trade(TH + 1, TH + 0.9, level=1)])
     st = pt.run_martingale_cycle(fresh_data(True, "s-stale", 4400.0, 4401.0))
     assert st["stale_level_resets"] == 1, "a drought past the threshold must release"
     assert st["level"] == 0
@@ -373,42 +380,81 @@ def test_stale_level_reset():
     # only `level` moves — the loss record stays raw
     assert st["n_losses"] == 2 and st["cur_loss_streak"] == 2, "counters must stay raw"
 
-    # 3. a position that closes THIS tick refreshes the streak → no release.
-    #    This is the ordering guarantee (release runs after the close step).
-    st = state_with(2, TH + 50, open_pos={
-        "signal_time": "old", "open_time": ripe_iso(15), "entry": 4400.0,
-        "lot": 0.04, "level": 2})
-    st = pt.run_martingale_cycle(fresh_data(False, None, None, 4390.0, setups=[]))
+    # 3. THE OUTAGE PATH: a position opened before the threshold that only closes
+    #    THIS tick. The close is fresh, the streak it completes is not — so the
+    #    clock must read the OPEN. Measuring from the close alone would leave the
+    #    level at 2 here and silently reopen the very hazard this rule closes.
+    st = write_state(1, [mk_trade(TH + 6, TH + 5, level=0)],
+                     open_pos=pos(0, 0.02, 1))
+    st["open"]["open_time"] = (datetime.now(timezone.utc)
+                               - timedelta(hours=TH + 5)).isoformat()
+    pt.save_martingale_state(st)
+    st = pt.run_martingale_cycle(fresh_data(False, None, None, 4380.0, setups=[]))
     assert st["open"] is None, "the stale position must close"
-    assert st["stale_level_resets"] == 0, "the close itself refreshed the streak"
-    assert st["cur_loss_streak"] == 3, "the close counts as a real loss"
-    assert st["n_losses"] == 3
-    assert st["level"] == 0, "top-level loss resets to 0 the normal way (not via staleness)"
+    assert st["n_losses"] == 2, "the close still counts as a real loss"
+    assert st["stale_level_resets"] == 1, \
+        "a close whose own open predates the threshold must release the level"
+    assert st["level"] == 0, f"expected release to base, got level={st['level']}"
 
-    # 3b. the same close at a NON-top level keeps the incremented level — proving
-    #     the release really is skipped, not accidentally applied
-    st = state_with(0, TH + 50, open_pos={
-        "signal_time": "old", "open_time": ripe_iso(15), "entry": 4400.0,
-        "lot": 0.01, "level": 0})
-    st = pt.run_martingale_cycle(fresh_data(False, None, None, 4390.0, setups=[]))
-    assert st["stale_level_resets"] == 0 and st["level"] == 1, \
-        f"a fresh loss must leave level 1, got level={st['level']}"
+    # 4. a position opened and closed NORMALLY does not release, even when older
+    #    trades are ancient: the engine traded 12 min ago, so it was not dormant
+    st = write_state(1, [mk_trade(TH + 9, TH + 8, level=0)],
+                     open_pos=pos(pt.MART_HOLD_MINUTES + 2, 0.02, 1))
+    st = pt.run_martingale_cycle(fresh_data(False, None, None, 4380.0, setups=[]))
+    assert st["open"] is None, "the ripe position must close"
+    assert st["stale_level_resets"] == 0, "a fresh close means not dormant"
+    assert st["level"] == 2, f"a normal loss must level up, got {st['level']}"
 
-    # 4. level 0 is never 'released' (nothing to release)
-    st = state_with(0, TH + 50)
+    # 5. threshold boundary: just under → hold, just over → release
+    st = write_state(2, [mk_trade(TH - 0.5, TH - 0.6, level=1)])
+    st = pt.run_martingale_cycle(fresh_data(True, "s-under", 4400.0, 4401.0))
+    assert st["stale_level_resets"] == 0, "under the threshold must hold"
+    assert st["open"]["lot"] == 0.04
+    st = write_state(2, [mk_trade(TH + 0.002, TH - 0.6, level=1)])
+    st = pt.run_martingale_cycle(fresh_data(True, "s-over", 4400.0, 4401.0))
+    assert st["stale_level_resets"] == 1, "the boundary is inclusive (>= TH h)"
+
+    # 6. `open_time` missing → fall back to `close_time` rather than going blind
+    t = mk_trade(TH + 3, TH + 2, level=1)
+    t.pop("open_time")
+    st = write_state(2, [t])
+    st = pt.run_martingale_cycle(fresh_data(True, "s-closeonly", 4400.0, 4401.0))
+    assert st["stale_level_resets"] == 1, "close_time is the fallback clock"
+    assert st["stale_level_no_basis"] == 0, "a fallback clock is still a clock"
+
+    # 7. a LIVE position is not dormancy — never re-base a level that the open
+    #    position is still tracking (without this guard the release would fire,
+    #    because trades[-1] is stale)
+    st = write_state(2, [mk_trade(TH + 5, TH + 4, level=1)],
+                     open_pos=pos(2, 0.04, 2))
+    st = pt.run_martingale_cycle(fresh_data(False, None, None, 4401.0, setups=[]))
+    assert st["open"] is not None, "a 2-min-old position is not ripe"
+    assert st["stale_level_resets"] == 0, "a live position must block the release"
+    assert st["level"] == 2, "the open position's level must stay intact"
+
+    # 8. no usable clock → do NOT release, but DO say so (silence here would let
+    #    the original hazard return unnoticed)
+    st = write_state(2, [mk_trade(TH + 5, TH + 4, level=1)])
+    st = pt.run_martingale_cycle(fresh_data(True, "s-basis", 4400.0, 4401.0))  # fresh → no_basis stays 0
+    assert st["stale_level_no_basis"] == 0
+    st = write_state(2, [{"open_time": "garbage", "close_time": "garbage", "win": False}])
+    st = pt.run_martingale_cycle(fresh_data(True, "s-basis2", 4400.0, 4401.0))
+    assert st["stale_level_resets"] == 0, "no clock → no release (do not guess)"
+    assert st["stale_level_no_basis"] == 1, "…but the failed check must be counted"
+    st = write_state(2, [])
+    st = pt.run_martingale_cycle(fresh_data(True, "s-basis3", 4400.0, 4401.0))
+    assert st["stale_level_no_basis"] == 1
+    assert st["level"] == 2, "no trade history must not silently reset the level"
+
+    # 9. level 0 is never 'released' (nothing to release)
+    st = write_state(0, [mk_trade(TH + 50, TH + 49, level=0)])
     st = pt.run_martingale_cycle(fresh_data(True, "s-lvl0", 4400.0, 4401.0))
     assert st["stale_level_resets"] == 0, "level 0 has nothing to release"
     assert st["open"]["lot"] == 0.01
 
-    # 5. no trades at all (inconsistent state) → leave it alone rather than guess
-    st = state_with(2, 0, trades=0)
-    st = pt.run_martingale_cycle(fresh_data(True, "s-notrades", 4400.0, 4401.0))
-    assert st["stale_level_resets"] == 0, "no close history → no basis to release"
-    assert st["open"]["level"] == 2
-
-    # 6. MART_STALE_LEVEL_HOURS=0 disables the rule entirely
+    # 10. MART_STALE_LEVEL_HOURS=0 disables the rule entirely
     saved = pt.MART_STALE_LEVEL_HOURS
-    st = state_with(2, 999.0)
+    st = write_state(2, [mk_trade(999, 998, level=1)])
     pt.MART_STALE_LEVEL_HOURS = 0
     try:
         st = pt.run_martingale_cycle(fresh_data(True, "s-off", 4400.0, 4401.0))
@@ -417,12 +463,37 @@ def test_stale_level_reset():
     finally:
         pt.MART_STALE_LEVEL_HOURS = saved
 
-    # 7. the release survives a save/load round-trip (it must persist to disk)
-    st = state_with(2, TH + 1)
+    # 11. the release must persist to disk
+    st = write_state(2, [mk_trade(TH + 1, TH + 0.9, level=1)])
     pt.run_martingale_cycle(fresh_data(True, "s-persist", 4400.0, 4401.0))
     st = pt.load_martingale_state()
     assert st["stale_level_resets"] == 1 and st["level"] == 0, "release must persist"
     assert st["last_stale_reset_at"] is not None
+
+    # 12. SHADOW INTERACTION — the release must not leak into the counterfactual
+    #     book, and the book must not be able to suppress the release. The shadow
+    #     entry is deliberately BASE size (never `st["level"]`-derived): in an
+    #     ungated world the blocked signals would keep trading and the streak
+    #     would never go dormant, so a level-derived shadow lot would measure an
+    #     engine that never existed.
+    st = write_state(2, [mk_trade(TH + 5, TH + 4, level=1)])
+    trades_before = len(st["trades"])
+    st = pt.run_martingale_cycle(fresh_data(True, "s-shadow", 4400.0, 4401.0, setups=[]))
+    assert st["n_blocked_unaligned"] == 1, "the signal is blocked (no aligned setup)"
+    assert len(st["shadow"]) == 1, "…and measured in the shadow book"
+    assert st["stale_level_resets"] == 1, "shadow activity must NOT suppress the release"
+    assert st["level"] == 0, "…and the release still lands"
+    assert st["shadow"][0]["lot"] == pt.MART_SHADOW_LOT == pt.MART_LOT0, \
+        f"shadow lot must stay base size across a release, got {st['shadow'][0]['lot']}"
+    assert len(st["trades"]) == trades_before, "shadow must not append to the real ledger"
+    # close the shadow entry: it books into its own ledger, leaving the real one
+    # untouched, and cannot refresh the real streak
+    st["shadow"][0]["open_time"] = ripe_iso()
+    pt.save_martingale_state(st)
+    st = pt.run_martingale_cycle(fresh_data(False, None, None, 4405.0, setups=[]))
+    assert st["shadow"] == [] and len(st["shadow_trades"]) == 1
+    assert len(st["trades"]) == trades_before, "shadow close must not touch `trades`"
+    assert st["stale_level_resets"] == 1, "shadow close must not affect the real streak"
     print("test_stale_level_reset: ✅ all assertions passed")
 
 
