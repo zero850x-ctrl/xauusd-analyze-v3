@@ -677,10 +677,13 @@ MART_RESET_AFTER_MAX = True
 
 # 2026-09-18 (option B): S3 is long-only and completely independent of the
 # main-strategy trend gate, so it opened even while every main setup was
-# counter-trend. Live ledger (52 trades): L0 +$9.42 at 54.8% win, but L1 −$43.27
-# and L2 −$17.90 at 42.9% — the doubling only ever scaled into tape the main
-# gate had already rejected. The martingale may now only OPEN while the main
-# strategy shows an ALIGNED setup in the same direction; closing is never gated.
+# counter-trend. The ungated live ledger showed the base level roughly flat and
+# both doubling levels solidly negative, i.e. the doubling only ever scaled into
+# tape the main strategy's trend read opposed — see the PR for the per-level
+# numbers rather than freezing P&L figures in a comment.
+# The martingale may now only OPEN while the main strategy shows an ALIGNED
+# setup in the same direction; closing is never gated. This aligns ONE dimension
+# (D1/H1 trend direction) — see _martingale_aligned() for what it does NOT cover.
 # MART_ALIGNED_OFF=1 restores the old always-on behaviour without a revert.
 MART_REQUIRE_ALIGNED = os.environ.get("MART_ALIGNED_OFF") != "1"
 
@@ -688,9 +691,13 @@ MART_REQUIRE_ALIGNED = os.environ.get("MART_ALIGNED_OFF") != "1"
 def _martingale_aligned(setups, side="BUY"):
     """True when the main strategy has an ALIGNED setup in `side`'s direction.
 
-    ALIGNED is analyze_v3's own classification (daily + H1 both with the side, or
-    daily NEUTRAL with a supportive H1) — the same flag cron_push_eligible gates
-    on, so the martingale can no longer trade tape the main gate has rejected.
+    ALIGNED is analyze_v3's classification of the D1/H1 trend *direction* (both
+    with the side, or daily NEUTRAL with a supportive H1). It is deliberately
+    ONLY that dimension — it is NOT the full cron_push_eligible gate, which
+    additionally requires kline_confirmed, quality OK/GOOD, not a danger hour,
+    not post-spike, TP+SL present and a priority cap. So a setup can be ALIGNED
+    and still be unpushable; this gate promises "the main strategy's trend read
+    no longer opposes this side", not "the main strategy would trade now".
     A missing/empty setups list is not alignment: no main signal → no martingale.
     """
     for s in (setups or []):
@@ -699,6 +706,67 @@ def _martingale_aligned(setups, side="BUY"):
         if s.get("counter_trend_severity") == "ALIGNED":
             return True
     return False
+
+
+# Shadow (counterfactual) book for signals option B blocks: without it there is
+# no way to tell whether the gate filters losers or winners, and a gated ledger
+# only ever shows the survivors.
+MART_SHADOW_LOT = MART_LOT0
+
+
+def _shadow_open(st, s_time, price):
+    """Record the counterfactual entry for a signal option B just blocked.
+
+    Base size only and NO doubling. The ungated engine's level depended on
+    trades that will no longer happen, so reconstructing it would be a second
+    simulation with its own assumptions. This book answers exactly one question
+    — were the blocked S3 signals profitable after cost at base size? — which is
+    the only question the gate has to answer. MART_COST_PER_OZ applies as usual.
+    """
+    if price is None:
+        return
+    if st.get("shadow"):
+        print("⚠️ [馬丁] 👻 上一個被擋信號影子倉未平 — 新信號唔入影子簿")
+        return
+    st["shadow"] = {
+        "signal_time": s_time,
+        "open_time": _mart_now().isoformat(),
+        "entry": price,
+        "lot": MART_SHADOW_LOT,
+    }
+
+
+def _shadow_close(st, price):
+    """Close a ripe shadow entry and fold it into shadow_equity_usd."""
+    sh = st.get("shadow")
+    if not sh:
+        return
+    if price is None:
+        return
+    if _mart_elapsed_minutes(sh.get("open_time"), _mart_now()) < MART_HOLD_MINUTES:
+        return
+    entry = float(sh["entry"])
+    lot = float(sh.get("lot") or MART_SHADOW_LOT)
+    oz = lot / MART_LOT0
+    gross = (price - entry) * oz
+    cost = MART_COST_PER_OZ * oz
+    pnl = gross - cost
+    st["shadow_equity_usd"] = st.get("shadow_equity_usd", 0.0) + pnl
+    st.setdefault("shadow_trades", []).append({
+        "signal_time": sh.get("signal_time"),
+        "open_time": sh.get("open_time"),
+        "close_time": _mart_now().isoformat(),
+        "entry": entry,
+        "exit": price,
+        "lot": lot,
+        "gross_usd": round(gross, 2),
+        "cost_usd": round(cost, 2),
+        "pnl_usd": round(pnl, 2),
+        "win": pnl > 0,
+    })
+    st["shadow"] = None
+    print(f"[馬丁] 👻 影子（被擋信號）平倉: ${entry:.1f} → ${price:.1f} = "
+          f"{'✅ +$%.2f' % pnl if pnl > 0 else '❌ -$%.2f' % -pnl}")
 
 
 def _martingale_fresh_state():
@@ -716,6 +784,10 @@ def _martingale_fresh_state():
         "cur_loss_streak": 0,
         "longest_loss_streak": 0,
         "n_blocked_unaligned": 0,     # option B: S3 signals skipped for lack of an ALIGNED main setup
+        "n_blocked_no_setups": 0,     # option B: cycles where the payload had no setups list at all
+        "shadow": None,               # option B: counterfactual entry for a blocked signal
+        "shadow_trades": [],
+        "shadow_equity_usd": 0.0,
         "created": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -729,7 +801,9 @@ def load_martingale_state():
             st.setdefault("trades", [])
             for k in ("level", "last_signal_time", "open", "equity_usd", "peak_equity",
                       "max_drawdown_usd", "n_wins", "n_losses", "cur_loss_streak",
-                      "longest_loss_streak", "n_blocked_unaligned"):
+                      "longest_loss_streak", "n_blocked_unaligned",
+                      "n_blocked_no_setups", "shadow", "shadow_trades",
+                      "shadow_equity_usd"):
                 st.setdefault(k, _martingale_fresh_state()[k])
             return st
         except Exception:
@@ -771,12 +845,22 @@ def run_martingale_cycle(data):
        open on new S3 signal; close when hold >= 10 min; loss → next level."""
     sig = (data or {}).get("rebound_martingale") or {}
     price = _finite_px((data or {}).get("price"))
+    # S3 (detect_rebound_signal) is LONG-only today — it needs a bullish M15 bar —
+    # and analyze_v3 does not emit a direction for it. Prefer an explicit
+    # `direction` if one ever appears there, else assume BUY; document rather
+    # than silently hard-code, so adding a SELL variant cannot pass unnoticed.
+    sig_side = _norm_dir(sig.get("direction")) or "BUY"
     st = load_martingale_state()
     now = _mart_now()
 
-    if not sig.get("signal") and st.get("open") is None:
+    if not sig.get("signal") and st.get("open") is None and not st.get("shadow"):
         # Nothing to do — silent (keeps cron output quiet)
         return st
+
+    # ---- 0. Counterfactual book: close a ripe shadow entry ----
+    # Runs before the payload guard below so a broken analyzer payload can never
+    # strand a shadow position.
+    _shadow_close(st, price)
 
     if "rebound_martingale" not in (data or {}):
         print("⚠️ [馬丁] 報告無 rebound_martingale 欄位 — analyzer 未支援, 跳過")
@@ -842,16 +926,28 @@ def run_martingale_cycle(data):
         s_time = sig.get("bar_time")
         s_close = _finite_px(sig.get("entry"))
         if s_on and s_time and s_time != st.get("last_signal_time"):
-            if MART_REQUIRE_ALIGNED and not _martingale_aligned((data or {}).get("setups")):
-                # Consume the bar: one evaluation per signal bar, same dedupe
-                # semantics as a fill. Waiting for the tape to turn aligned and
-                # then opening a stale S3 bar is a different strategy, not this one.
-                st["last_signal_time"] = s_time
+            # Retry only for missing data, never for a decision: a gate
+            # rejection is a decision, and re-deciding it on a later tick would
+            # evaluate alignment at an arbitrary time and drift the entry price
+            # further from the bar (the 09-08 fix above already accepts a stale
+            # *price*, but that is a fill convention, not a licence to re-judge
+            # a bar until the answer is convenient).
+            if price is None:
+                print("⚠️ [馬丁] S3 信號但無現價 — 唔開倉 (唔用 bar close 補位)")
+            elif MART_REQUIRE_ALIGNED and "setups" not in (data or {}):
+                # Missing producer key = upstream failure, NOT a policy decision:
+                # do not consume the bar, so a transient analyzer/payload hiccup
+                # cannot permanently kill a real signal. Counted separately from
+                # the alignment skip so an operator can tell the two apart.
+                st["n_blocked_no_setups"] = st.get("n_blocked_no_setups", 0) + 1
+                print("⚠️ [馬丁] 報告無 setups 欄位 — 無法判斷對齊, 唔開倉 (bar 保留待重試)")
+            elif MART_REQUIRE_ALIGNED and not _martingale_aligned(
+                    (data or {}).get("setups"), side=sig_side):
+                st["last_signal_time"] = s_time      # consumed → one evaluation per bar
                 st["n_blocked_unaligned"] = st.get("n_blocked_unaligned", 0) + 1
                 print("[馬丁] ⏭ S3 信號但主策略無 ALIGNED 同向 setup — 唔開倉 "
                       "(option B 2026-09-18；MART_ALIGNED_OFF=1 可關)")
-            elif price is None:
-                print("⚠️ [馬丁] S3 信號但無現價 — 唔開倉 (唔用 bar close 補位)")
+                _shadow_open(st, s_time, price)
             else:
                 level = st.get("level", 0)
                 lot = MART_LOT0 * 2 ** level
@@ -873,10 +969,24 @@ def run_martingale_cycle(data):
     mr = f"maxDD ${-st['max_drawdown_usd']:.2f}" if st["max_drawdown_usd"] else "maxDD $0"
     print(f"[馬丁] 狀態: 級{st['level']+1} | equity ${st['equity_usd']:+.2f} | {mr} | "
           f"勝率 {wr} ({st['n_wins']}/{n}) | 最長連蝕 {st['longest_loss_streak']}"
-          + (f" | ⏭未對齊 {st['n_blocked_unaligned']}" if st.get("n_blocked_unaligned") else ""))
+          + (f" | ⏭未對齊 {st['n_blocked_unaligned']}" if st.get("n_blocked_unaligned") else "")
+          + (f" | ⚠️無 setups {st['n_blocked_no_setups']}" if st.get("n_blocked_no_setups") else "")
+          + _shadow_status(st))
 
     save_martingale_state(st)
     return st
+
+
+def _shadow_status(st):
+    """One-line counterfactual summary (option B evidence), empty when unused."""
+    tr = st.get("shadow_trades") or []
+    eq = st.get("shadow_equity_usd") or 0.0
+    if not tr and not st.get("shadow"):
+        return ""
+    wins = sum(1 for t in tr if t.get("win"))
+    live = " +1 未平" if st.get("shadow") else ""
+    return (f" | 👻被擋信號 {len(tr)} 筆 {wins}W/"
+            f"{len(tr) - wins}L equity ${eq:+.2f}{live}")
 
 
 def _parse_dt(val):
