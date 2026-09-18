@@ -675,6 +675,193 @@ MART_COST_PER_OZ = float(os.environ.get("MART_COST_PER_OZ", "0.30"))
 # 0.04 indefinitely — a 10-loss streak meant 8 trades at 4× size.
 MART_RESET_AFTER_MAX = True
 
+# 2026-09-18 (option B): S3 is long-only and completely independent of the
+# main-strategy trend gate, so it opened even while every main setup was
+# counter-trend. The ungated live ledger showed the base level roughly flat and
+# both doubling levels solidly negative, i.e. the doubling only ever scaled into
+# tape the main strategy's trend read opposed — see the PR for the per-level
+# numbers rather than freezing P&L figures in a comment.
+# The martingale may now only OPEN while the main strategy shows an ALIGNED
+# setup in the same direction; closing is never gated. This aligns ONE dimension
+# (D1/H1 trend direction) — see _martingale_aligned() for what it does NOT cover.
+# MART_ALIGNED_OFF=1 restores this gate's old always-on behaviour without a
+# revert — but it does NOT restore pre-option-B sizing: the dormancy rule below
+# (MART_STALE_LEVEL_HOURS) is independent and keeps applying, so an incident
+# responder flipping this switch must not expect byte-identical legacy behaviour.
+MART_REQUIRE_ALIGNED = os.environ.get("MART_ALIGNED_OFF") != "1"
+
+# 2026-09-18 (deployment hazard): while the gate blocks, `level` — and the loss
+# streak itself — simply freeze, because a blocked signal is not a loss. Held
+# long enough, the FIRST aligned tape after the drought would open at the frozen
+# level (up to 4× size) to recover that streak.
+#
+# WHY a time limit at all: a martingale progression is only defined over
+# CONSECUTIVE attempts. A gap long enough that the next signal is no longer part
+# of the same sequence breaks that premise, so the progression restarts. (The
+# earlier draft justified this as "a different market regime" — that reasoning is
+# wrong and load-bearing: the S3 signal keeps firing through a gate drought in
+# the SAME regime; it is the consecutiveness that lapses, not the regime.)
+#
+# MEASURED, not chosen for taste. 53 live trades over 5 trading days, gap defined
+# as open→open and conditioned on the previous trade being a LOSS (the only state
+# in which this rule can bind): n=26, median 1.12h, **largest 11.75h**; every gap
+# above 8h is the structural overnight break (trading day ends ~22:20 HKT,
+# restarts ~08:15 HKT). 14h clears the largest by 2.25h (19.2%).
+#
+# The rule deliberately measures from the last OPEN, not the last close, so it is
+# directly comparable with the open→open distribution above — measuring
+# close→now would read ~10 min (one MART_HOLD_MINUTES) LOWER than the calibrated
+# quantity and quietly loosen the rule by a hold time.
+#
+# KNOWN LIMITS of this calibration (recorded so the next reader does not
+# over-trust it):
+#   - The sample is the UNGATED cadence. Under the gate, gaps are dominated by
+#     blocked droughts, so "will not fire in normal operation" is NOT proven for
+#     the deployed shape — only that it did not fire in 5 days of history.
+#   - 5 trading days contain no weekend, so the intended weekend behaviour
+#     (~58h gaps) has never been replayed. Holiday early closes could also create
+#     benign gaps above the threshold.
+#   - The sample is small (26 binding observations). Re-run the replay as the
+#     ledger grows.
+# All of those make a false fire MORE likely, and a false fire SHRINKS size, so
+# the uncertainty is on the safe side.
+# 0 disables the rule entirely.
+def _env_float(name, default):
+    """Parse-safe float env read: a typo'd knob must not stop the import.
+
+    This module is imported by every strategy path, so an unguarded float() on a
+    martingale-only override would halt trading that has nothing to do with it.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"⚠️ [馬丁] {name}={raw!r} 唔係數字 — 用預設 {default}")
+        return float(default)
+
+
+MART_STALE_LEVEL_HOURS = _env_float("MART_STALE_LEVEL_HOURS", 14)
+
+
+
+def _martingale_aligned(setups, side="BUY"):
+    """True when the main strategy has an ALIGNED setup in `side`'s direction.
+
+    ALIGNED is analyze_v3's classification of the D1/H1 trend *direction* (both
+    with the side, or daily NEUTRAL with a supportive H1). It is deliberately
+    ONLY that dimension — it is NOT the full cron_push_eligible gate, which
+    additionally requires kline_confirmed, quality OK/GOOD, not a danger hour,
+    not post-spike, TP+SL present and a priority cap. So a setup can be ALIGNED
+    and still be unpushable; this gate promises "the main strategy's trend read
+    no longer opposes this side", not "the main strategy would trade now".
+    A missing/empty setups list is not alignment: no main signal → no martingale.
+    """
+    for s in (setups or []):
+        if _norm_dir(s.get("direction")) != side:
+            continue
+        if s.get("counter_trend_severity") == "ALIGNED":
+            return True
+    return False
+
+
+# Shadow (counterfactual) book for signals option B blocks: without it there is
+# no way to tell whether the gate filters losers or winners, and a gated ledger
+# only ever shows the survivors.
+MART_SHADOW_LOT = MART_LOT0
+
+
+def _readable_setups(data):
+    """Whether the payload carries a USABLE setups list.
+
+    A missing key, an explicit None, or a non-list value are all upstream
+    failures — not 'the main strategy is counter-trend'. Conflating the two is
+    how a broken analyzer silently turns into a dead engine.
+    """
+    return isinstance((data or {}).get("setups", None), list)
+
+
+def _shadow_open(st, s_time, price):
+    """Record the counterfactual entry for a signal option B just blocked.
+
+    Base size only and NO doubling. The ungated engine's level depended on
+    trades that will no longer happen, so reconstructing it would be a second
+    simulation with its own assumptions. This book answers exactly one question
+    — were the blocked S3 signals profitable after cost at base size? — which is
+    the only question the gate has to answer. MART_COST_PER_OZ applies as usual.
+
+    One slot PER blocked signal, not per 10-minute window: S3 clusters are
+    exactly where the gate bites, so sampling only the first member of a cluster
+    would bias the very evidence the gate is judged on. The same signal can be
+    re-evaluated while the payload is unreadable, so each signal_time is pinned
+    exactly once across both books.
+    """
+    if price is None or s_time is None:
+        return
+    if not isinstance(st.get("shadow"), list):
+        # Tolerate a single-dict book (the shape of the first cut of this branch).
+        st["shadow"] = [st["shadow"]] if isinstance(st.get("shadow"), dict) else []
+    seen = {sh.get("signal_time") for sh in st["shadow"] if isinstance(sh, dict)}
+    seen |= {t.get("signal_time") for t in (st.get("shadow_trades") or [])}
+    if s_time in seen:
+        return
+    st["shadow"].append({
+        "signal_time": s_time,
+        "open_time": _mart_now().isoformat(),
+        "entry": price,
+        "lot": MART_SHADOW_LOT,
+    })
+
+
+def _shadow_close(st, price):
+    """Close every ripe shadow entry; each keeps its own 10-minute clock.
+
+    Returns the number closed. Malformed entries are dropped loudly rather than
+    raised: this is the observation layer and must never break a real close.
+    """
+    if price is None:
+        return 0
+    book = st.get("shadow")
+    if isinstance(book, dict):
+        book = [book]
+    if not book:
+        st["shadow"] = []
+        return 0
+    keep, closed = [], 0
+    for sh in book:
+        if _mart_elapsed_minutes(sh.get("open_time"), _mart_now()) < MART_HOLD_MINUTES:
+            keep.append(sh)
+            continue
+        try:
+            entry = float(sh["entry"])
+            lot = float(sh.get("lot") or MART_SHADOW_LOT)
+        except (KeyError, TypeError, ValueError):
+            print(f"⚠️ [馬丁] 👻 影子倉資料壞 — 丟棄: {sh!r}")
+            continue
+        oz = lot / MART_LOT0
+        gross = (price - entry) * oz
+        cost = MART_COST_PER_OZ * oz
+        pnl = gross - cost
+        st["shadow_equity_usd"] = st.get("shadow_equity_usd", 0.0) + pnl
+        st.setdefault("shadow_trades", []).append({
+            "signal_time": sh.get("signal_time"),
+            "open_time": sh.get("open_time"),
+            "close_time": _mart_now().isoformat(),
+            "entry": entry,
+            "exit": price,
+            "lot": lot,
+            "gross_usd": round(gross, 2),
+            "cost_usd": round(cost, 2),
+            "pnl_usd": round(pnl, 2),
+            "win": pnl > 0,
+        })
+        closed += 1
+        print(f"[馬丁] 👻 影子（被擋信號）平倉: ${entry:.1f} → ${price:.1f} = "
+              f"{'✅ +$%.2f' % pnl if pnl > 0 else '❌ -$%.2f' % -pnl}")
+    st["shadow"] = keep
+    return closed
+
 
 def _martingale_fresh_state():
     return {
@@ -690,6 +877,15 @@ def _martingale_fresh_state():
         "n_losses": 0,
         "cur_loss_streak": 0,
         "longest_loss_streak": 0,
+        "n_blocked_unaligned": 0,     # option B: S3 signals skipped for lack of an ALIGNED main setup
+        "n_blocked_no_setups": 0,     # option B: signal BARS whose payload had no usable setups list
+        "last_no_setups_bar": None,   # option B: dedupe the counter above (per bar, not per tick)
+        "stale_level_resets": 0,      # levels released for dormancy (not for a win)
+        "last_stale_reset_at": None,
+        "stale_level_no_basis": 0,    # dormancy checks that could not read a clock
+        "shadow": [],                 # option B: counterfactual entries for blocked signals
+        "shadow_trades": [],
+        "shadow_equity_usd": 0.0,
         "created": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -703,8 +899,18 @@ def load_martingale_state():
             st.setdefault("trades", [])
             for k in ("level", "last_signal_time", "open", "equity_usd", "peak_equity",
                       "max_drawdown_usd", "n_wins", "n_losses", "cur_loss_streak",
-                      "longest_loss_streak"):
+                      "longest_loss_streak", "n_blocked_unaligned",
+                      "n_blocked_no_setups", "last_no_setups_bar", "shadow",
+                      "shadow_trades", "shadow_equity_usd", "stale_level_resets",
+                      "last_stale_reset_at", "stale_level_no_basis"):
                 st.setdefault(k, _martingale_fresh_state()[k])
+            # Normalise the shadow book at the boundary so nothing downstream has
+            # to care: the first cut of the option-B branch wrote a single dict,
+            # and a hand-edited/older file can carry None.
+            if isinstance(st.get("shadow"), dict):
+                st["shadow"] = [st["shadow"]]
+            elif not isinstance(st.get("shadow"), list):
+                st["shadow"] = []
             return st
         except Exception:
             pass
@@ -740,20 +946,116 @@ def _mart_elapsed_minutes(open_time_iso, now):
         return MART_HOLD_MINUTES + 1  # unparseable → treat as ripe
 
 
+def _mart_last_trade_stamp(st, field):
+    """Parse `field` from the most recent finished trade (aware-UTC or None).
+
+    Named `_mart_` on purpose: the module already has `_last_close_dt(log)` for
+    the main ledger, whose dicts are shaped differently (`history` vs `trades`).
+    `_parse_dt` guarantees a tz-aware UTC datetime or None, so the result is
+    always safe to subtract from `now`.
+    """
+    trades = st.get("trades") or []
+    if not trades:
+        return None
+    last = trades[-1]
+    if not isinstance(last, dict):
+        return None
+    return _parse_dt(last.get(field))
+
+
+def _maybe_stale_level_reset(st, now):
+    """Drop a frozen level once the streak has been dormant too long.
+
+    Called AFTER the close step and BEFORE the open step, so the decision uses
+    the freshest knowledge and the lot size is computed from the released level.
+    Returns True when a reset happened. Only `level` moves — the loss counters
+    stay a raw record of consecutive losses.
+
+    The clock is the last trade's OPEN, with the close as a fallback, because:
+      - open→open is the quantity MART_STALE_LEVEL_HOURS was calibrated on, so
+        the threshold compares like with like;
+      - a position that closes THIS tick normally refreshes the streak (its open
+        is ~MART_HOLD_MINUTES old), so there is no need to special-case it;
+      - but if that very trade was OPENED before the threshold — the restart
+        after an outage, where the close is fresh while the streak it completes
+        is ancient — reading the open still releases it. Reading the close alone
+        would miss exactly that path.
+    """
+    if MART_STALE_LEVEL_HOURS <= 0:
+        return False
+    if st.get("level", 0) == 0:
+        return False
+
+    if st.get("open") is not None:
+        # A live position is not dormancy. And a position held for many holds is
+        # an anomaly in its own right (the close step ripens after
+        # MART_HOLD_MINUTES), so flag it loudly rather than silently re-base a
+        # level that `open["level"]` still refers to.
+        held = _mart_elapsed_minutes(st["open"].get("open_time"), now)
+        if held >= MART_HOLD_MINUTES * 6:
+            print(f"⚠️ [馬丁] 持倉 {held:.0f} 分鐘 — 遠超平倉期，另有 bug；"
+                  f"今 tick 唔重設 level")
+        return False
+
+    try:
+        stamp = _mart_last_trade_stamp(st, "open_time")
+        basis = "open_time"
+        if stamp is None:
+            stamp = _mart_last_trade_stamp(st, "close_time")
+            basis = "close_time"
+    except Exception as e:                       # never let the check halt trading
+        print(f"⚠️ [馬丁] 閒置檢查讀唔到時間 ({e!r}) — 今 tick 唔重設")
+        st["stale_level_no_basis"] = st.get("stale_level_no_basis", 0) + 1
+        return False
+
+    if stamp is None:
+        # Without a usable timestamp the hazard this rule exists to close
+        # silently returns, so say so instead of failing quiet.
+        st["stale_level_no_basis"] = st.get("stale_level_no_basis", 0) + 1
+        print(f"⚠️ [馬丁] 級{st['level']+1} 但冇可用嘅交易時間 — 唔重設"
+              f"（乾旱後 4× 追舊 streak 嘅 hazard 可能仍在）")
+        return False
+
+    hours = (now - stamp).total_seconds() / 3600.0
+    if hours < MART_STALE_LEVEL_HOURS:
+        return False
+    print(f"[馬丁] 🕰 級{st['level']+1} 對上一次交易開倉已 {hours:.1f}h（{basis}）"
+          f"> {MART_STALE_LEVEL_HOURS:g}h — 重設返級1（加碼序列已中斷）")
+    st["level"] = 0
+    st["stale_level_resets"] = st.get("stale_level_resets", 0) + 1
+    st["last_stale_reset_at"] = now.isoformat()
+    return True
+
+
 def run_martingale_cycle(data):
     """One cycle per cron tick (~10 min). Mirrors the 60-day real-path study:
        open on new S3 signal; close when hold >= 10 min; loss → next level."""
     sig = (data or {}).get("rebound_martingale") or {}
     price = _finite_px((data or {}).get("price"))
+    # S3 (detect_rebound_signal) is LONG-only today — it needs a bullish M15 bar —
+    # and analyze_v3 does not emit a direction for it. Prefer an explicit
+    # `direction` if one ever appears there, else assume BUY; document rather
+    # than silently hard-code, so adding a SELL variant cannot pass unnoticed.
+    sig_side = _norm_dir(sig.get("direction")) or "BUY"
     st = load_martingale_state()
     now = _mart_now()
 
-    if not sig.get("signal") and st.get("open") is None:
+    if not sig.get("signal") and st.get("open") is None and not st.get("shadow"):
         # Nothing to do — silent (keeps cron output quiet)
         return st
 
+    # ---- 0. Counterfactual book: close ripe shadow entries ----
+    # Runs before the payload guard below so a broken analyzer payload can never
+    # strand a shadow position, and is wrapped because this is the OBSERVATION
+    # layer: it must never be able to stop a real close.
+    try:
+        _shadow_close(st, price)
+    except Exception as e:                                    # noqa: BLE001
+        print(f"⚠️ [馬丁] 👻 影子倉平倉出錯（唔影響真倉）: {e!r}")
+
     if "rebound_martingale" not in (data or {}):
         print("⚠️ [馬丁] 報告無 rebound_martingale 欄位 — analyzer 未支援, 跳過")
+        save_martingale_state(st)   # step 0 may have closed a shadow — must persist
         return st
 
     # ---- 1. Close ripe position ----
@@ -806,6 +1108,11 @@ def run_martingale_cycle(data):
                   f"${entry_px:.1f} → ${exit_px:.1f} = {'✅ +$%.2f' % pnl if win else '❌ -$%.2f' % -pnl}")
             st["open"] = None
 
+    # ---- 1b. Release a frozen level before sizing the next position ----
+    # Runs after the close step (so a position that just closed counts as fresh)
+    # and before the open step (so the lot size uses the released level).
+    _maybe_stale_level_reset(st, now)
+
     # ---- 2. Open on new S3 signal ----
     # 2026-09-08 review: fill at the LIVE price at this cron tick, not at the
     # signal bar's close. The bar closed up to ~10 min before this tick, so
@@ -816,8 +1123,32 @@ def run_martingale_cycle(data):
         s_time = sig.get("bar_time")
         s_close = _finite_px(sig.get("entry"))
         if s_on and s_time and s_time != st.get("last_signal_time"):
+            # Retry only for missing data, never for a decision: a gate
+            # rejection is a decision, and re-deciding it on a later tick would
+            # evaluate alignment at an arbitrary time and drift the entry price
+            # further from the bar (the 09-08 fix above already accepts a stale
+            # *price*, but that is a fill convention, not a licence to re-judge
+            # a bar until the answer is convenient).
             if price is None:
                 print("⚠️ [馬丁] S3 信號但無現價 — 唔開倉 (唔用 bar close 補位)")
+            elif MART_REQUIRE_ALIGNED and not _readable_setups(data):
+                # Missing/None/ill-typed producer payload = upstream failure, NOT
+                # a policy decision: do not consume the bar, so a transient
+                # analyzer hiccup cannot permanently kill a real signal. Counted
+                # and shadowed per BAR (not per tick) — the ungated engine would
+                # have opened this bar, so it belongs in the evidence too.
+                if st.get("last_no_setups_bar") != s_time:
+                    st["last_no_setups_bar"] = s_time
+                    st["n_blocked_no_setups"] = st.get("n_blocked_no_setups", 0) + 1
+                    _shadow_open(st, s_time, price)
+                print("⚠️ [馬丁] 報告無可用 setups 欄位 — 無法判斷對齊, 唔開倉 (bar 保留待重試)")
+            elif MART_REQUIRE_ALIGNED and not _martingale_aligned(
+                    (data or {}).get("setups"), side=sig_side):
+                st["last_signal_time"] = s_time      # consumed → one evaluation per bar
+                st["n_blocked_unaligned"] = st.get("n_blocked_unaligned", 0) + 1
+                print("[馬丁] ⏭ S3 信號但主策略無 ALIGNED 同向 setup — 唔開倉 "
+                      "(option B 2026-09-18；MART_ALIGNED_OFF=1 可關)")
+                _shadow_open(st, s_time, price)
             else:
                 level = st.get("level", 0)
                 lot = MART_LOT0 * 2 ** level
@@ -838,10 +1169,30 @@ def run_martingale_cycle(data):
     wr = f"{st['n_wins']/n:.1%}" if n else "-"
     mr = f"maxDD ${-st['max_drawdown_usd']:.2f}" if st["max_drawdown_usd"] else "maxDD $0"
     print(f"[馬丁] 狀態: 級{st['level']+1} | equity ${st['equity_usd']:+.2f} | {mr} | "
-          f"勝率 {wr} ({st['n_wins']}/{n}) | 最長連蝕 {st['longest_loss_streak']}")
+          f"勝率 {wr} ({st['n_wins']}/{n}) | 最長連蝕 {st['longest_loss_streak']}"
+          + (f" | ⏭未對齊 {st['n_blocked_unaligned']}" if st.get("n_blocked_unaligned") else "")
+          + (f" | ⚠️無 setups {st['n_blocked_no_setups']}" if st.get("n_blocked_no_setups") else "")
+          + (f" | 🕰閒置重設 {st['stale_level_resets']}" if st.get("stale_level_resets") else "")
+          + (f" | ⚠️閒置無基準 {st['stale_level_no_basis']}" if st.get("stale_level_no_basis") else "")
+          + _shadow_status(st))
 
     save_martingale_state(st)
     return st
+
+
+def _shadow_status(st):
+    """One-line counterfactual summary (option B evidence), empty when unused."""
+    tr = st.get("shadow_trades") or []
+    book = st.get("shadow") or []
+    if isinstance(book, dict):
+        book = [book]
+    eq = st.get("shadow_equity_usd") or 0.0
+    if not tr and not book:
+        return ""
+    wins = sum(1 for t in tr if t.get("win"))
+    live = f" +{len(book)} 未平" if book else ""
+    return (f" | 👻被擋信號 {len(tr)} 筆 {wins}W/"
+            f"{len(tr) - wins}L equity ${eq:+.2f}{live}")
 
 
 def _parse_dt(val):
