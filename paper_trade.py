@@ -95,7 +95,6 @@ ANTI_MARTINGALE = True         # Block volume increase after consecutive losses
 # this guard can still do something the daily-R cap does not.
 ANTI_MART_LOSS_LIMIT = 3       # 3+ same-day consecutive losses → volume capped at 0.01
 SL_MIN_ATR_MULT = 0.8          # SL must be >= 0.8 × ATR (2026-08-22: 0.5→0.8, fewer noise stop-outs)
-GC_F_BASIS_FAIL_USD = 40.0     # GC=F last close vs spot; >$40 = rollover, fail closed
 MAX_DAILY_LOSS_R = 3           # Stop trading after -3R daily drawdown
 ANTI_STACKING = True           # Enable stacking / overlap guards
 ANTI_STACKING_OPPOSITE_ONLY = False  # False: also cap same-direction concurrency
@@ -357,78 +356,27 @@ def _next_trade_id(log, today):
     return f"{today}-{max_n + 1:02d}"
 
 
-def _json_price_is_spot(data):
-    """True when analyze JSON `price` is spot, not a GC=F / futures fallback."""
-    if not data:
-        return False
-    src = str(data.get("intraday_source") or data.get("data_source") or "")
-    low = src.lower()
-    if "gc=f" in low or "future" in low or "期貨" in src:
-        return False
-    if data.get("basis_cron_blocked"):
-        return False
-    return True
+# 2026-09-15: only the venue that produced the signal may decide a close.
+# PAXG-USD is a crypto token, not the OANDA spot feed the report trades on:
+# over 138 overlapping M30 bars (2026-09-10 → 09-14) its high ran a median
+# $2.24 ABOVE spot (28 bars > $5) and its low $4.42 above, i.e. its range is
+# shifted up — enough to trip a stop spot never touched (2026-09-14-01:
+# PAXG high 4323.09 vs spot high 4317.83, SL 4320 → a phantom −1.0R). GC=F
+# carries a $15-52 futures premium on top of that.
+CLOSE_DECISIVE_SOURCES = ("tv",)
 
 
-GOLD_API_URL = "https://api.gold-api.com/price/XAU"
-GOLD_API_TIMEOUT = 8
+def _close_venue_confirmed(data_source):
+    """Is this venue allowed to decide a close? Only the signal's own spot feed.
 
+    Before 2026-09-15 the verifier blanket-trusted 'paxg' and basis-checked
+    'gc_f' (±$40), so a fallback series could book a stop the traded venue
+    never hit. Callers now keep the trade LIVE and record `venue_warning`
+    instead, and the next spot tick decides.
 
-def _live_spot_price():
-    """Fresh spot from gold-api.com. None on failure. Call once per check run."""
-    try:
-        import urllib.request
-        req = urllib.request.Request(
-            GOLD_API_URL, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=GOLD_API_TIMEOUT) as resp:
-            payload = json.loads(resp.read().decode())
-        px = float(payload.get("price"))
-        if px > 0:
-            return px
-    except Exception as e:
-        print(f"  ⚠️ gold-api live spot unavailable: {e}")
-    return None
-
-
-def _series_last_close(bars):
-    """Finite last close from fetched M30 bars, or None."""
-    if bars is None or getattr(bars, "empty", True):
-        return None
-    try:
-        return _finite_px(bars["close"].iloc[-1])
-    except (KeyError, IndexError, TypeError, ValueError):
-        return None
-
-
-def _spot_close_verified(close_px, spot, atr, data_source, data=None,
-                         series_last_close=None, live_spot=None):
-    """Validate the data series' basis before trusting a simulated close.
-
-    Fail closed if unverifiable. Does not perform network I/O — callers pass
-    `live_spot` from a single `_live_spot_price()` per run.
-
-    - tv / paxg: bars are spot or spot-anchored — trust (range guard already ran).
-    - gc_f: last bar close vs freshest spot (injected live quote, else JSON
-      price if that JSON is itself spot). Fail closed when drift exceeds
-      GC_F_BASIS_FAIL_USD ($40, same band as backtest.py rollover alert),
-      or when series last close / spot reference is missing or non-finite.
-      Individual fill vs current quote is not compared.
+    No network I/O — pure predicate on the source tag.
     """
-    if data_source in ("tv", "paxg"):
-        return True
-
-    ref = _finite_px(live_spot)
-    if ref is None:
-        json_is_spot = data is None or _json_price_is_spot(data)
-        if json_is_spot:
-            ref = _finite_px(spot)
-    if ref is None:
-        return False
-
-    slc = _finite_px(series_last_close)
-    if slc is None:
-        return False
-    return abs(slc - ref) <= GC_F_BASIS_FAIL_USD
+    return data_source in CLOSE_DECISIVE_SOURCES
 
 
 def _counts_toward_r(record):
@@ -1562,17 +1510,50 @@ def seed_trades(data, setups=None):
     return new_count > 0
 
 
+# 2026-09-15: tvDatafeed builds its DataFrame index with
+# `datetime.datetime.fromtimestamp(...)` (tvDatafeed/main.py:143) → the naive
+# stamps it hands back are LOCAL time (HKT on this box), NOT UTC. Every
+# consumer here compares bar times against UTC (seeded_time / now), so a raw TV
+# series was shifted +8h: the exit sim walked bars from 8 hours BEFORE the
+# trade existed and booked stops off pre-entry prices (09-15: 2026-09-14-01
+# re-closed −1.28R on a bar that printed before the seed). Convert local → UTC
+# at the source, and warn (never silently shift) if the newest bar looks stale.
+_LOCAL_TZ = datetime.now().astimezone().tzinfo
+
+
+def _tv_bars_to_utc(bars, stale_minutes=90):
+    """tvDatafeed's naive bar stamps are local time → return UTC-naive times."""
+    dt = bars['datetime']
+    if getattr(dt.dt, 'tz', None) is not None:
+        dt = dt.dt.tz_convert('UTC')                      # already tz-aware
+    else:
+        dt = dt.dt.tz_localize(_LOCAL_TZ).dt.tz_convert('UTC')
+    bars = bars.copy()
+    bars['datetime'] = dt.dt.tz_localize(None)
+    try:
+        newest = bars['datetime'].max()
+        lag = (datetime.now(timezone.utc).replace(tzinfo=None) - newest).total_seconds() / 60.0
+        if lag > stale_minutes:
+            print(f"  ⚠️ TV bars stale: newest bar {newest}Z is {lag:.0f}min behind now "
+                  f"— alignment unverified")
+    except Exception:
+        pass
+    return bars
+
+
 def _fetch_m30(start, end):
     """Fetch M30 OHLC data for the given date range via yfinance or TradingView.
 
     Returns (bars, data_source) where data_source is:
-      'tv'   — TradingView OANDA spot (primary, trusted)
+      'tv'   — TradingView OANDA spot (primary, trusted; the only source
+               allowed to decide a close — see CLOSE_DECISIVE_SOURCES)
       'paxg' — yfinance PAXG-USD (spot-anchored token; 1 PAXG = 1 oz London
                Good Delivery — tracks spot within a few $, far tighter than
                GC=F futures premium; added 2026-08-24 after GC=F pushed a
-               fake Bull Flag with $52 premium)
-      'gc_f' — yfinance GC=F futures (last resort; premium $15-52, needs
-               spot-vs-close verification in check_outcomes)
+               fake Bull Flag with $52 premium). Reference/coverage only —
+               never decisive (see CLOSE_DECISIVE_SOURCES).
+      'gc_f' — yfinance GC=F futures (last resort; premium $15-52).
+               Reference/coverage only — never decisive.
     """
     bars = None
     data_source = "gc_f"
@@ -1582,18 +1563,19 @@ def _fetch_m30(start, end):
         try:
             bars = _tv.get_hist(
                 symbol="XAUUSD", exchange="OANDA",
-                interval=TVInterval.min_30,
+                interval=TVInterval.in_30_minute,
                 n_bars=500,
             )
             if bars is not None and not bars.empty:
                 bars = bars.reset_index()
                 if 'datetime' in bars.columns:
-                    # 2026-08-07 fix: normalize to UTC before stripping tz so
-                    # bar times compare chronologically with seeded_time (UTC).
-                    if bars['datetime'].dt.tz is not None:
-                        bars['datetime'] = bars['datetime'].dt.tz_convert('UTC').dt.tz_localize(None)
+                    # 2026-08-07/2026-09-15: tvDatafeed stamps are LOCAL time
+                    # (fromtimestamp) — normalise local → UTC so bar times
+                    # compare chronologically with seeded_time (UTC).
+                    bars = _tv_bars_to_utc(bars)
                 data_source = "tv"
-                print(f"  📊 TradingView M30: {len(bars)} bars")
+                print(f"  📊 TradingView M30: {len(bars)} bars "
+                      f"(last {bars['datetime'].iloc[-1]}Z)")
         except Exception as e:
             print(f"  ⚠️ TradingView fetch failed: {e}")
 
@@ -1667,10 +1649,10 @@ def check_outcomes(data):
         print("⚠️ Could not fetch M30 data — skipping check")
         return
 
-    series_last = _series_last_close(bars)
-    live_spot = None
-    if data_source not in ("tv", "paxg"):
-        live_spot = _live_spot_price()
+    # 2026-09-15: a non-spot series (paxg/gc_f) must not decide anything.
+    venue_ok = _close_venue_confirmed(data_source)
+    if not venue_ok:
+        print(f"⚠️ M30 series from '{data_source}' — non-spot venue: closes withheld this tick")
 
     still_live = []
     closed = 0
@@ -1679,6 +1661,18 @@ def check_outcomes(data):
         if trade.get("status") != "LIVE":
             # Preserve non-LIVE records (e.g. cancelled, partially closed)
             # rather than silently discarding them.
+            still_live.append(trade)
+            continue
+
+        if not venue_ok:
+            # 2026-09-15: non-spot series — withhold the close AND the
+            # sim_state update (tp1/trail levels from a shifted venue would
+            # leak into the next spot tick). Leave the trade untouched.
+            trade["venue_warning"] = {
+                "source": data_source,
+                "at": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                "reason": "non-spot M30 series — close withheld (spot is the traded venue)",
+            }
             still_live.append(trade)
             continue
 
@@ -1713,19 +1707,13 @@ def check_outcomes(data):
             verified = bool(sim.get("verified", True))
             close_px = sim.get("close_price")
             spot = data.get("price")
-            if verified:
-                verified = _spot_close_verified(
-                    close_px, spot, atr, data_source, data,
-                    series_last_close=series_last,
-                    live_spot=live_spot,
-                )
             if not verified:
                 trade["data_source"] = sim.get("data_source", data_source)
                 trade["last_unverified"] = {
                     "result": sim["result"],
                     "close_price": close_px,
                     "pnl_r": sim["pnl_r"],
-                    "reason": "gc_f series basis check failed",
+                    "reason": "series range guard failed",
                 }
                 still_live.append(trade)
                 print(
@@ -1743,8 +1731,11 @@ def check_outcomes(data):
                 "tp2_hit": sim.get("tp2_hit", False),
                 "verified": True,
                 "data_source": sim.get("data_source", data_source),
+                # 2026-09-15: audit trail — which venue actually decided the close.
+                "close_data_source": sim.get("data_source", data_source),
                 "closed_time": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
             })
+            trade.pop("venue_warning", None)
             closed += 1
             emoji = "🟠" if sim["result"] == "Trail" else "🔴" if sim["result"] == "SL" else "⏱️"
             print(f"  {emoji} {sim['result']}: {trade['id']} {trade['direction']} @ {close_px} ({sim['pnl_r']:+.2f}R)")
@@ -1757,6 +1748,7 @@ def check_outcomes(data):
         trade["tp2_hit"] = sim.get("tp2_hit", False)
         trade["trail_active"] = sim.get("trail_active", False)
         trade["trail_stop"] = sim.get("trail_stop")
+        trade.pop("venue_warning", None)
         if sim.get("last_bar_time"):
             trade["sim_state"] = {
                 "tp1_hit": sim.get("tp1_hit", False),
@@ -1890,10 +1882,12 @@ def run_backtest(data):
         print("⚠️ Could not fetch M30 data for backtest")
         return
 
-    series_last = _series_last_close(bars)
-    live_spot = None
-    if data_source not in ("tv", "paxg"):
-        live_spot = _live_spot_price()
+    # 2026-09-15: refuse to backtest on a venue that is not the traded spot
+    # feed. A fallback series (paxg/gc_f) is shifted against spot, so its
+    # SL/TP outcomes describe a market the signals were never taken in.
+    if not _close_venue_confirmed(data_source):
+        print(f"⚠️ M30 series from '{data_source}' — non-spot venue: backtest refused")
+        return
 
     setups = data.get("setups", [])
     if not setups:
@@ -1967,12 +1961,6 @@ def run_backtest(data):
         pnl_r = sim["pnl_r"]
         bars_held = sim["bars_held"]
         verified = bool(sim.get("verified", True))
-        if sim.get("closed") and verified:
-            verified = _spot_close_verified(
-                sim.get("close_price"), current_price, atr, data_source, data,
-                series_last_close=series_last,
-                live_spot=live_spot,
-            )
         scalp = " ⚠️SCALP" if bars_held < MIN_HOLDING_BARS else ""
         unv = "" if verified else " ❌UNVERIFIED"
         print(f"  {pattern}: {direction} entry={entry:.2f} SL={stop:.2f} TP1={tp1:.2f} → {status} ({pnl_r:+.1f}R, {bars_held} bars){scalp}{unv}")

@@ -27,40 +27,20 @@ def test_norm_dir():
     assert pt._norm_dir("") == ""
 
 
-def test_spot_close_verified():
-    atr = 20.0
-    data = {"intraday_source": "TradingView (OANDA:XAUUSD)", "price": 3390}
-    assert pt._spot_close_verified(3392, 3390, atr, "tv", data) is True
-    assert pt._spot_close_verified(
-        3392, 3390, atr, "gc_f", data,
-        series_last_close=3410, live_spot=3390,
-    ) is True  # $20 premium — normal, under $40 fail band
-    assert pt._spot_close_verified(
-        3480, 3390, atr, "gc_f", data,
-        series_last_close=3440, live_spot=3390,
-    ) is False  # $50 > $40
-    assert pt._spot_close_verified(
-        3392, 3390, atr, "gc_f", data,
-        series_last_close=None, live_spot=3390,
-    ) is False  # missing series last → fail closed, no fill-vs-quote
-    fut = {"intraday_source": "Yahoo Finance GC=F", "price": 3410}
-    assert pt._spot_close_verified(
-        3410, 3410, atr, "gc_f", fut,
-        series_last_close=3410, live_spot=None,
-    ) is False  # futures JSON is not a spot reference
+def test_close_venue_confirmed():
+    """Only the spot feed that produced the signal may decide a close.
 
-
-def test_spot_close_verified_does_not_hit_network():
-    orig = pt._live_spot_price
-    pt._live_spot_price = lambda: (_ for _ in ()).throw(RuntimeError("network"))
-    try:
-        assert pt._spot_close_verified(
-            4643.59, 4675.0, 14.43, "gc_f",
-            {"intraday_source": "TradingView (OANDA:XAUUSD)", "price": 4675.0},
-            series_last_close=4695.0, live_spot=4675.0,
-        ) is True
-    finally:
-        pt._live_spot_price = orig
+    2026-09-15: this used to trust paxg outright ("regardless of close-vs-spot
+    gap") and basis-check gc_f within $40. PAXG runs a median $2.24 above spot
+    on the high, which booked a phantom stop (2026-09-14-01: PAXG high 4323.09
+    vs spot 4317.83 against SL 4320). Non-spot venues now defer: the caller
+    keeps the trade LIVE and records venue_warning for the next spot tick.
+    """
+    assert pt._close_venue_confirmed("tv") is True
+    assert pt._close_venue_confirmed("paxg") is False
+    assert pt._close_venue_confirmed("gc_f") is False
+    assert pt._close_venue_confirmed("") is False
+    assert pt._close_venue_confirmed(None) is False
 
 
 def test_counts_toward_r():
@@ -383,8 +363,7 @@ def test_log_paths_env_override():
 if __name__ == "__main__":
     tests = [
         test_norm_dir,
-        test_spot_close_verified,
-        test_spot_close_verified_does_not_hit_network,
+        test_close_venue_confirmed,
         test_counts_toward_r,
         test_daily_loss_skips_unverified,
         test_discipline_stacking,
