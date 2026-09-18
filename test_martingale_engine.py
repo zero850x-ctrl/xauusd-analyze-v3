@@ -23,9 +23,20 @@ import paper_trade as pt
 tmpdir = tempfile.mkdtemp()
 pt.MARTINGALE_PATH = os.path.join(tmpdir, "paper_martingale.json")
 
-def fresh_data(signal=False, bar_time=None, entry=None, price=None):
+def aligned_setup(direction="BUY", severity="ALIGNED"):
+    """A main-strategy setup as analyze_v3 emits it (emoji-prefixed direction)."""
+    return {"direction": f"{'🟢' if direction == 'BUY' else '🔴'} {direction}",
+            "counter_trend_severity": severity}
+
+
+def fresh_data(signal=False, bar_time=None, entry=None, price=None, setups=None):
     d = {"price": price}
     d["rebound_martingale"] = {"signal": signal, "bar_time": bar_time, "entry": entry}
+    # option B (2026-09-18): the martingale only opens while the main strategy
+    # shows an ALIGNED setup in the SAME direction. Default to one so the engine
+    # tests below keep exercising the ordinary open path; pass setups=[] to test
+    # the gate itself.
+    d["setups"] = [aligned_setup("BUY")] if setups is None else setups
     return d
 
 def make_open(st, mins_ago):
@@ -86,6 +97,61 @@ def test_unit():
     print("test_unit: ✅ all assertions passed")
 
 test_unit()
+
+
+def test_aligned_gate():
+    """option B (2026-09-18): an S3 signal may only OPEN while the main strategy
+    shows an ALIGNED setup in the SAME direction. Closing is never gated — a
+    position must always be able to exit."""
+    if os.path.exists(pt.MARTINGALE_PATH):
+        os.remove(pt.MARTINGALE_PATH)
+    st = pt.load_martingale_state()
+    assert st.get("n_blocked_unaligned") == 0, "fresh state carries the counter"
+
+    # 1. no main setups at all → signal consumed, nothing opened, counted
+    st = pt.run_martingale_cycle(fresh_data(True, "b1", 4400.0, 4401.0, setups=[]))
+    assert st["open"] is None, "empty setups must not open"
+    assert st["last_signal_time"] == "b1", "a blocked signal must still be consumed"
+    assert st["n_blocked_unaligned"] == 1
+
+    # 2. same bar again → not re-evaluated (dedupe identical to a fill)
+    st = pt.run_martingale_cycle(fresh_data(True, "b1", 4400.0, 4401.0, setups=[]))
+    assert st["n_blocked_unaligned"] == 1, "consumed bar must not be re-counted"
+
+    # 3. same-direction but not ALIGNED (MILD / SEVERE) is not alignment
+    for sev in ("MILD", "SEVERE"):
+        st = pt.run_martingale_cycle(
+            fresh_data(True, f"b-{sev}", 4400.0, 4401.0, setups=[aligned_setup("BUY", sev)]))
+        assert st["open"] is None, f"{sev} main setup must not open the martingale"
+    assert st["n_blocked_unaligned"] == 3
+
+    # 4. ALIGNED but opposite direction cannot unlock a long-only S3 signal
+    st = pt.run_martingale_cycle(
+        fresh_data(True, "b-sell", 4400.0, 4401.0, setups=[aligned_setup("SELL")]))
+    assert st["open"] is None, "an ALIGNED SELL setup must not unlock a BUY signal"
+    assert st["n_blocked_unaligned"] == 4
+
+    # 5. ALIGNED BUY present → opens exactly as before
+    st = pt.run_martingale_cycle(fresh_data(True, "b-ok", 4400.0, 4401.0))
+    assert st["open"] is not None and st["open"]["lot"] == 0.01, "ALIGNED BUY must open"
+    assert st["open"]["entry"] == 4401.0, "entry is still the live price"
+    assert st["n_blocked_unaligned"] == 4, "a fill must not touch the skip counter"
+
+    # 6. closing is NEVER gated — ripe position exits even with zero setups
+    make_open(st, 12)
+    st = pt.run_martingale_cycle(fresh_data(False, None, None, 4402.0, setups=[]))
+    assert st["open"] is None and st["n_wins"] == 1, "close must not be gated by option B"
+
+    # 7. MART_ALIGNED_OFF=1 escape hatch restores the old always-on behaviour
+    pt.MART_REQUIRE_ALIGNED = False
+    try:
+        st = pt.run_martingale_cycle(fresh_data(True, "b-off", 4400.0, 4401.0, setups=[]))
+        assert st["open"] is not None, "MART_ALIGNED_OFF must restore opening unaligned"
+    finally:
+        pt.MART_REQUIRE_ALIGNED = True
+    print("test_aligned_gate: ✅ all assertions passed")
+
+test_aligned_gate()
 
 if "--replay" not in sys.argv:
     print("(60-day yfinance replay skipped — pass --replay to run it; needs network, ~45s)")

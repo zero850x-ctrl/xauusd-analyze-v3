@@ -675,6 +675,31 @@ MART_COST_PER_OZ = float(os.environ.get("MART_COST_PER_OZ", "0.30"))
 # 0.04 indefinitely — a 10-loss streak meant 8 trades at 4× size.
 MART_RESET_AFTER_MAX = True
 
+# 2026-09-18 (option B): S3 is long-only and completely independent of the
+# main-strategy trend gate, so it opened even while every main setup was
+# counter-trend. Live ledger (52 trades): L0 +$9.42 at 54.8% win, but L1 −$43.27
+# and L2 −$17.90 at 42.9% — the doubling only ever scaled into tape the main
+# gate had already rejected. The martingale may now only OPEN while the main
+# strategy shows an ALIGNED setup in the same direction; closing is never gated.
+# MART_ALIGNED_OFF=1 restores the old always-on behaviour without a revert.
+MART_REQUIRE_ALIGNED = os.environ.get("MART_ALIGNED_OFF") != "1"
+
+
+def _martingale_aligned(setups, side="BUY"):
+    """True when the main strategy has an ALIGNED setup in `side`'s direction.
+
+    ALIGNED is analyze_v3's own classification (daily + H1 both with the side, or
+    daily NEUTRAL with a supportive H1) — the same flag cron_push_eligible gates
+    on, so the martingale can no longer trade tape the main gate has rejected.
+    A missing/empty setups list is not alignment: no main signal → no martingale.
+    """
+    for s in (setups or []):
+        if _norm_dir(s.get("direction")) != side:
+            continue
+        if s.get("counter_trend_severity") == "ALIGNED":
+            return True
+    return False
+
 
 def _martingale_fresh_state():
     return {
@@ -690,6 +715,7 @@ def _martingale_fresh_state():
         "n_losses": 0,
         "cur_loss_streak": 0,
         "longest_loss_streak": 0,
+        "n_blocked_unaligned": 0,     # option B: S3 signals skipped for lack of an ALIGNED main setup
         "created": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -703,7 +729,7 @@ def load_martingale_state():
             st.setdefault("trades", [])
             for k in ("level", "last_signal_time", "open", "equity_usd", "peak_equity",
                       "max_drawdown_usd", "n_wins", "n_losses", "cur_loss_streak",
-                      "longest_loss_streak"):
+                      "longest_loss_streak", "n_blocked_unaligned"):
                 st.setdefault(k, _martingale_fresh_state()[k])
             return st
         except Exception:
@@ -816,7 +842,15 @@ def run_martingale_cycle(data):
         s_time = sig.get("bar_time")
         s_close = _finite_px(sig.get("entry"))
         if s_on and s_time and s_time != st.get("last_signal_time"):
-            if price is None:
+            if MART_REQUIRE_ALIGNED and not _martingale_aligned((data or {}).get("setups")):
+                # Consume the bar: one evaluation per signal bar, same dedupe
+                # semantics as a fill. Waiting for the tape to turn aligned and
+                # then opening a stale S3 bar is a different strategy, not this one.
+                st["last_signal_time"] = s_time
+                st["n_blocked_unaligned"] = st.get("n_blocked_unaligned", 0) + 1
+                print("[馬丁] ⏭ S3 信號但主策略無 ALIGNED 同向 setup — 唔開倉 "
+                      "(option B 2026-09-18；MART_ALIGNED_OFF=1 可關)")
+            elif price is None:
                 print("⚠️ [馬丁] S3 信號但無現價 — 唔開倉 (唔用 bar close 補位)")
             else:
                 level = st.get("level", 0)
@@ -838,7 +872,8 @@ def run_martingale_cycle(data):
     wr = f"{st['n_wins']/n:.1%}" if n else "-"
     mr = f"maxDD ${-st['max_drawdown_usd']:.2f}" if st["max_drawdown_usd"] else "maxDD $0"
     print(f"[馬丁] 狀態: 級{st['level']+1} | equity ${st['equity_usd']:+.2f} | {mr} | "
-          f"勝率 {wr} ({st['n_wins']}/{n}) | 最長連蝕 {st['longest_loss_streak']}")
+          f"勝率 {wr} ({st['n_wins']}/{n}) | 最長連蝕 {st['longest_loss_streak']}"
+          + (f" | ⏭未對齊 {st['n_blocked_unaligned']}" if st.get("n_blocked_unaligned") else ""))
 
     save_martingale_state(st)
     return st
