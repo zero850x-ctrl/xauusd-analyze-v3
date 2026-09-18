@@ -714,6 +714,16 @@ def _martingale_aligned(setups, side="BUY"):
 MART_SHADOW_LOT = MART_LOT0
 
 
+def _readable_setups(data):
+    """Whether the payload carries a USABLE setups list.
+
+    A missing key, an explicit None, or a non-list value are all upstream
+    failures — not 'the main strategy is counter-trend'. Conflating the two is
+    how a broken analyzer silently turns into a dead engine.
+    """
+    return isinstance((data or {}).get("setups", None), list)
+
+
 def _shadow_open(st, s_time, price):
     """Record the counterfactual entry for a signal option B just blocked.
 
@@ -722,51 +732,77 @@ def _shadow_open(st, s_time, price):
     simulation with its own assumptions. This book answers exactly one question
     — were the blocked S3 signals profitable after cost at base size? — which is
     the only question the gate has to answer. MART_COST_PER_OZ applies as usual.
+
+    One slot PER blocked signal, not per 10-minute window: S3 clusters are
+    exactly where the gate bites, so sampling only the first member of a cluster
+    would bias the very evidence the gate is judged on. The same signal can be
+    re-evaluated while the payload is unreadable, so each signal_time is pinned
+    exactly once across both books.
     """
-    if price is None:
+    if price is None or s_time is None:
         return
-    if st.get("shadow"):
-        print("⚠️ [馬丁] 👻 上一個被擋信號影子倉未平 — 新信號唔入影子簿")
+    if not isinstance(st.get("shadow"), list):
+        # Tolerate a single-dict book (the shape of the first cut of this branch).
+        st["shadow"] = [st["shadow"]] if isinstance(st.get("shadow"), dict) else []
+    seen = {sh.get("signal_time") for sh in st["shadow"] if isinstance(sh, dict)}
+    seen |= {t.get("signal_time") for t in (st.get("shadow_trades") or [])}
+    if s_time in seen:
         return
-    st["shadow"] = {
+    st["shadow"].append({
         "signal_time": s_time,
         "open_time": _mart_now().isoformat(),
         "entry": price,
         "lot": MART_SHADOW_LOT,
-    }
+    })
 
 
 def _shadow_close(st, price):
-    """Close a ripe shadow entry and fold it into shadow_equity_usd."""
-    sh = st.get("shadow")
-    if not sh:
-        return
+    """Close every ripe shadow entry; each keeps its own 10-minute clock.
+
+    Returns the number closed. Malformed entries are dropped loudly rather than
+    raised: this is the observation layer and must never break a real close.
+    """
     if price is None:
-        return
-    if _mart_elapsed_minutes(sh.get("open_time"), _mart_now()) < MART_HOLD_MINUTES:
-        return
-    entry = float(sh["entry"])
-    lot = float(sh.get("lot") or MART_SHADOW_LOT)
-    oz = lot / MART_LOT0
-    gross = (price - entry) * oz
-    cost = MART_COST_PER_OZ * oz
-    pnl = gross - cost
-    st["shadow_equity_usd"] = st.get("shadow_equity_usd", 0.0) + pnl
-    st.setdefault("shadow_trades", []).append({
-        "signal_time": sh.get("signal_time"),
-        "open_time": sh.get("open_time"),
-        "close_time": _mart_now().isoformat(),
-        "entry": entry,
-        "exit": price,
-        "lot": lot,
-        "gross_usd": round(gross, 2),
-        "cost_usd": round(cost, 2),
-        "pnl_usd": round(pnl, 2),
-        "win": pnl > 0,
-    })
-    st["shadow"] = None
-    print(f"[馬丁] 👻 影子（被擋信號）平倉: ${entry:.1f} → ${price:.1f} = "
-          f"{'✅ +$%.2f' % pnl if pnl > 0 else '❌ -$%.2f' % -pnl}")
+        return 0
+    book = st.get("shadow")
+    if isinstance(book, dict):
+        book = [book]
+    if not book:
+        st["shadow"] = []
+        return 0
+    keep, closed = [], 0
+    for sh in book:
+        if _mart_elapsed_minutes(sh.get("open_time"), _mart_now()) < MART_HOLD_MINUTES:
+            keep.append(sh)
+            continue
+        try:
+            entry = float(sh["entry"])
+            lot = float(sh.get("lot") or MART_SHADOW_LOT)
+        except (KeyError, TypeError, ValueError):
+            print(f"⚠️ [馬丁] 👻 影子倉資料壞 — 丟棄: {sh!r}")
+            continue
+        oz = lot / MART_LOT0
+        gross = (price - entry) * oz
+        cost = MART_COST_PER_OZ * oz
+        pnl = gross - cost
+        st["shadow_equity_usd"] = st.get("shadow_equity_usd", 0.0) + pnl
+        st.setdefault("shadow_trades", []).append({
+            "signal_time": sh.get("signal_time"),
+            "open_time": sh.get("open_time"),
+            "close_time": _mart_now().isoformat(),
+            "entry": entry,
+            "exit": price,
+            "lot": lot,
+            "gross_usd": round(gross, 2),
+            "cost_usd": round(cost, 2),
+            "pnl_usd": round(pnl, 2),
+            "win": pnl > 0,
+        })
+        closed += 1
+        print(f"[馬丁] 👻 影子（被擋信號）平倉: ${entry:.1f} → ${price:.1f} = "
+              f"{'✅ +$%.2f' % pnl if pnl > 0 else '❌ -$%.2f' % -pnl}")
+    st["shadow"] = keep
+    return closed
 
 
 def _martingale_fresh_state():
@@ -784,8 +820,9 @@ def _martingale_fresh_state():
         "cur_loss_streak": 0,
         "longest_loss_streak": 0,
         "n_blocked_unaligned": 0,     # option B: S3 signals skipped for lack of an ALIGNED main setup
-        "n_blocked_no_setups": 0,     # option B: cycles where the payload had no setups list at all
-        "shadow": None,               # option B: counterfactual entry for a blocked signal
+        "n_blocked_no_setups": 0,     # option B: signal BARS whose payload had no usable setups list
+        "last_no_setups_bar": None,   # option B: dedupe the counter above (per bar, not per tick)
+        "shadow": [],                 # option B: counterfactual entries for blocked signals
         "shadow_trades": [],
         "shadow_equity_usd": 0.0,
         "created": datetime.now(timezone.utc).isoformat(),
@@ -802,9 +839,16 @@ def load_martingale_state():
             for k in ("level", "last_signal_time", "open", "equity_usd", "peak_equity",
                       "max_drawdown_usd", "n_wins", "n_losses", "cur_loss_streak",
                       "longest_loss_streak", "n_blocked_unaligned",
-                      "n_blocked_no_setups", "shadow", "shadow_trades",
-                      "shadow_equity_usd"):
+                      "n_blocked_no_setups", "last_no_setups_bar", "shadow",
+                      "shadow_trades", "shadow_equity_usd"):
                 st.setdefault(k, _martingale_fresh_state()[k])
+            # Normalise the shadow book at the boundary so nothing downstream has
+            # to care: the first cut of the option-B branch wrote a single dict,
+            # and a hand-edited/older file can carry None.
+            if isinstance(st.get("shadow"), dict):
+                st["shadow"] = [st["shadow"]]
+            elif not isinstance(st.get("shadow"), list):
+                st["shadow"] = []
             return st
         except Exception:
             pass
@@ -857,13 +901,18 @@ def run_martingale_cycle(data):
         # Nothing to do — silent (keeps cron output quiet)
         return st
 
-    # ---- 0. Counterfactual book: close a ripe shadow entry ----
+    # ---- 0. Counterfactual book: close ripe shadow entries ----
     # Runs before the payload guard below so a broken analyzer payload can never
-    # strand a shadow position.
-    _shadow_close(st, price)
+    # strand a shadow position, and is wrapped because this is the OBSERVATION
+    # layer: it must never be able to stop a real close.
+    try:
+        _shadow_close(st, price)
+    except Exception as e:                                    # noqa: BLE001
+        print(f"⚠️ [馬丁] 👻 影子倉平倉出錯（唔影響真倉）: {e!r}")
 
     if "rebound_martingale" not in (data or {}):
         print("⚠️ [馬丁] 報告無 rebound_martingale 欄位 — analyzer 未支援, 跳過")
+        save_martingale_state(st)   # step 0 may have closed a shadow — must persist
         return st
 
     # ---- 1. Close ripe position ----
@@ -934,13 +983,17 @@ def run_martingale_cycle(data):
             # a bar until the answer is convenient).
             if price is None:
                 print("⚠️ [馬丁] S3 信號但無現價 — 唔開倉 (唔用 bar close 補位)")
-            elif MART_REQUIRE_ALIGNED and "setups" not in (data or {}):
-                # Missing producer key = upstream failure, NOT a policy decision:
-                # do not consume the bar, so a transient analyzer/payload hiccup
-                # cannot permanently kill a real signal. Counted separately from
-                # the alignment skip so an operator can tell the two apart.
-                st["n_blocked_no_setups"] = st.get("n_blocked_no_setups", 0) + 1
-                print("⚠️ [馬丁] 報告無 setups 欄位 — 無法判斷對齊, 唔開倉 (bar 保留待重試)")
+            elif MART_REQUIRE_ALIGNED and not _readable_setups(data):
+                # Missing/None/ill-typed producer payload = upstream failure, NOT
+                # a policy decision: do not consume the bar, so a transient
+                # analyzer hiccup cannot permanently kill a real signal. Counted
+                # and shadowed per BAR (not per tick) — the ungated engine would
+                # have opened this bar, so it belongs in the evidence too.
+                if st.get("last_no_setups_bar") != s_time:
+                    st["last_no_setups_bar"] = s_time
+                    st["n_blocked_no_setups"] = st.get("n_blocked_no_setups", 0) + 1
+                    _shadow_open(st, s_time, price)
+                print("⚠️ [馬丁] 報告無可用 setups 欄位 — 無法判斷對齊, 唔開倉 (bar 保留待重試)")
             elif MART_REQUIRE_ALIGNED and not _martingale_aligned(
                     (data or {}).get("setups"), side=sig_side):
                 st["last_signal_time"] = s_time      # consumed → one evaluation per bar
@@ -980,11 +1033,14 @@ def run_martingale_cycle(data):
 def _shadow_status(st):
     """One-line counterfactual summary (option B evidence), empty when unused."""
     tr = st.get("shadow_trades") or []
+    book = st.get("shadow") or []
+    if isinstance(book, dict):
+        book = [book]
     eq = st.get("shadow_equity_usd") or 0.0
-    if not tr and not st.get("shadow"):
+    if not tr and not book:
         return ""
     wins = sum(1 for t in tr if t.get("win"))
-    live = " +1 未平" if st.get("shadow") else ""
+    live = f" +{len(book)} 未平" if book else ""
     return (f" | 👻被擋信號 {len(tr)} 筆 {wins}W/"
             f"{len(tr) - wins}L equity ${eq:+.2f}{live}")
 

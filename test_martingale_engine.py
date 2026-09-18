@@ -24,7 +24,11 @@ tmpdir = tempfile.mkdtemp()
 pt.MARTINGALE_PATH = os.path.join(tmpdir, "paper_martingale.json")
 
 def aligned_setup(direction="BUY", severity="ALIGNED"):
-    """A main-strategy setup as analyze_v3 emits it (emoji-prefixed direction)."""
+    """A main-strategy setup as analyze_v3 emits it (emoji-prefixed direction).
+
+    NOTE: hand-written fixture — it only proves the gate matches the test
+    author's expectation. `test_producer_contract` pins the real emitter.
+    """
     return {"direction": f"{'🟢' if direction == 'BUY' else '🔴'} {direction}",
             "counter_trend_severity": severity}
 
@@ -39,8 +43,12 @@ def fresh_data(signal=False, bar_time=None, entry=None, price=None, setups=None)
     d["setups"] = [aligned_setup("BUY")] if setups is None else setups
     return d
 
+def ripe_iso(minutes=12):
+    """Explicit backdated timestamp — never rely on wall-clock timing."""
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+
 def make_open(st, mins_ago):
-    st["open"] = {"signal_time": "t-sig", "open_time": (datetime.now(timezone.utc) - timedelta(minutes=mins_ago)).isoformat(),
+    st["open"] = {"signal_time": "t-sig", "open_time": ripe_iso(mins_ago),
                   "entry": 4400.0, "lot": pt.MART_LOT0 * 2 ** st["level"], "level": st["level"]}
     pt.save_martingale_state(st)   # cycle 會重新 load — 必須 persist
 
@@ -101,8 +109,8 @@ test_unit()
 
 def test_aligned_gate():
     """option B (2026-09-18): an S3 signal may only OPEN while the main strategy
-    shows an ALIGNED setup in the SAME direction. Closing is never gated, and a
-    missing price is still retried (only a *decision* consumes the bar)."""
+    shows an ALIGNED setup in the SAME direction. Closing is never gated; only a
+    *decision* consumes a bar — never missing data."""
     if not pt.MART_REQUIRE_ALIGNED:
         print("test_aligned_gate: ⏭ skipped (MART_ALIGNED_OFF=1 — gate 已關)")
         return
@@ -111,32 +119,34 @@ def test_aligned_gate():
     st = pt.load_martingale_state()
     assert "n_blocked_unaligned" in st and st["n_blocked_unaligned"] == 0
 
-    # 1. no main setups at all → signal consumed, nothing opened, counted, and
-    #    the blocked signal enters the counterfactual book at base size
+    # 1. no aligned setup → signal consumed, nothing opened, counted, and the
+    #    blocked signal enters the counterfactual book at BASE size
     st = pt.run_martingale_cycle(fresh_data(True, "b1", 4400.0, 4401.0, setups=[]))
     assert st["open"] is None, "empty setups must not open"
     assert st["last_signal_time"] == "b1", "a blocked signal must still be consumed"
     assert st["n_blocked_unaligned"] == 1
-    assert st["shadow"] is not None and st["shadow"]["entry"] == 4401.0
-    assert st["shadow"]["lot"] == pt.MART_SHADOW_LOT == pt.MART_LOT0, "shadow is base size"
+    assert len(st["shadow"]) == 1 and st["shadow"][0]["entry"] == 4401.0, st["shadow"]
+    assert st["shadow"][0]["lot"] == pt.MART_SHADOW_LOT == pt.MART_LOT0, "shadow is base size"
 
     # 2. same bar again → not re-evaluated (dedupe identical to a fill)
     st = pt.run_martingale_cycle(fresh_data(True, "b1", 4400.0, 4401.0, setups=[]))
     assert st["n_blocked_unaligned"] == 1, "consumed bar must not be re-counted"
+    assert len(st["shadow"]) == 1, "the same bar must not be shadowed twice"
 
     # 3. the shadow closes on the same 10-min rule, books net of cost, and never
     #    touches the real ledger. Without this book a gated ledger only shows
-    #    survivors, so the gate could never be judged.
-    st["shadow"]["open_time"] = (datetime.now(timezone.utc) - timedelta(minutes=12)).isoformat()
+    #    survivors, so the gate itself could never be judged.
+    st["shadow"][0]["open_time"] = ripe_iso()
     pt.save_martingale_state(st)
     st = pt.run_martingale_cycle(fresh_data(False, None, None, 4405.0, setups=[]))
-    assert st["shadow"] is None, "ripe shadow must close even with no signal"
+    assert st["shadow"] == [], "ripe shadow must close even with no signal"
     assert len(st["shadow_trades"]) == 1
     sh = st["shadow_trades"][0]
     assert sh["win"] is True and abs(sh["gross_usd"] - 4.0) < 1e-9, sh
     assert abs(sh["pnl_usd"] - (4.0 - pt.MART_COST_PER_OZ)) < 1e-9, sh
     assert abs(st["shadow_equity_usd"] - sh["pnl_usd"]) < 1e-9
     assert st["n_wins"] == 0 and st["level"] == 0, "shadow must not touch the real ledger"
+    assert sh["signal_time"] == "b1", "the book must record which signal it stands for"
 
     # 4. same-direction but not ALIGNED (MILD / SEVERE) is not alignment
     for sev in ("MILD", "SEVERE"):
@@ -151,33 +161,62 @@ def test_aligned_gate():
     assert st["open"] is None, "an ALIGNED SELL setup must not unlock a BUY signal"
     assert st["n_blocked_unaligned"] == 4
 
-    # 6. a MISSING `setups` KEY is an upstream failure, not a policy decision:
-    #    the bar must stay un-consumed, be counted separately, and open nothing
-    payload = fresh_data(True, "b-nokey", 4400.0, 4401.0, setups=[])
-    payload.pop("setups")
-    st = pt.run_martingale_cycle(payload)
-    assert st["last_signal_time"] == "b-sell", "a missing producer key must NOT consume the bar"
-    assert st["n_blocked_unaligned"] == 4, "a missing key is not an alignment rejection"
-    assert st["n_blocked_no_setups"] == 1, "it must be counted on its own line"
+    # 6. a CLUSTER of blocked signals must each be measured — sampling only the
+    #    first member of a cluster would bias the very evidence the gate is
+    #    judged on, and S3 clusters are exactly where the gate bites
+    before = len(st["shadow"])
+    for i, bar in enumerate(("c1", "c2", "c3")):
+        st = pt.run_martingale_cycle(fresh_data(True, bar, 4400.0, 4401.0 + i, setups=[]))
+    assert st["n_blocked_unaligned"] == 7, st["n_blocked_unaligned"]
+    assert len(st["shadow"]) == before + 3, "every blocked signal gets its own slot"
+    assert [s["signal_time"] for s in st["shadow"][-3:]] == ["c1", "c2", "c3"]
 
-    # 7. …and the same bar still OPENS on a later tick once the payload is sound
+    # 7. an unreadable payload (missing key / None / non-list) is an UPSTREAM
+    #    FAILURE, not a policy decision: do not consume the bar, count once per
+    #    BAR (not per tick), and still measure it — the ungated engine would have
+    #    opened this bar
+    for bad in ("__missing__", None, "oops"):
+        payload = fresh_data(True, "b-nokey", 4400.0, 4409.0, setups=[])
+        if bad == "__missing__":
+            payload.pop("setups")
+        else:
+            payload["setups"] = bad
+        st = pt.run_martingale_cycle(payload)
+        st = pt.run_martingale_cycle(payload)   # second tick: must not double-count
+    assert st["last_signal_time"] == "c3", "an unreadable payload must NOT consume the bar"
+    assert st["n_blocked_unaligned"] == 7, "it is not an alignment rejection"
+    assert st["n_blocked_no_setups"] == 1, "counted once per BAR, not once per tick"
+    assert st["shadow"][-1]["signal_time"] == "b-nokey", "the bar is still measurable"
+
+    # 8. …and the same bar still OPENS on a later tick once the payload is sound
     st = pt.run_martingale_cycle(fresh_data(True, "b-nokey", 4400.0, 4402.0))
     assert st["open"] is not None, "the retried bar must open once the payload is sound"
     assert st["open"]["entry"] == 4402.0, "entry is still the live price"
-    assert st["n_blocked_unaligned"] == 4 and st["n_blocked_no_setups"] == 1
+    assert st["n_blocked_unaligned"] == 7 and st["n_blocked_no_setups"] == 1
 
-    # 8. closing is NEVER gated — ripe position exits even with zero setups
+    # 9. a ripe close AND a blocked new signal in the SAME tick: the close must
+    #    still happen, and the consumed bar must not then be reopened
     make_open(st, 12)
-    st = pt.run_martingale_cycle(fresh_data(False, None, None, 4403.0, setups=[]))
-    assert st["open"] is None and st["n_wins"] == 1, "close must not be gated by option B"
+    st = pt.run_martingale_cycle(fresh_data(True, "b-same-tick", 4400.0, 4403.0, setups=[]))
+    assert st["open"] is None, "the ripe position must close despite the blocked signal"
+    assert st["n_wins"] == 1, "close must not be gated by option B"
+    assert st["last_signal_time"] == "b-same-tick", "the new bar is consumed, no reopen"
 
-    # 9. a MISSING PRICE is not a decision either → same retry rule as case 6
+    # 10. a MISSING PRICE is not a decision either → same retry rule as case 7
     st = pt.run_martingale_cycle(fresh_data(True, "b-nodata", 4400.0, None, setups=[]))
-    assert st["last_signal_time"] == "b-nokey", "no price must NOT consume the bar"
-    assert st["n_blocked_unaligned"] == 4, "no price is not an alignment rejection"
-    assert len(st["shadow_trades"]) == 1, "no price → nothing to record"
+    assert st["last_signal_time"] == "b-same-tick", "no price must NOT consume the bar"
+    assert st["n_blocked_unaligned"] == 8, "no price is not an alignment rejection"
+    assert st["n_blocked_no_setups"] == 1, "no price is not an unreadable payload"
 
-    # 10. MART_ALIGNED_OFF=1 escape hatch restores the old always-on behaviour
+    # 11. a malformed shadow entry is dropped LOUDLY and must never block a close
+    st["shadow"].append({"signal_time": "corrupt"})          # no open_time / entry
+    make_open(st, 12)
+    pt.save_martingale_state(st)
+    st = pt.run_martingale_cycle(fresh_data(True, "b-corrupt", 4400.0, 4401.0, setups=[]))
+    assert st["open"] is None, "a corrupt shadow entry must not block the real close"
+    assert st["n_wins"] == 2
+
+    # 12. MART_ALIGNED_OFF=1 escape hatch restores the old always-on behaviour
     saved = pt.MART_REQUIRE_ALIGNED
     st["open"] = None
     st["last_signal_time"] = None
@@ -186,32 +225,43 @@ def test_aligned_gate():
     try:
         st = pt.run_martingale_cycle(fresh_data(True, "b-off", 4400.0, 4401.0, setups=[]))
         assert st["open"] is not None, "MART_ALIGNED_OFF must restore opening unaligned"
-        assert len(st["shadow_trades"]) == 1, "gate off → no new shadow entries"
+        assert st["n_blocked_unaligned"] == 9, "gate off → no new alignment rejections"
     finally:
         pt.MART_REQUIRE_ALIGNED = saved
 
-    # 12. a pre-option-B state file (no counter/shadow keys, level 2, an OPEN
-    #     position) must migrate and still be able to close that position
-    legacy_open = {"signal_time": "legacy", "entry": 4400.0, "lot": 0.04, "level": 2,
-                   "open_time": (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()}
+    # 13. a pre-option-B state file (no counter/shadow keys, level 2, an OPEN
+    #     position) must migrate AND still be able to close that position
     with open(pt.MARTINGALE_PATH, "w") as f:
-        json.dump({"level": 2, "max_level": 3, "open": legacy_open, "trades": [],
-                   "equity_usd": -51.76, "n_wins": 26, "n_losses": 26,
-                   "cur_loss_streak": 2, "longest_loss_streak": 6}, f)
+        json.dump({"level": 2, "max_level": 3, "trades": [], "equity_usd": -51.76,
+                   "n_wins": 26, "n_losses": 26, "cur_loss_streak": 2,
+                   "longest_loss_streak": 6,
+                   "open": {"signal_time": "legacy", "entry": 4400.0, "lot": 0.04,
+                            "level": 2, "open_time": ripe_iso(15)}}, f)
     st = pt.load_martingale_state()
     assert st["n_blocked_unaligned"] == 0 and st["n_blocked_no_setups"] == 0
-    assert st["shadow"] is None and st["shadow_trades"] == [] and st["shadow_equity_usd"] == 0.0
+    assert st["shadow"] == [] and st["shadow_trades"] == [] and st["shadow_equity_usd"] == 0.0
     assert st["level"] == 2 and st["n_wins"] == 26, "legacy fields must survive the load"
     st = pt.run_martingale_cycle(fresh_data(False, None, None, 4410.0, setups=[]))
     assert st["open"] is None, "deploying into an open position must not strand it"
     assert st["n_wins"] == 27, "the legacy position must still be able to close"
+
+    # 14. the first cut of this branch wrote `shadow` as a single dict — a state
+    #     file carrying that shape must migrate to the list, not crash
+    with open(pt.MARTINGALE_PATH, "w") as f:
+        json.dump({"level": 0, "open": None, "trades": [], "shadow": {
+            "signal_time": "old", "open_time": ripe_iso(3), "entry": 4400.0, "lot": 0.01}}, f)
+    st = pt.load_martingale_state()
+    assert isinstance(st["shadow"], list) and len(st["shadow"]) == 1, st["shadow"]
+    st = pt.run_martingale_cycle(fresh_data(True, "b-dictmig", 4400.0, 4405.0, setups=[]))
+    assert len(st["shadow"]) == 2, "the migrated entry plus the new one"
     print("test_aligned_gate: ✅ all assertions passed")
 
 
 def test_producer_contract():
     """The gate reads fields analyze_v3 emits — pin that contract by running the
-    real emitter instead of trusting a hand-written fixture. A direction/severity
-    format change must fail HERE, not silently block every signal in live."""
+    real emitter, AND by checking a real report file still has the shape we read.
+    A direction/severity/payload change must fail HERE, not silently halt the
+    engine in live until someone notices that it stopped trading."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import analyze_v3 as az
 
@@ -240,6 +290,29 @@ def test_producer_contract():
     poor["quality"] = "POOR_RR"
     assert az.cron_push_eligible(poor) is False, "POOR_RR must never be pushable"
     assert pt._martingale_aligned([poor]) is True, "…but option B still accepts it (known gap)"
+
+    # ── end-to-end canary on a REAL payload ──
+    # The fixtures above are hand-built, so they cannot prove the live report
+    # actually carries the keys this gate reads.
+    reports = os.path.expanduser("~/.hermes/reports")
+    files = sorted(f for f in os.listdir(reports)
+                   if f.startswith("xauusd_v3_") and f.endswith(".json")) \
+        if os.path.isdir(reports) else []
+    if not files:
+        print("test_producer_contract: ⚠️ skip live-payload canary (冇 report 檔)")
+    else:
+        with open(os.path.join(reports, files[-1])) as f:
+            payload = json.load(f)
+        assert "setups" in payload and isinstance(payload["setups"], list), \
+            f"{files[-1]} 冇頂層 setups list — option B 會當上游故障、引擎停擺"
+        assert "rebound_martingale" in payload, f"{files[-1]} 冇 rebound_martingale"
+        assert "price" in payload, f"{files[-1]} 冇 price"
+        for s in payload["setups"]:
+            assert "counter_trend_severity" in s, \
+                f"{files[-1]} setup 冇 counter_trend_severity — gate 會永遠 False"
+            assert pt._norm_dir(s.get("direction")), f"unparseable direction: {s.get('direction')!r}"
+        print(f"   live canary OK: {files[-1]} — {len(payload['setups'])} setups, "
+              f"severities={sorted({s['counter_trend_severity'] for s in payload['setups']})}")
     print("test_producer_contract: ✅ all assertions passed")
 
 
@@ -272,6 +345,10 @@ if "--replay" not in sys.argv:
 # ⚠️ 2026-09-03 review: 原研究協議有 look-ahead bias (entry 用 bar 起點+5m 價,
 # 但信號要 15m bar 收市先確認)。誠實協議: entry = 5m bar labeled t+10m 的 close
 # (= 信號 bar 收市價 t+15m), exit = +10min。此 replay 作為引擎回歸基準。
+#
+# NOTE: 呢個 replay 用 fresh_data() 預設（有 ALIGNED BUY setup）→ option B gate
+# 恆常通過，所以佢驗證嘅係「開倉／平倉／升級」引擎正確性，唔係 gate 後嘅策略
+# 表現。Gate 後嘅真實表現要睇 live 影子簿（shadow_equity_usd）。
 import yfinance as yf
 import pandas as pd
 import numpy as np
