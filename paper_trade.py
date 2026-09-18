@@ -365,6 +365,14 @@ def _next_trade_id(log, today):
 # carries a $15-52 futures premium on top of that.
 CLOSE_DECISIVE_SOURCES = ("tv",)
 
+# A withheld close is RECOVERABLE (the next spot tick books the real price), which
+# is why the venue gate fails closed instead of trusting a shifted series. But it
+# also HIDES a dead TV feed: the 2026-09-15 `TVInterval.min_30` typo meant every
+# tick silently fell through to PAXG and nobody noticed for days. So a deferral
+# counts itself and escalates once it stops looking transient (12 ticks ≈ 1h on
+# the 5-minute cron). Fail-safe, not fail-silent.
+VENUE_STALE_ALERT_TICKS = 12
+
 
 def _close_venue_confirmed(data_source):
     """Is this venue allowed to decide a close? Only the signal's own spot feed.
@@ -654,7 +662,7 @@ MART_REQUIRE_ALIGNED = os.environ.get("MART_ALIGNED_OFF") != "1"
 # as open→open and conditioned on the previous trade being a LOSS (the only state
 # in which this rule can bind): n=26, median 1.12h, **largest 11.75h**; every gap
 # above 8h is the structural overnight break (trading day ends ~22:20 HKT,
-# restarts ~08:15 HKT). 14h clears the largest by 2.25h (19.2%).
+# restarts ~08:15 HKT). 14h clears the largest by 2.25h (19.1%).
 #
 # The rule deliberately measures from the last OPEN, not the last close, so it is
 # directly comparable with the open→open distribution above — measuring
@@ -675,19 +683,37 @@ MART_REQUIRE_ALIGNED = os.environ.get("MART_ALIGNED_OFF") != "1"
 # the uncertainty is on the safe side.
 # 0 disables the rule entirely.
 def _env_float(name, default):
-    """Parse-safe float env read: a typo'd knob must not stop the import.
+    """Parse-safe, DOMAIN-safe float env read: a bad knob must not import-fail.
 
     This module is imported by every strategy path, so an unguarded float() on a
     martingale-only override would halt trading that has nothing to do with it.
+
+    2026-09-18 review: catching ValueError is NOT enough, which matters here
+    because this knob silently INVERTS the rule when it goes wrong:
+
+    - `nan` parses fine, and every comparison against nan is False → `hours <
+      nan` never trips and `nan <= 0` is not "disabled", so `=nan` releases the
+      level on every check ⇒ the progression is silently abolished (always base
+      size). Exactly the silent-inversion class this rule exists to kill.
+    - `inf` / `1e400` is the mirror image: `hours < inf` is always True, so the
+      rule goes quiet forever and is indistinguishable from "no drought".
+    - A negative (sign typo, e.g. -14) has no meaning as a duration and would
+      silently disable the rule.
+
+    All three now warn and fall back to the default, like a bad parse.
     """
     raw = os.environ.get(name)
     if raw is None or raw == "":
         return float(default)
     try:
-        return float(raw)
+        val = float(raw)
     except ValueError:
         print(f"⚠️ [馬丁] {name}={raw!r} 唔係數字 — 用預設 {default}")
         return float(default)
+    if not math.isfinite(val) or val < 0:
+        print(f"⚠️ [馬丁] {name}={raw!r} 唔係有限非負數 — 用預設 {default}")
+        return float(default)
+    return val
 
 
 MART_STALE_LEVEL_HOURS = _env_float("MART_STALE_LEVEL_HOURS", 14)
@@ -935,14 +961,19 @@ def _maybe_stale_level_reset(st, now):
         return False
 
     if st.get("open") is not None:
-        # A live position is not dormancy. And a position held for many holds is
-        # an anomaly in its own right (the close step ripens after
-        # MART_HOLD_MINUTES), so flag it loudly rather than silently re-base a
-        # level that `open["level"]` still refers to.
-        held = _mart_elapsed_minutes(st["open"].get("open_time"), now)
-        if held >= MART_HOLD_MINUTES * 6:
-            print(f"⚠️ [馬丁] 持倉 {held:.0f} 分鐘 — 遠超平倉期，另有 bug；"
-                  f"今 tick 唔重設 level")
+        # A live position is not dormancy: `open["level"]` still refers to this
+        # level, so re-basing it mid-flight would desync the position from the
+        # progression. Refuse.
+        #
+        # 2026-09-18 review: a "held far past MART_HOLD_MINUTES" warning used to
+        # sit here. It was unreachable through this cycle, so it was removed
+        # rather than kept as decoration — proven by construction, not by
+        # reading: step 1 closes any position whose hold >= MART_HOLD_MINUTES,
+        # and when it cannot (price is None) it returns BEFORE 1b runs. So a
+        # live position at 1b always has hold < MART_HOLD_MINUTES. If that
+        # invariant ever breaks, step 1 is what needs fixing; a warning here
+        # would only have misdiagnosed it as a stale-level problem (and a
+        # position stuck live is already reported by step 1 itself).
         return False
 
     try:
@@ -951,12 +982,19 @@ def _maybe_stale_level_reset(st, now):
         if stamp is None:
             stamp = _mart_last_trade_stamp(st, "close_time")
             basis = "close_time"
+        # The subtraction belongs INSIDE the guard. `_parse_dt` and `_mart_now`
+        # are both meant to be tz-aware UTC so this cannot raise today — but an
+        # exception escaping this function kills the whole cycle (no close, no
+        # open), and a future edit making `_mart_now` naive would raise
+        # TypeError precisely here. `_mart_elapsed_minutes` guards the same
+        # subtraction for the same reason.
+        hours = None if stamp is None else (now - stamp).total_seconds() / 3600.0
     except Exception as e:                       # never let the check halt trading
         print(f"⚠️ [馬丁] 閒置檢查讀唔到時間 ({e!r}) — 今 tick 唔重設")
         st["stale_level_no_basis"] = st.get("stale_level_no_basis", 0) + 1
         return False
 
-    if stamp is None:
+    if stamp is None or hours is None:
         # Without a usable timestamp the hazard this rule exists to close
         # silently returns, so say so instead of failing quiet.
         st["stale_level_no_basis"] = st.get("stale_level_no_basis", 0) + 1
@@ -964,7 +1002,6 @@ def _maybe_stale_level_reset(st, now):
               f"（乾旱後 4× 追舊 streak 嘅 hazard 可能仍在）")
         return False
 
-    hours = (now - stamp).total_seconds() / 3600.0
     if hours < MART_STALE_LEVEL_HOURS:
         return False
     print(f"[馬丁] 🕰 級{st['level']+1} 對上一次交易開倉已 {hours:.1f}h（{basis}）"
@@ -1668,11 +1705,26 @@ def check_outcomes(data):
             # 2026-09-15: non-spot series — withhold the close AND the
             # sim_state update (tp1/trail levels from a shifted venue would
             # leak into the next spot tick). Leave the trade untouched.
+            #
+            # 2026-09-18 review: this branch is the one that can HIDE a dead TV
+            # feed, so it must not be silent. Carry the first deferral time and a
+            # tick count (the previous warning's `at` is overwritten every tick,
+            # which made "down 5 minutes" and "down 5 days" indistinguishable),
+            # and escalate past VENUE_STALE_ALERT_TICKS.
+            prev = trade.get("venue_warning") or {}
+            now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            ticks = int(prev.get("ticks") or 0) + 1
             trade["venue_warning"] = {
                 "source": data_source,
-                "at": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                "since": prev.get("since") or prev.get("at") or now_iso,
+                "at": now_iso,
+                "ticks": ticks,
                 "reason": "non-spot M30 series — close withheld (spot is the traded venue)",
             }
+            if ticks >= VENUE_STALE_ALERT_TICKS:
+                print(f"🚨 [venue] '{data_source}' 連續 {ticks} 個 tick 唔係 spot "
+                      f"（首次 {trade['venue_warning']['since']}）— 平倉一直被扣起，"
+                      f"TV feed 可能已經死；倉冇止損保護，要人手跟")
             still_live.append(trade)
             continue
 

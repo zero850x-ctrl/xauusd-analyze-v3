@@ -330,20 +330,53 @@ def test_env_flag_parsing():
             capture_output=True, text=True, cwd=repo)
         assert r.stdout.strip() == str(want), \
             f"MART_ALIGNED_OFF={val!r} → {r.stdout!r} (only literal '1' disables) {r.stderr[-300:]}"
-    print("test_env_flag_parsing: ✅ all assertions passed (only literal '1' disables)")
+
+    # 2026-09-18 review: catching ValueError was NOT enough for a knob that
+    # silently INVERTS the rule when it goes wrong. `nan` parses, and every
+    # comparison against it is False → `hours < nan` never trips, so the level is
+    # released on every check (progression abolished). `inf`/`1e400` is the
+    # mirror: the rule goes permanently quiet and looks like "no drought". A
+    # negative is a sign typo and has no meaning as a duration. All must fall
+    # back to the default (14.0), loudly; only a real non-negative finite value
+    # — including 0, the documented off switch — may pass through.
+    for val, want in (("nan", 14.0), ("NaN", 14.0), (".nan", 14.0), ("inf", 14.0),
+                      ("Infinity", 14.0), ("1e400", 14.0), ("-14", 14.0),
+                      ("14h", 14.0), ("", 14.0), ("0", 0.0), ("21.5", 21.5)):
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import paper_trade as p; print(repr(p.MART_STALE_LEVEL_HOURS))"],
+            env={**os.environ, "MART_STALE_LEVEL_HOURS": val,
+                 "XAUUSD_PAPER_MARTINGALE": pt.MARTINGALE_PATH},
+            capture_output=True, text=True, cwd=repo)
+        # the fallback warning is printed to stdout too — compare the last line
+        got = (r.stdout.strip().splitlines() or [""])[-1]
+        assert got == repr(want), \
+            f"MART_STALE_LEVEL_HOURS={val!r} → {got!r}, want {want!r} {r.stderr[-300:]}"
+    print("test_env_flag_parsing: ✅ all assertions passed "
+          "(only literal '1' disables; bad float domains fall back to the default)")
 
 
 def test_stale_level_reset():
-    """Dormancy rule (2026-09-18). Dormancy is driven through the `trades`
-    timestamps; only the fixtures' *base* time is wall-clock, and every margin is
-    hours, so none of this is clock-sensitive."""
+    """Dormancy rule (2026-09-18). Every timestamp here is relative to a FROZEN
+    clock: `paper_trade._mart_now` is monkeypatched for the whole case list, so
+    fixtures land exactly where they claim. An earlier version leaned on
+    wall-clock margins — a 2-min-old fixture against a 10-min ripe threshold
+    leaves only ~8 minutes of headroom, and a stalled CI could have flipped it.
+    The patch is restored at the end; a failed assert aborts the process, so it
+    cannot leak into another test."""
     if os.path.exists(pt.MARTINGALE_PATH):
         os.remove(pt.MARTINGALE_PATH)
 
+    FROZEN = datetime.now(timezone.utc)
+    _real_mart_now = pt._mart_now
+    pt._mart_now = lambda: FROZEN
+
+    def ago_iso(minutes=0.0, hours=0.0):
+        return (FROZEN - timedelta(minutes=minutes, hours=hours)).isoformat()
+
     def mk_trade(open_h, close_h, win=False, level=0):
-        n = datetime.now(timezone.utc)
-        return {"open_time": (n - timedelta(hours=open_h)).isoformat(),
-                "close_time": (n - timedelta(hours=close_h)).isoformat(),
+        return {"open_time": ago_iso(hours=open_h),
+                "close_time": ago_iso(hours=close_h),
                 "win": win, "level": level}
 
     def write_state(level, trades, open_pos=None):
@@ -357,7 +390,10 @@ def test_stale_level_reset():
         return pt.load_martingale_state()
 
     def pos(mins_ago, lot, level):
-        return {"signal_time": "old", "open_time": ripe_iso(mins_ago),
+        # NOTE: `mins_ago` values below that are < MART_HOLD_MINUTES describe a
+        # state the cycle itself converges on but a cold state file can hold, so
+        # these are white-box branch fixtures, not states production produces.
+        return {"signal_time": "old", "open_time": ago_iso(minutes=mins_ago),
                 "entry": 4400.0, "lot": lot, "level": level}
 
     TH = pt.MART_STALE_LEVEL_HOURS
@@ -386,8 +422,7 @@ def test_stale_level_reset():
     #    level at 2 here and silently reopen the very hazard this rule closes.
     st = write_state(1, [mk_trade(TH + 6, TH + 5, level=0)],
                      open_pos=pos(0, 0.02, 1))
-    st["open"]["open_time"] = (datetime.now(timezone.utc)
-                               - timedelta(hours=TH + 5)).isoformat()
+    st["open"]["open_time"] = ago_iso(hours=TH + 5)
     pt.save_martingale_state(st)
     st = pt.run_martingale_cycle(fresh_data(False, None, None, 4380.0, setups=[]))
     assert st["open"] is None, "the stale position must close"
@@ -405,7 +440,9 @@ def test_stale_level_reset():
     assert st["stale_level_resets"] == 0, "a fresh close means not dormant"
     assert st["level"] == 2, f"a normal loss must level up, got {st['level']}"
 
-    # 5. threshold boundary: just under → hold, just over → release
+    # 5. threshold boundary: just under → hold, just over → release. Both sides
+    #    are exact now that the clock is frozen (the over-side sits 7.2s past the
+    #    line), so this pins `>=` rather than a margin.
     st = write_state(2, [mk_trade(TH - 0.5, TH - 0.6, level=1)])
     st = pt.run_martingale_cycle(fresh_data(True, "s-under", 4400.0, 4401.0))
     assert st["stale_level_resets"] == 0, "under the threshold must hold"
@@ -424,7 +461,8 @@ def test_stale_level_reset():
 
     # 7. a LIVE position is not dormancy — never re-base a level that the open
     #    position is still tracking (without this guard the release would fire,
-    #    because trades[-1] is stale)
+    #    because trades[-1] is stale). The frozen clock makes the distinction
+    #    crisp: 2 min held vs the 10-min ripe threshold, no margin at all.
     st = write_state(2, [mk_trade(TH + 5, TH + 4, level=1)],
                      open_pos=pos(2, 0.04, 2))
     st = pt.run_martingale_cycle(fresh_data(False, None, None, 4401.0, setups=[]))
@@ -435,7 +473,8 @@ def test_stale_level_reset():
     # 8. no usable clock → do NOT release, but DO say so (silence here would let
     #    the original hazard return unnoticed)
     st = write_state(2, [mk_trade(TH + 5, TH + 4, level=1)])
-    st = pt.run_martingale_cycle(fresh_data(True, "s-basis", 4400.0, 4401.0))  # fresh → no_basis stays 0
+    st = pt.run_martingale_cycle(fresh_data(True, "s-basis", 4400.0, 4401.0))
+    # stale fixture, but it releases normally — no "no basis" event to count
     assert st["stale_level_no_basis"] == 0
     st = write_state(2, [{"open_time": "garbage", "close_time": "garbage", "win": False}])
     st = pt.run_martingale_cycle(fresh_data(True, "s-basis2", 4400.0, 4401.0))
@@ -488,12 +527,39 @@ def test_stale_level_reset():
     assert len(st["trades"]) == trades_before, "shadow must not append to the real ledger"
     # close the shadow entry: it books into its own ledger, leaving the real one
     # untouched, and cannot refresh the real streak
-    st["shadow"][0]["open_time"] = ripe_iso()
+    st["shadow"][0]["open_time"] = ago_iso(minutes=12)
     pt.save_martingale_state(st)
     st = pt.run_martingale_cycle(fresh_data(False, None, None, 4405.0, setups=[]))
     assert st["shadow"] == [] and len(st["shadow_trades"]) == 1
     assert len(st["trades"]) == trades_before, "shadow close must not touch `trades`"
     assert st["stale_level_resets"] == 1, "shadow close must not affect the real streak"
+
+    # 13. THE INVARIANT that made an earlier over-held warning unreachable: step 1
+    #     closes any position whose hold >= MART_HOLD_MINUTES, so 1b only ever
+    #     sees positions that are NOT over-held. Driving one through the cycle
+    #     therefore must CLOSE it (and must not "release" it as dormancy) — if a
+    #     future edit breaks this, the over-held case silently becomes release
+    #     territory again and this case fails.
+    st = write_state(2, [mk_trade(TH + 9, TH + 8, level=1)],
+                     open_pos=pos(pt.MART_HOLD_MINUTES * 10, 0.04, 2))
+    st = pt.run_martingale_cycle(fresh_data(False, None, None, 4380.0, setups=[]))
+    assert st["open"] is None, "an over-held position is closed by step 1, not kept"
+    assert st["n_losses"] == 3, "the close counts as a real loss"
+    assert st["stale_level_resets"] == 0, \
+        "a position that just closed is not dormancy (its own open is fresh-ish)"
+    assert st["level"] == 0, "top-level loss resets to 0 the normal way"
+
+    # 14. same over-held position, but no price this tick: step 1 returns before
+    #     1b, so nothing closes and nothing releases. The level must survive
+    #     untouched (this is the path that makes 13's invariant hold).
+    st = write_state(2, [mk_trade(TH + 5, TH + 4, level=1)],
+                     open_pos=pos(pt.MART_HOLD_MINUTES * 10, 0.04, 2))
+    st = pt.run_martingale_cycle(fresh_data(False, None, None, None, setups=[]))
+    assert st["open"] is not None, "no price → the position stays LIVE"
+    assert st["stale_level_resets"] == 0, "a live position is never released"
+    assert st["level"] == 2, "the level must survive a data gap"
+
+    pt._mart_now = _real_mart_now
     print("test_stale_level_reset: ✅ all assertions passed")
 
 

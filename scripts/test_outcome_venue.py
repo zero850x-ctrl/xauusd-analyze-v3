@@ -12,6 +12,8 @@ touched was booked as SL -1.0R @4320.15.
 
 These tests are offline: bars and source are injected, state is a temp file.
 """
+import contextlib
+import io
 import json
 import os
 import re
@@ -139,12 +141,103 @@ def test_venue_warning_cleared_on_clean_tick():
           "venue_warning" not in log["trades"][0])
 
 
+def _run_ticks(steps):
+    """Run check_outcomes once per (source, high) step over ONE log file.
+
+    Returns (snapshots, stdout_per_tick). The single-tick `_run_check` cannot
+    observe a lifecycle — and a warning lifecycle is exactly what has to be
+    pinned here.
+    """
+    seed_dt = datetime.now(timezone.utc) - timedelta(hours=4)
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "paper_trade_log.json")
+        with open(path, "w") as fh:
+            json.dump({"trades": [_sell_trade(seed_dt)], "history": []}, fh)
+
+        orig_path, orig_fetch = pt.LOG_PATH, pt._fetch_m30
+        pt.LOG_PATH = path
+        snaps, outs = [], []
+        try:
+            for source, high_at in steps:
+                pt._fetch_m30 = (lambda *a, _s=source, _h=high_at, **k:
+                                 _bars(seed_dt, _s, _h))
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    pt.check_outcomes({"price": 4285.0,
+                                       "intraday_source": "TradingView (OANDA:XAUUSD)"})
+                outs.append(buf.getvalue())
+                with open(path) as fh:
+                    snaps.append(json.load(fh))
+            return snaps, outs
+        finally:
+            pt.LOG_PATH, pt._fetch_m30 = orig_path, orig_fetch
+
+
+def test_venue_warning_lifecycle_across_ticks():
+    """The warning must be CREATED on a non-spot tick and CLEARED by a later spot
+    tick — i.e. both `trade.pop("venue_warning", None)` calls must matter.
+
+    2026-09-18 review: the earlier versions of these cases started from a CLEAN
+    log, where `pop` on an absent key is a no-op and `"venue_warning" not in hist`
+    is trivially true — deleting BOTH pops left the whole suite green. A lifecycle
+    needs two ticks on one log.
+    """
+    # (a) deferred, then closed by a spot tick → the closed record carries none
+    snaps, _ = _run_ticks([("paxg", 4323.09), ("tv", 4321.0)])
+    deferred, closed = snaps
+    warn = deferred["trades"][0].get("venue_warning") or {}
+    check("non-spot tick records a warning", warn.get("source") == "paxg")
+    check("warning counts the deferral", warn.get("ticks") == 1)
+    check("warning carries a first-deferral stamp", bool(warn.get("since")))
+    check("spot tick closes the trade", closed.get("trades") == [])
+    check("closed record drops the stale warning",
+          "venue_warning" not in closed["history"][0])
+    check("close is tagged with the deciding venue",
+          closed["history"][0].get("close_data_source") == "tv")
+
+    # (b) deferred, then a spot tick that does NOT touch the stop → still LIVE and
+    #     the warning is gone (the second pop, on the still-live path)
+    snaps, _ = _run_ticks([("paxg", 4323.09), ("tv", 4300.0)])
+    deferred, clean = snaps
+    check("deferral recorded before the clean tick",
+          (deferred["trades"][0].get("venue_warning") or {}).get("source") == "paxg")
+    check("trade survives a clean spot tick", clean["trades"][0]["status"] == "LIVE")
+    check("clean spot tick clears the warning",
+          "venue_warning" not in clean["trades"][0])
+    check("nothing was written to history", clean.get("history") == [])
+
+
+def test_venue_deferral_counter_escalates():
+    """A long deferral must count ticks, keep the FIRST stamp, and shout.
+
+    Fail-safe is not fail-silent: this branch is what hides a dead TV feed (the
+    09-15 `TVInterval.min_30` typo put every tick on PAXG for days unnoticed).
+    """
+    n = pt.VENUE_STALE_ALERT_TICKS + 2
+    snaps, outs = _run_ticks([("paxg", 4323.09)] * n)
+    warn = snaps[-1]["trades"][0].get("venue_warning") or {}
+    check("tick count accumulates across the drought", warn.get("ticks") == n)
+    check("first-deferral stamp is stable, not overwritten each tick",
+          warn.get("since") == (snaps[0]["trades"][0]["venue_warning"] or {}).get("since"))
+    check("the warning keeps the most recent tick too", bool(warn.get("at")))
+    check("trade never closed during the drought",
+          len(snaps[-1]["trades"]) == 1 and snaps[-1].get("history") == [])
+    check("no escalation before the threshold",
+          all("🚨" not in o for o in outs[:pt.VENUE_STALE_ALERT_TICKS - 1]))
+    check("escalates loudly at the threshold",
+          "🚨" in outs[pt.VENUE_STALE_ALERT_TICKS - 1])
+    check("keeps escalating while the feed is still dead",
+          all("🚨" in o for o in outs[pt.VENUE_STALE_ALERT_TICKS - 1:]))
+
+
 if __name__ == "__main__":
     tests = [
         test_tv_interval_members_exist,
         test_non_spot_series_cannot_close,
         test_tv_series_closes_and_is_tagged,
         test_venue_warning_cleared_on_clean_tick,
+        test_venue_warning_lifecycle_across_ticks,
+        test_venue_deferral_counter_escalates,
     ]
     failed = 0
     for fn in tests:
