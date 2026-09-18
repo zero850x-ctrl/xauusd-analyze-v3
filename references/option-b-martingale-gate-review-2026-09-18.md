@@ -44,38 +44,63 @@ size 記一個影子倉（同一 10 分鐘規則、同一 cost、唔加碼）。
 **第二輪 3 個 model 一致指出**原本「每 10 分鐘窗口一格」= 專抽 cluster 第一個 =
 有偏差證據 → 已改成**每個被擋信號一格**。
 
-### 閒置重設（`d2b302c`）
+### 閒置重設（`d2b302c`，經 `01036eb` 修正）
 gate 擋住期間 `level` 同連敗計數 freeze（被擋唔算輸）。擋得夠久，乾旱後第一段
-aligned tape 會用冰封 level 開倉（最多 4× size）追返另一個 regime 嘅 streak。
+aligned tape 會用冰封 level 開倉（最多 4× size）追返舊 streak。
 
-streak 最多保留 `MART_STALE_LEVEL_HOURS`（預設 **14h**），由**最後一次平倉**起計。
-只動 `level`，counter 保持原樣。可審計（`stale_level_resets` /
-`last_stale_reset_at`）。`=0` 關閉。
+streak 最多保留 `MART_STALE_LEVEL_HOURS`（預設 **14h**），由**最後一筆交易嘅
+OPEN** 起計（close 做 fallback）。只動 `level`，counter 保持原樣。可審計
+（`stale_level_resets` / `last_stale_reset_at` / `stale_level_no_basis`）。`=0` 關閉。
 
-**14h 係讀出嚟（live 53 筆、5 日）**：相鄰開倉 gap 中位 0.74h、最大 11.75h；
-**所有 >8h 嘅 gap 都係結構性隔夜**（交易日 ~22:20 HKT 收、~08:15 HKT 開）；
-14h 比最大良性 gap 高 ~19%。回放 53 筆：**觸發 0 次、逐筆 level 零偏差**
-（12h 亦 0 次但只高 0.25h；8h 會改動 2 筆）。
+**理由**：加碼序列只對「連續嘗試」有定義，斷開就要重啟 —— **唔係**「另一個 regime」
+（S3 喺乾旱期間照出，只係被擋，regime 冇變）。呢個 rationale 早期寫錯，係 load-bearing。
+
+**14h 校準（live 53 筆、5 個交易日）**：量度 = open→open，**condition 喺上一筆係輸**
+（rule 唯一會 bind 嘅狀態）：n=26、中位 1.12h、**最大 11.75h**；所有 >8h 嘅 gap 都係
+結構性隔夜（交易日 ~22:20 HKT 收、~08:15 HKT 開）。14h 比最大高 2.25h（19.2%）。
+回放 53 筆（level>0 嘅決策點）：觸發 **0 次**。
+
+**已知限制（唔可以當佢已證明）**：
+- 樣本係 **UNGATED cadence**。gate 開咗之後 gap 由 blocked drought 主導 →
+  「正常運作唔會誤觸」對部署形態**未經證明**，只可以講「5 日歷史冇觸發過」
+- 5 個交易日**冇 weekend**，設計上嘅週末行為（~58h gap）從未被 replay
+- n 細（26 個 binding 觀察）；假期早收亦可能造成超閾值嘅良性 gap
+- 以上全部令 false fire **更可能**，而 false fire 只會**縮細** size → 不確定性喺安全側
+
+**量度起點點解係 open 唔係 close**（第三輪 review 兩個 model 一致指出）：
+- open→open 先係 14h 校準用嘅量，否則門檻同校準數據唔同尺（close 量度會低一個
+  `MART_HOLD_MINUTES`，即靜靜雞放鬆成個持倉時間）
+- **修好一條真漏洞**：引擎持倉期間死 >TH，重啟後第一個 tick 平倉 → close 新鮮但
+  streak 唔係 → 淨讀 close 唔會 release，level 照加碼 4×
+- 正常平倉照樣刷新（該筆 open 只 ~10 分鐘前），唔使特例處理
+- 有 live position 時**唔准**重設（position 仍追蹤 `open["level"]`）
+- 讀唔到時間**唔會靜默**：加 `stale_level_no_basis` counter + 警告
+
+**測試有鑑別力（已獨立證明）**：把量度改返 close-based 跑同一情境 → level 停喺 2、
+resets 0（test 會紅）；open-based → level 0、resets 1。
+
 
 ## Cursor 請重點驗嘅 8 項
 
-1. **14h 推導係唔係偷換？** 我度相鄰**開倉**間隔同隔夜 gap，但 code 用「上次
-   **平倉** → 現在」。呢兩個量度係唔係同一件事？有冇量錯？
-2. **次序**：release 喺 close 之後、open 之前。有冇路徑可以喺 release 之前就用舊
-   `level` 決定 size（注意 `st["open"]` 可能由上一 tick 帶住 level）？
-3. **靜默停擺／靜默放大倉位**：payload 變形（`setups` 缺失 / `None` / 非 list）
-   已當上游故障（唔消耗 bar、獨立 counter、警告 + canary test）。仲有冇其他途徑？
+1. **14h 推導**：已按第二輪意見改用正確校準量（open→open、condition-on-loss）同
+   記錄已知限制。仲有冇偷換？`>=` 邊界語義啱唔啱？
+2. **次序**：release 喺 close 之後、open 之前；有 live position 時唔准 release。
+   仲有冇路徑可以喺 release 之前用舊 `level` 決定 size？
+3. **靜默停擺／靜默放大倉位**：payload 變形當上游故障（唔消耗 bar、獨立 counter、
+   警告 + canary test）；讀唔到交易時間亦唔再靜默（`stale_level_no_basis`）。
+   仲有冇其他靜默路徑？
 4. **只動 level 唔動 counter** 正確嗎？`cur_loss_streak` 同 level 脫節會唔會影響
    其他地方（日內虧損限額、冷靜期）？
-5. **同影子簿互動**：shadow 平倉會唔會意外「刷新」真 streak（令 release 唔觸發）？
-   反之 release 會唔會影響 shadow？
-6. **`_mart_last_close_dt` 改名**：module 已有 `_last_close_dt(log)` 服務主帳簿
-   （`history` vs `trades` 形狀唔同），撞名會靜默讀錯。改名夠唔夠？
-7. **測試質素**：新增 case 有冇假保證（只測自己 fixture、靠 wall clock、漏分支）？
-   特別 case 3/3b 聲稱釘住「今 tick 平倉即刷新 streak」嘅次序保證。
+5. **影子簿互動**：已核實 shadow lot = `MART_LOT0`（唔由 `st["level"]` 推）、shadow
+   平倉只寫 `shadow_trades`，並加 test 釘住。仲有冇交叉污染？
+6. **命名**：module 已有 `_last_close_dt(log)`（主帳簿）＋ `_mart_last_trade_stamp`
+   （馬丁）。兩者 dict 形狀唔同，撞名會靜默讀錯 —— 夠唔夠清晰？
+7. **測試質素**：新增 case 已獨立證明有鑑別力（close-based 會紅）。仲有冇假保證、
+   漏分支、或者將來 refactor 會靜默整甩嘅斷言？
 8. **`run_tests.sh` 唯一 fail = `test_post_spike_gate` G4 clock flake**
    （HKT 18:00–18:59 必 fail；`BROKER_UTC_OFFSET_HOURS=0` → ALL PASS）。
    呢個 flake 應唔應該順手修？
+
 
 ## 反向模擬：危險時段唔 block（同日做）
 
