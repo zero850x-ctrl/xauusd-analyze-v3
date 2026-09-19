@@ -77,14 +77,24 @@ def main():
             r = stats(grp, lbl)
             print(f"  {lbl}: n={r['n']} win%={r['win%']} PF={r['PF']} E(R)={r['E(R)']} net$={r['net$']}")
 
-    trades_dump = []
+    trades_dump = dump_trades(closed)
+    json.dump(rows, open(os.path.join(SCRIPT_DIR, "yearly_breakdown.json"), "w"), indent=1)
+    json.dump(trades_dump, open(os.path.join(SCRIPT_DIR, "trades_5y.json"), "w"), indent=1)
+    print(f"\n[saved] yearly_breakdown.json + trades_5y.json ({len(trades_dump)} trades)")
+
+
+def dump_trades(closed):
+    """Trade list → dump rows（獨立函數，令 DB 層可測；見 test_yearly_breakdown_dump.py）。
+
+    ⚠️ 2026-09-19 fix：舊版手砌 attribute 名，但 3 個名同 Trade class 唔符
+    → 靜默變 None 而且冇任何 consumer 會發現（`direction` vs `side`、
+    `stop_loss` vs `stop_price`、`take_profit` vs `tp1_price`）→ 319 筆
+    direction 全 None，令「用同一把尺驗 CS chase 規則」嘅研究做唔到。
+    呢個係 bug class：手寫 attribute 名只會喺 class 改名之後靜默變 None。
+    改用 class 自己嘅 `to_dict()`（authoritative），再補 dump 專用欄位。
+    """
+    out = []
     for t in closed:
-        # ⚠️ 2026-09-19 fix：舊版手砌 attribute 名，但 3 個名同 Trade class 唔符
-        #    → 靜默變 None 而且冇人發覺（`direction` vs `side`、`stop_loss` vs
-        #    `stop_price`、`take_profit` vs `tp1_price`）→ 319 筆全部 direction=None，
-        #    令「用同一把尺驗 CS chase 規則」呢個研究做唔到。呢個係 bug class：
-        #    手寫 attribute 名喺 class 改名之後只會靜默變 None。
-        #    改用 class 自己嘅 `to_dict()`（authoritative），再補幾個 dump 專用欄位。
         if not hasattr(t, "to_dict"):
             print(f"⚠️ 跳過冇 to_dict() 嘅 trade: {type(t).__name__}")
             continue
@@ -92,10 +102,8 @@ def main():
         row["bar_idx"] = getattr(t, "bar_idx", None)
         row["limit_order"] = bool(getattr(t, "limit_order", False))
         row["entry_mode"] = getattr(t, "entry_mode", None)
-        trades_dump.append(row)
-    json.dump(rows, open(os.path.join(SCRIPT_DIR, "yearly_breakdown.json"), "w"), indent=1)
-    json.dump(trades_dump, open(os.path.join(SCRIPT_DIR, "trades_5y.json"), "w"), indent=1)
-    print(f"\n[saved] yearly_breakdown.json + trades_5y.json ({len(trades_dump)} trades)")
+        out.append(row)
+    return out
 
 
 if __name__ == "__main__":
