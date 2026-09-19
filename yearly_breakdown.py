@@ -79,20 +79,20 @@ def main():
 
     trades_dump = []
     for t in closed:
-        d = getattr(t, "entry_date", None) or getattr(t, "entry_time", None)
-        trades_dump.append({
-            "id": getattr(t, "id", None),
-            "entry_time": str(d),
-            "direction": getattr(t, "direction", None),
-            "entry": getattr(t, "entry_price", None),
-            "sl": getattr(t, "stop_loss", None),
-            "tp": getattr(t, "take_profit", None),
-            "exit": getattr(t, "exit_price", None),
-            "pnl": getattr(t, "total_pnl", None),
-            "rr": getattr(t, "rr_achieved", None),
-            "limit_order": bool(getattr(t, "limit_order", False)),
-            "entry_mode": getattr(t, "entry_mode", None),
-        })
+        # ⚠️ 2026-09-19 fix：舊版手砌 attribute 名，但 3 個名同 Trade class 唔符
+        #    → 靜默變 None 而且冇人發覺（`direction` vs `side`、`stop_loss` vs
+        #    `stop_price`、`take_profit` vs `tp1_price`）→ 319 筆全部 direction=None，
+        #    令「用同一把尺驗 CS chase 規則」呢個研究做唔到。呢個係 bug class：
+        #    手寫 attribute 名喺 class 改名之後只會靜默變 None。
+        #    改用 class 自己嘅 `to_dict()`（authoritative），再補幾個 dump 專用欄位。
+        if not hasattr(t, "to_dict"):
+            print(f"⚠️ 跳過冇 to_dict() 嘅 trade: {type(t).__name__}")
+            continue
+        row = t.to_dict()
+        row["bar_idx"] = getattr(t, "bar_idx", None)
+        row["limit_order"] = bool(getattr(t, "limit_order", False))
+        row["entry_mode"] = getattr(t, "entry_mode", None)
+        trades_dump.append(row)
     json.dump(rows, open(os.path.join(SCRIPT_DIR, "yearly_breakdown.json"), "w"), indent=1)
     json.dump(trades_dump, open(os.path.join(SCRIPT_DIR, "trades_5y.json"), "w"), indent=1)
     print(f"\n[saved] yearly_breakdown.json + trades_5y.json ({len(trades_dump)} trades)")
