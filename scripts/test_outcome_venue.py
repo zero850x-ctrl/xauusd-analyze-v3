@@ -454,7 +454,7 @@ def test_total_fetch_failure_is_recorded_and_escalates():
           any("🚨" in o for o in outs))
 
 
-def _run_forced_sim(close_bar_time, source="tv", verified=True):
+def _run_forced_sim(close_bar_time, source="tv", verified=True, bad_seed=False):
     """One tick with a HAND-BUILT closed sim result.
 
     The guards below protect against the sim (or its inputs) reporting a close
@@ -467,10 +467,13 @@ def _run_forced_sim(close_bar_time, source="tv", verified=True):
               "close_price": 4321.0, "tp1_hit": False, "tp2_hit": False,
               "verified": verified, "data_source": source,
               "close_bar_time": close_bar_time}
+    seed_trade = _sell_trade(seed_dt)
+    if bad_seed:
+        seed_trade["seeded_time"] = "not-a-timestamp"
     with tempfile.TemporaryDirectory() as td:
         path = os.path.join(td, "paper_trade_log.json")
         with open(path, "w") as fh:
-            json.dump({"trades": [_sell_trade(seed_dt)], "history": []}, fh)
+            json.dump({"trades": [seed_trade], "history": []}, fh)
         orig = (pt.LOG_PATH, pt._fetch_m30, pt._simulate_staged_exit)
         pt.LOG_PATH = path
         pt._fetch_m30 = lambda *a, **k: _bars(seed_dt, source, 4210.0)
@@ -525,6 +528,46 @@ def test_unreadable_deciding_bar_is_withheld():
     check("and it is printed", "UNVERIFIED" in out or "⚠️" in out)
 
 
+def test_unreadable_seed_time_is_withheld():
+    """A corrupt `seeded_time` must not silently open the door.
+
+    The invariant guard used to sit inside `seed_dt is not None`, so an
+    unparseable `seeded_time` skipped the whole check and booked the close with
+    no record — the same fail-open shape the PR removes elsewhere.
+    """
+    log, _ = _run_forced_sim(
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), bad_seed=True)
+    check("unreadable seed does NOT book a close", log.get("history") == [])
+    check("trade stays LIVE", log["trades"][0]["status"] == "LIVE")
+    unv = log["trades"][0].get("last_unverified") or {}
+    check("the reason names the seed", "seed time unreadable" in (unv.get("reason") or ""))
+
+
+def test_run_backtest_refuses_unverifiable_clock():
+    """No lag measured → refuse. Same rule as the live path.
+
+    The future-series check alone left `lag is None` fail-OPEN in the research
+    path, which contradicted the gate's own principle.
+    """
+    orig = (pt._fetch_m30, pt._simulate_staged_exit)
+    called = []
+    seed_dt = datetime.now(timezone.utc) - timedelta(hours=2)
+    pt._fetch_m30 = lambda *a, **k: (_bars_without_time(seed_dt, 4300.0), "tv")
+    pt._simulate_staged_exit = lambda *a, **k: called.append(1) or {}
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            pt.run_backtest({"setups": [{"direction": "SELL", "entry": 4300.0,
+                                         "stop_loss": 4350.0, "tp1": 4250.0,
+                                         "tp2": 4200.0, "atr_30m": 15}],
+                             "generated_at": seed_dt.strftime("%Y-%m-%dT%H:%M:%SZ")})
+    finally:
+        pt._fetch_m30, pt._simulate_staged_exit = orig
+    out = buf.getvalue()
+    check("unverifiable clock → backtest refused", "unverifiable" in out)
+    check("no setup was simulated", called == [])
+
+
 def test_run_backtest_refuses_future_series():
     """A FUTURE-dated series is never legitimate — backtest included.
 
@@ -571,6 +614,8 @@ if __name__ == "__main__":
         test_total_fetch_failure_is_recorded_and_escalates,
         test_close_bar_before_seed_is_withheld,
         test_unreadable_deciding_bar_is_withheld,
+        test_unreadable_seed_time_is_withheld,
+        test_run_backtest_refuses_unverifiable_clock,
         test_run_backtest_refuses_future_series,
     ]
     failed = 0

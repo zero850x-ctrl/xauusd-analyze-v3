@@ -1594,7 +1594,7 @@ def _series_lag_minutes(bars):
             newest = newest.tz_convert("UTC").tz_localize(None)
         lag = (datetime.now(timezone.utc).replace(tzinfo=None)
                - newest).total_seconds() / 60.0
-    except (TypeError, ValueError, AttributeError):
+    except (TypeError, ValueError):
         # AttributeError is NOT theoretical: an `object`-dtype datetime column
         # hands back a stdlib datetime, which has `tzinfo` but no `.tz_convert`,
         # and a `Timedelta` value makes the subtraction return a datetime whose
@@ -1760,9 +1760,14 @@ def _stamp_venue_warning(trade, source, reason, lag=None):
         # Name the SOURCE: with clock skew the reason string carries no feed
         # name, so without this an operator reading the log cannot tell which
         # series to go look at.
+        #
+        # Do NOT add a diagnosis here (it used to end "series venue/時鐘有問題"):
+        # this counter now also carries booking-invariant withholds, where the
+        # problem is the sim/booking, not the feed — a hardcoded cause would send
+        # an operator to inspect the wrong subsystem. `reason` already says why.
         print(f"🚨 [venue] 連續 {ticks} 個 tick 扣起平倉（首次 "
               f"{trade['venue_warning']['since']}）：source={source} {reason} — "
-              f"series venue/時鐘有問題；倉冇止損保護，要人手跟")
+              f"倉冇止損保護，要人手跟")
     return trade["venue_warning"]
 
 
@@ -1896,11 +1901,20 @@ def check_outcomes(data):
             # set `close_bar_time`, so `None` means something is wrong, not that
             # the close is fine.
             bar_dt = _parse_dt(sim.get("close_bar_time") or "")
-            if verified and seed_dt is not None:
+            if verified:
                 if bar_dt is None:
                     verified = False
                     unverified_reason = ("deciding bar time unreadable — cannot "
                                          "verify it came after the seed")
+                elif seed_dt is None:
+                    # Hoisted out of the `seed_dt is not None` guard (review round
+                    # 4): the reason for withholding on an unreadable bar does not
+                    # depend on the seed being readable, and leaving it inside made
+                    # a corrupt `seeded_time` fail OPEN — a close booked with no
+                    # record at all, which is the failure this PR exists to remove.
+                    verified = False
+                    unverified_reason = ("seed time unreadable — cannot verify the "
+                                         "deciding bar came after it")
                 elif bar_dt <= seed_dt:
                     verified = False
                     unverified_reason = (
@@ -2111,7 +2125,13 @@ def run_backtest(data):
     # mirror would silently shift every backtest by 8h with no gate and no
     # warning, quietly corrupting research conclusions.
     series_lag = _series_lag_minutes(bars)
-    if series_lag is not None and series_lag < -TV_STALE_MINUTES:
+    if series_lag is None:
+        # Unverifiable clock → refuse, same rule as the live path. Leaving this
+        # fail-open contradicted the gate's own principle (review round 4).
+        print(f"⚠️ M30 series bar times unreadable (source '{data_source}') — "
+              f"clock unverifiable, backtest refused")
+        return
+    if series_lag < -TV_STALE_MINUTES:
         print(f"⚠️ M30 series is {-series_lag:.0f}min in the FUTURE (source "
               f"'{data_source}') — clock skew, backtest refused")
         return
