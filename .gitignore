@@ -3,3 +3,6 @@
 verify_data_paxg*.csv
 # per-trade dumps written by verify_tp_retest.py (large; summary JSON is tracked)
 verify_*_trades.json
+# Python bytecode (唔應該入 repo；2026-09-19 加)
+__pycache__/
+*.pyc

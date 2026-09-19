@@ -77,25 +77,42 @@ def main():
             r = stats(grp, lbl)
             print(f"  {lbl}: n={r['n']} win%={r['win%']} PF={r['PF']} E(R)={r['E(R)']} net$={r['net$']}")
 
-    trades_dump = []
-    for t in closed:
-        d = getattr(t, "entry_date", None) or getattr(t, "entry_time", None)
-        trades_dump.append({
-            "id": getattr(t, "id", None),
-            "entry_time": str(d),
-            "direction": getattr(t, "direction", None),
-            "entry": getattr(t, "entry_price", None),
-            "sl": getattr(t, "stop_loss", None),
-            "tp": getattr(t, "take_profit", None),
-            "exit": getattr(t, "exit_price", None),
-            "pnl": getattr(t, "total_pnl", None),
-            "rr": getattr(t, "rr_achieved", None),
-            "limit_order": bool(getattr(t, "limit_order", False)),
-            "entry_mode": getattr(t, "entry_mode", None),
-        })
+    trades_dump = dump_trades(closed)
     json.dump(rows, open(os.path.join(SCRIPT_DIR, "yearly_breakdown.json"), "w"), indent=1)
     json.dump(trades_dump, open(os.path.join(SCRIPT_DIR, "trades_5y.json"), "w"), indent=1)
     print(f"\n[saved] yearly_breakdown.json + trades_5y.json ({len(trades_dump)} trades)")
+
+
+def dump_trades(closed):
+    """Trade list → dump rows（獨立函數，令 DB 層可測；見 test_yearly_breakdown_dump.py）。
+
+    ⚠️ 2026-09-19 fix：舊版手砌 attribute 名，但 3 個名同 Trade class 唔符
+    → 靜默變 None 而且冇任何 consumer 會發現（`direction` vs `side`、
+    `stop_loss` vs `stop_price`、`take_profit` vs `tp1_price`）→ 319 筆
+    direction 全 None，令「用同一把尺驗 CS chase 規則」嘅研究做唔到。
+    呢個係 bug class：手寫 attribute 名只會喺 class 改名之後靜默變 None。
+    改用 class 自己嘅 `to_dict()`（authoritative），再補 dump 專用欄位。
+
+    ⚠️ 第二個同形狀嘅陷阱（2026-09-19 外審指出）：第一版對「冇 to_dict()」嘅對象
+    **靜默跳過**，即係用另一個靜默置換原本嘅靜默 —— 若 Trade 改名或者傳錯 list，
+    就會靜靜 dump 0 筆而冇人知。所以而家**大聲 raise**：dump 唔到嘢係 bug，
+    唔係可以靜靜容忍嘅情況。呢個係本 bug class 嘅正確收尾方式。
+    """
+    bad = [t for t in closed if not hasattr(t, "to_dict")]
+    if bad:
+        raise TypeError(
+            f"dump_trades: {len(bad)}/{len(closed)} 個對象冇 to_dict()"
+            f"（首個：{type(bad[0]).__name__}）—— 寧願炸都唔可以靜默少 dump")
+    out = []
+    for t in closed:
+        row = t.to_dict()
+        row["bar_idx"] = getattr(t, "bar_idx", None)
+        row["limit_order"] = bool(getattr(t, "limit_order", False))
+        row["entry_mode"] = getattr(t, "entry_mode", None)
+        out.append(row)
+    if len(out) != len(closed):
+        raise AssertionError(f"dump_trades: 入 {len(closed)} 出 {len(out)} —— 有行被吞")
+    return out
 
 
 if __name__ == "__main__":
