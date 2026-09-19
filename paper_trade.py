@@ -501,6 +501,14 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
                 "tp2_hit": tp2_hit,
                 "verified": verified,
                 "data_source": data_source,
+                # 2026-09-18 review: WHICH bar decided. `closed_time` is wall
+                # clock, so a close booked after a feed outage (sim replays the
+                # missed bars from `last_bar_time`) looked identical to a live
+                # one — and the 09-14-01 phantom stop was only ever caught by
+                # comparing bar time against seed time. Keep that comparison
+                # possible in the record itself.
+                "close_bar_time": (last_bar_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+                                   if last_bar_dt is not None else None),
             }
 
         if not tp1_hit and tp1 > 0 and ((is_sell and low <= tp1) or (not is_sell and high >= tp1)):
@@ -543,6 +551,8 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
                 "tp2_hit": tp2_hit,
                 "verified": verified,
                 "data_source": data_source,
+                "close_bar_time": (last_bar_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+                                   if last_bar_dt is not None else None),
             }
 
         # ── Update trailing stop AFTER all exit checks for this bar ──
@@ -1557,8 +1567,41 @@ def seed_trades(data, setups=None):
 # at the source, and warn (never silently shift) if the newest bar looks stale.
 _LOCAL_TZ = datetime.now().astimezone().tzinfo
 
+# How far the newest bar may lag before the series loses the right to decide a
+# close (minutes). 90min = 3 × the 30-min bar interval, i.e. a series must be
+# CURRENT to decide. Same band the fetch-side warning has always used.
+TV_STALE_MINUTES = 90
 
-def _tv_bars_to_utc(bars, stale_minutes=90):
+
+def _series_lag_minutes(bars):
+    """Minutes the newest bar lags now, or None when that cannot be read.
+
+    Alignment is the whole point: this module compares bar times against UTC
+    (`seeded_time` / now), so a series whose clock is wrong describes a market
+    the trade was never taken in. A lag that cannot be MEASURED is therefore
+    not "probably fine" — callers must treat None as unverifiable.
+    """
+    if bars is None or getattr(bars, "empty", True):
+        return None
+    try:
+        newest = bars["datetime"].max()
+    except (KeyError, AttributeError, TypeError):
+        return None
+    if newest is None:
+        return None
+    try:
+        if getattr(newest, "tzinfo", None) is not None:
+            newest = newest.tz_convert("UTC").tz_localize(None)
+        lag = (datetime.now(timezone.utc).replace(tzinfo=None)
+               - newest).total_seconds() / 60.0
+    except (TypeError, ValueError):
+        return None
+    # NaT / NaN: every comparison against it is False, so `lag == lag` is the
+    # NaN test (the module imports numpy, not pandas).
+    return lag if lag == lag else None
+
+
+def _tv_bars_to_utc(bars, stale_minutes=None):
     """tvDatafeed's naive bar stamps are local time → return UTC-naive times."""
     dt = bars['datetime']
     if getattr(dt.dt, 'tz', None) is not None:
@@ -1567,14 +1610,23 @@ def _tv_bars_to_utc(bars, stale_minutes=90):
         dt = dt.dt.tz_localize(_LOCAL_TZ).dt.tz_convert('UTC')
     bars = bars.copy()
     bars['datetime'] = dt.dt.tz_localize(None)
-    try:
-        newest = bars['datetime'].max()
-        lag = (datetime.now(timezone.utc).replace(tzinfo=None) - newest).total_seconds() / 60.0
-        if lag > stale_minutes:
-            print(f"  ⚠️ TV bars stale: newest bar {newest}Z is {lag:.0f}min behind now "
-                  f"— alignment unverified")
-    except Exception:
-        pass
+    # 2026-09-18 review: a warning was the ONLY defence against a mis-stamped
+    # series — nothing stopped the stale bars from deciding a close. This log
+    # line stays (it is the operator's first hint) but the DECISION is now made
+    # in check_outcomes, which can withhold. Do not gate here: this is a helper
+    # and --backtest replays history, so every backtest call is legitimately
+    # "stale" and gating here would kill it.
+    lag = _series_lag_minutes(bars)
+    limit = TV_STALE_MINUTES if stale_minutes is None else stale_minutes
+    if lag is not None and lag > limit:
+        print(f"  ⚠️ TV bars stale: newest bar {bars['datetime'].max()}Z is "
+              f"{lag:.0f}min behind now — alignment unverified")
+    elif lag is not None and lag < -limit:
+        # The ORIGINAL 09-15 bug ran this way (+8h into the future, because naive
+        # LOCAL stamps were read as UTC). Warn in both directions so a regression
+        # is visible whichever way the clock slips.
+        print(f"  ⚠️ TV bars ahead of now: newest bar {bars['datetime'].max()}Z is "
+              f"{-lag:.0f}min in the future — alignment unverified")
     return bars
 
 
@@ -1687,9 +1739,34 @@ def check_outcomes(data):
         return
 
     # 2026-09-15: a non-spot series (paxg/gc_f) must not decide anything.
+    # 2026-09-18 review: so must a series whose CLOCK is wrong. Alignment is not
+    # a nice-to-have here — bar times are compared against UTC (`seeded_time` /
+    # now), so a mis-stamped series books stops the traded venue never hit. A
+    # log line cannot withhold a close; this gate can, and it reuses the venue
+    # mechanism (withhold + `venue_warning` + escalation) rather than inventing
+    # a second policy. The realistic trigger is the mirror of the 09-15 bug: if
+    # tvDatafeed ever switches to `utcfromtimestamp()`, the stamps become naive
+    # UTC, the local→UTC shift would move the whole series 8h INTO THE PAST, and
+    # without this gate the stale bars would still be decisive and still get
+    # tagged `close_data_source="tv"`.
     venue_ok = _close_venue_confirmed(data_source)
+    venue_reason = f"non-spot venue '{data_source}'"
+    series_lag = None
+    if venue_ok:
+        series_lag = _series_lag_minutes(bars)
+        if series_lag is None:
+            venue_ok = False
+            venue_reason = "series bar times unreadable — alignment unverifiable"
+        elif abs(series_lag) > TV_STALE_MINUTES:
+            # Symmetric on purpose: the original 09-15 bug ran the OTHER way
+            # (+8h ahead), and a future-dated series walks bars that have not
+            # happened yet — booking closes at prices the market never traded.
+            venue_ok = False
+            direction = "stale" if series_lag > 0 else "ahead of now"
+            venue_reason = (f"series {direction} {abs(series_lag):.0f}min "
+                            f"(limit ±{TV_STALE_MINUTES}min) — alignment unverified")
     if not venue_ok:
-        print(f"⚠️ M30 series from '{data_source}' — non-spot venue: closes withheld this tick")
+        print(f"⚠️ M30 closes withheld this tick — {venue_reason}")
 
     still_live = []
     closed = 0
@@ -1719,12 +1796,13 @@ def check_outcomes(data):
                 "since": prev.get("since") or prev.get("at") or now_iso,
                 "at": now_iso,
                 "ticks": ticks,
-                "reason": "non-spot M30 series — close withheld (spot is the traded venue)",
+                "lag_minutes": None if series_lag is None else round(series_lag, 1),
+                "reason": f"close withheld — {venue_reason}",
             }
             if ticks >= VENUE_STALE_ALERT_TICKS:
-                print(f"🚨 [venue] '{data_source}' 連續 {ticks} 個 tick 唔係 spot "
-                      f"（首次 {trade['venue_warning']['since']}）— 平倉一直被扣起，"
-                      f"TV feed 可能已經死；倉冇止損保護，要人手跟")
+                print(f"🚨 [venue] 連續 {ticks} 個 tick 扣起平倉（首次 "
+                      f"{trade['venue_warning']['since']}）：{venue_reason} — "
+                      f"series venue/時鐘有問題；倉冇止損保護，要人手跟")
             still_live.append(trade)
             continue
 
@@ -1765,6 +1843,7 @@ def check_outcomes(data):
                     "result": sim["result"],
                     "close_price": close_px,
                     "pnl_r": sim["pnl_r"],
+                    "bar_time": sim.get("close_bar_time"),
                     "reason": "series range guard failed",
                 }
                 still_live.append(trade)
@@ -1785,6 +1864,11 @@ def check_outcomes(data):
                 "data_source": sim.get("data_source", data_source),
                 # 2026-09-15: audit trail — which venue actually decided the close.
                 "close_data_source": sim.get("data_source", data_source),
+                # 2026-09-18 review: and which BAR. A close replayed out of a
+                # feed outage carries a fresh `closed_time` but an old bar; the
+                # two together are what make a delayed/backfilled close
+                # distinguishable from a live one after the fact.
+                "close_bar_time": sim.get("close_bar_time"),
                 "closed_time": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
             })
             trade.pop("venue_warning", None)
