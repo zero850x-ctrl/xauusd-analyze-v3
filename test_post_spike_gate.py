@@ -72,8 +72,15 @@ mk_setup = lambda d: {"direction": d, "entry_status": "已突破", "priority": 2
                       "tp1": "$4420", "stop_loss": "$4440"}
 setups = [mk_setup("🟢 BUY"), mk_setup("🔴 SELL")]
 TREND = {"trend": "BULLISH", "strength": 2, "close": 4400, "ma20": 4380, "ma50": 4300, "rsi": 55}
+# ⚠️ 2026-09-19 fix: 必須傳 `time_quality_override="normal"`。
+# 唔傳嘅話 `_inject_push_metadata` 會用 `_broker_hour()`（真實時鐘）算
+# `time_quality`；撞正 DANGER_HOURS（broker 07 / 18）就變 'danger' →
+# `cron_push_eligible` False → G4 由預期 True 變 fail。
+# BROKER_UTC_OFFSET_HOURS 預設 −3，所以 broker 07 = UTC 10 = **HKT 18:00-18:59**
+# → 呢個 test 每日嗰個鐘數必 fail。呢個 test 測嘅係 post-spike 邏輯，
+# 唔應該受時段影響。（同 scripts/test_zone_rejection.py 同一類 flake。）
 av._inject_push_metadata(setups, TREND, TREND, current_price=4370, atr=10.0,
-                         closes=closes_a)
+                         closes=closes_a, time_quality_override="normal")
 for s in setups:
     d = s["direction"]
     print(f"  {d}: post_spike_blocked={s.get('post_spike_blocked')} note={s.get('post_spike_note','')[:40]}")
