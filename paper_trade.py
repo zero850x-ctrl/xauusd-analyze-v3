@@ -1888,12 +1888,24 @@ def check_outcomes(data):
             # rather than only being *discoverable* by hand-comparing record
             # fields afterwards. `seed_dt` is the resume point when the sim was
             # resumed, which makes the check tighter, not looser.
+            #
+            # Fail-CLOSED on an unreadable bar time (kimi-k3 round 3): the clock
+            # gate already withholds when the SERIES clock cannot be read, so
+            # booking a close whose DECIDING bar cannot be read would apply the
+            # opposite rule to the same question. Both sim close branches always
+            # set `close_bar_time`, so `None` means something is wrong, not that
+            # the close is fine.
             bar_dt = _parse_dt(sim.get("close_bar_time") or "")
-            if verified and bar_dt is not None and seed_dt is not None and bar_dt <= seed_dt:
-                verified = False
-                unverified_reason = (
-                    f"deciding bar {sim.get('close_bar_time')} is not after the "
-                    f"seed {seed_dt.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+            if verified and seed_dt is not None:
+                if bar_dt is None:
+                    verified = False
+                    unverified_reason = ("deciding bar time unreadable — cannot "
+                                         "verify it came after the seed")
+                elif bar_dt <= seed_dt:
+                    verified = False
+                    unverified_reason = (
+                        f"deciding bar {sim.get('close_bar_time')} is not after the "
+                        f"seed {seed_dt.strftime('%Y-%m-%dT%H:%M:%SZ')}")
             if not verified:
                 trade["data_source"] = sim.get("data_source", data_source)
                 trade["last_unverified"] = {
@@ -1905,6 +1917,13 @@ def check_outcomes(data):
                     "close_bar_time": sim.get("close_bar_time"),
                     "reason": unverified_reason,
                 }
+                # A withheld close must be as audible as any other withhold —
+                # otherwise a sim that keeps reporting an unbookable close turns
+                # into a silent permanent no-close (no stop-loss protection, no
+                # alarm), which is exactly the failure this PR exists to remove.
+                _stamp_venue_warning(trade, data_source,
+                                     f"close withheld — {unverified_reason}",
+                                     series_lag)
                 still_live.append(trade)
                 print(
                     f"  ❌ UNVERIFIED {sim['result']}: {trade['id']} {trade['direction']} "
