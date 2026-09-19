@@ -1594,7 +1594,13 @@ def _series_lag_minutes(bars):
             newest = newest.tz_convert("UTC").tz_localize(None)
         lag = (datetime.now(timezone.utc).replace(tzinfo=None)
                - newest).total_seconds() / 60.0
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, AttributeError):
+        # AttributeError is NOT theoretical: an `object`-dtype datetime column
+        # hands back a stdlib datetime, which has `tzinfo` but no `.tz_convert`,
+        # and a `Timedelta` value makes the subtraction return a datetime whose
+        # `.total_seconds()` raises. This function's whole job is to survive
+        # weird input — an exception escaping it kills the tick AND skips the
+        # `venue_warning` write, so the escalation would silently never fire.
         return None
     # NaT / NaN: every comparison against it is False, so `lag == lag` is the
     # NaN test (the module imports numpy, not pandas).

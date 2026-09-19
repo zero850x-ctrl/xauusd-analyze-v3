@@ -342,6 +342,49 @@ def test_future_dated_series_cannot_close():
           (warn.get("lag_minutes") or 0) < -pt.TV_STALE_MINUTES)
 
 
+def test_lag_probe_survives_weird_frames():
+    """`_series_lag_minutes` must RETURN None for anything it cannot measure.
+
+    It is the last line of defence for close decisions, and it runs INSIDE the
+    tick: an exception escaping it kills the whole tick and skips the
+    `venue_warning` write, so the escalation would silently never fire. Its
+    contract is therefore "measure or None", never "raise".
+
+    The reachable one is the object-dtype column: `.max()` hands back a stdlib
+    `datetime`, which has a `tzinfo` attribute but no `.tz_convert`.
+    """
+    from datetime import datetime as _dt
+    unreadable = {
+        "empty frame": pd.DataFrame({"datetime": []}),
+        "missing column": pd.DataFrame({"open": [1.0]}),
+        "all NaT": pd.DataFrame({"datetime": [pd.NaT]}),
+        "None": None,
+        "not a frame": [1, 2, 3],
+        "object-dtype aware datetime":
+            pd.DataFrame({"datetime": [_dt(2026, 9, 18, 12, 0, tzinfo=timezone.utc)]},
+                         dtype=object),
+        "object-dtype Timedelta":
+            pd.DataFrame({"datetime": [pd.Timedelta(days=1)]}, dtype=object),
+    }
+    for name, obj in unreadable.items():
+        try:
+            got = pt._series_lag_minutes(obj)
+        except Exception as e:                      # noqa: BLE001 - the whole point
+            raise AssertionError(f"{name}: raised {type(e).__name__}: {e}")
+        check(f"{name} → None (never raises)", got is None)
+    # A naive column is NOT unreadable: assuming naive == UTC is this module's
+    # standing convention (`_parse_dt`), and the real path always hands over a
+    # naive frame because `_tv_bars_to_utc` strips the tz after converting. So an
+    # object-dtype naive datetime measures — it must not be lumped in above.
+    naive_obj = pd.DataFrame({"datetime": [_dt(2026, 9, 18, 12, 0)]}, dtype=object)
+    check("object-dtype naive datetime still measures (naive == UTC convention)",
+          pt._series_lag_minutes(naive_obj) is not None)
+    # …and a normal frame still measures
+    seed = datetime.now(timezone.utc) - timedelta(hours=4)
+    lag = pt._series_lag_minutes(_bars(seed, "tv", 4321.0)[0])
+    check("a readable frame still measures", lag is not None and lag > 0)
+
+
 if __name__ == "__main__":
     tests = [
         test_tv_interval_members_exist,
@@ -355,6 +398,7 @@ if __name__ == "__main__":
         test_future_dated_series_cannot_close,
         test_unreadable_series_times_cannot_close,
         test_close_bar_time_recorded,
+        test_lag_probe_survives_weird_frames,
     ]
     failed = 0
     for fn in tests:
