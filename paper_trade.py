@@ -1594,7 +1594,7 @@ def _series_lag_minutes(bars):
             newest = newest.tz_convert("UTC").tz_localize(None)
         lag = (datetime.now(timezone.utc).replace(tzinfo=None)
                - newest).total_seconds() / 60.0
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, AttributeError):
         # AttributeError is NOT theoretical: an `object`-dtype datetime column
         # hands back a stdlib datetime, which has `tzinfo` but no `.tz_convert`,
         # and a `Timedelta` value makes the subtraction return a datetime whose
