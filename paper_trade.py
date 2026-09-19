@@ -1731,6 +1731,41 @@ def _fetch_m30(start, end):
     return bars, data_source
 
 
+def _stamp_venue_warning(trade, source, reason, lag=None):
+    """Record (and escalate) one withheld tick on a live trade.
+
+    One place for every withhold cause — total fetch failure, wrong venue, bad
+    clock — so they accumulate on the SAME counter. Splitting them let a partial
+    break (wrong series: 🚨 after 12 ticks) be louder than a total break (no
+    series at all: a single log line, no record, no escalation), which is
+    backwards: a feed that returns nothing is the more serious failure.
+
+    `lag_minutes` is ALWAYS written: None means "could not measure", a number is
+    the measured skew (negative = series ahead of now). Omitting the key would
+    make "unreadable" and "not applicable" the same on disk, and a `None` that is
+    never actually written is not a distinction at all.
+    """
+    prev = trade.get("venue_warning") or {}
+    now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    ticks = int(prev.get("ticks") or 0) + 1
+    trade["venue_warning"] = {
+        "source": source,
+        "since": prev.get("since") or prev.get("at") or now_iso,
+        "at": now_iso,
+        "ticks": ticks,
+        "lag_minutes": None if lag is None else round(lag, 1),
+        "reason": reason,
+    }
+    if ticks >= VENUE_STALE_ALERT_TICKS:
+        # Name the SOURCE: with clock skew the reason string carries no feed
+        # name, so without this an operator reading the log cannot tell which
+        # series to go look at.
+        print(f"🚨 [venue] 連續 {ticks} 個 tick 扣起平倉（首次 "
+              f"{trade['venue_warning']['since']}）：source={source} {reason} — "
+              f"series venue/時鐘有問題；倉冇止損保護，要人手跟")
+    return trade["venue_warning"]
+
+
 def check_outcomes(data):
     """Check all LIVE paper trades against latest bars — hit SL or TP?"""
     log = load_log()
@@ -1741,7 +1776,16 @@ def check_outcomes(data):
 
     bars, data_source = _fetch_m30(None, None)
     if bars is None or bars.empty:
+        # 2026-09-18 review: a TOTAL feed failure used to exit here with a bare
+        # log line while a PARTIAL one (wrong venue) escalated to 🚨 after 12
+        # ticks — the more serious outage was the quieter one. Record it on the
+        # same counter so both are equally auditable.
         print("⚠️ Could not fetch M30 data — skipping check")
+        for trade in live_trades:
+            _stamp_venue_warning(trade, data_source or "none",
+                                 "close withheld — no M30 series at all "
+                                 "(every source failed)")
+        save_log(log)
         return
 
     # 2026-09-15: a non-spot series (paxg/gc_f) must not decide anything.
@@ -1757,12 +1801,16 @@ def check_outcomes(data):
     # tagged `close_data_source="tv"`.
     venue_ok = _close_venue_confirmed(data_source)
     venue_reason = f"non-spot venue '{data_source}'"
-    series_lag = None
+    # Measure the skew UNCONDITIONALLY, even for a series we are already
+    # rejecting: a wrong venue and a wrong clock can both be present (a fallback
+    # feed can itself be mis-stamped), and measuring only on the happy path made
+    # the two incidents indistinguishable in the record afterwards.
+    series_lag = _series_lag_minutes(bars)
     if venue_ok:
-        series_lag = _series_lag_minutes(bars)
         if series_lag is None:
             venue_ok = False
-            venue_reason = "series bar times unreadable — alignment unverifiable"
+            venue_reason = ("series bar times unreadable — alignment "
+                            f"unverifiable (source '{data_source}')")
         elif abs(series_lag) > TV_STALE_MINUTES:
             # Symmetric on purpose: the original 09-15 bug ran the OTHER way
             # (+8h ahead), and a future-dated series walks bars that have not
@@ -1770,7 +1818,8 @@ def check_outcomes(data):
             venue_ok = False
             direction = "stale" if series_lag > 0 else "ahead of now"
             venue_reason = (f"series {direction} {abs(series_lag):.0f}min "
-                            f"(limit ±{TV_STALE_MINUTES}min) — alignment unverified")
+                            f"(limit ±{TV_STALE_MINUTES}min, source "
+                            f"'{data_source}') — alignment unverified")
     if not venue_ok:
         print(f"⚠️ M30 closes withheld this tick — {venue_reason}")
 
@@ -1794,26 +1843,8 @@ def check_outcomes(data):
             # tick count (the previous warning's `at` is overwritten every tick,
             # which made "down 5 minutes" and "down 5 days" indistinguishable),
             # and escalate past VENUE_STALE_ALERT_TICKS.
-            prev = trade.get("venue_warning") or {}
-            now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-            ticks = int(prev.get("ticks") or 0) + 1
-            trade["venue_warning"] = {
-                "source": data_source,
-                "since": prev.get("since") or prev.get("at") or now_iso,
-                "at": now_iso,
-                "ticks": ticks,
-                # Only meaningful when a lag was actually MEASURED. Omitting it
-                # for a non-spot series keeps "could not measure" (measured but
-                # unreadable ⇒ the key is present and null) distinguishable from
-                # "not applicable" (wrong venue).
-                "reason": f"close withheld — {venue_reason}",
-            }
-            if series_lag is not None:
-                trade["venue_warning"]["lag_minutes"] = round(series_lag, 1)
-            if ticks >= VENUE_STALE_ALERT_TICKS:
-                print(f"🚨 [venue] 連續 {ticks} 個 tick 扣起平倉（首次 "
-                      f"{trade['venue_warning']['since']}）：{venue_reason} — "
-                      f"series venue/時鐘有問題；倉冇止損保護，要人手跟")
+            _stamp_venue_warning(trade, data_source,
+                                 f"close withheld — {venue_reason}", series_lag)
             still_live.append(trade)
             continue
 
@@ -1846,16 +1877,33 @@ def check_outcomes(data):
 
         if sim.get("closed"):
             verified = bool(sim.get("verified", True))
+            unverified_reason = "series range guard failed"
             close_px = sim.get("close_price")
             spot = data.get("price")
+            # 2026-09-18 review (glm-5.3): assert the booking-time invariant.
+            # `_simulate_staged_exit` skips every bar at or before `seed_dt`, so a
+            # deciding bar that is NOT after the seed cannot come from a series
+            # that is what it claims to be — this is the 09-14-01 incident class
+            # (a close decided by a pre-entry bar), and it should raise on its own
+            # rather than only being *discoverable* by hand-comparing record
+            # fields afterwards. `seed_dt` is the resume point when the sim was
+            # resumed, which makes the check tighter, not looser.
+            bar_dt = _parse_dt(sim.get("close_bar_time") or "")
+            if verified and bar_dt is not None and seed_dt is not None and bar_dt <= seed_dt:
+                verified = False
+                unverified_reason = (
+                    f"deciding bar {sim.get('close_bar_time')} is not after the "
+                    f"seed {seed_dt.strftime('%Y-%m-%dT%H:%M:%SZ')}")
             if not verified:
                 trade["data_source"] = sim.get("data_source", data_source)
                 trade["last_unverified"] = {
                     "result": sim["result"],
                     "close_price": close_px,
                     "pnl_r": sim["pnl_r"],
-                    "bar_time": sim.get("close_bar_time"),
-                    "reason": "series range guard failed",
+                    # Same key name as the closed record — `bar_time` here made
+                    # grepping for how a close was decided miss these entirely.
+                    "close_bar_time": sim.get("close_bar_time"),
+                    "reason": unverified_reason,
                 }
                 still_live.append(trade)
                 print(
@@ -2033,13 +2081,21 @@ def run_backtest(data):
     # feed. A fallback series (paxg/gc_f) is shifted against spot, so its
     # SL/TP outcomes describe a market the signals were never taken in.
     #
-    # 2026-09-18 review: the CLOCK gate deliberately does NOT apply here. A
-    # backtest replays history from `data["generated_at"]`, so a series that is
-    # old relative to NOW is the normal case — refusing on staleness would refuse
-    # every backtest. Do not "restore parity" by copying the check_outcomes gate
-    # into this function. (The real question for a backtest is whether the series
-    # reaches back to the seed bar, which `_simulate_staged_exit`'s resume logic
-    # already handles via `last_bar_time`.)
+    # 2026-09-18 review: the CLOCK gate deliberately does NOT apply here in its
+    # "stale" half. A backtest replays history from `data["generated_at"]`, so a
+    # series that is old relative to NOW is the normal case — refusing on
+    # staleness would refuse every backtest. Do not "restore parity" by copying
+    # the check_outcomes gate into this function.
+    #
+    # The other half DOES apply: a series dated INTO THE FUTURE is never
+    # legitimate, whichever mode we are in. Without this, the `utcfromtimestamp()`
+    # mirror would silently shift every backtest by 8h with no gate and no
+    # warning, quietly corrupting research conclusions.
+    series_lag = _series_lag_minutes(bars)
+    if series_lag is not None and series_lag < -TV_STALE_MINUTES:
+        print(f"⚠️ M30 series is {-series_lag:.0f}min in the FUTURE (source "
+              f"'{data_source}') — clock skew, backtest refused")
+        return
     if not _close_venue_confirmed(data_source):
         print(f"⚠️ M30 series from '{data_source}' — non-spot venue: backtest refused")
         return

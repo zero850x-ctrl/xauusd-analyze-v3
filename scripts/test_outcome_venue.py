@@ -135,9 +135,12 @@ def test_non_spot_series_cannot_close():
     check("no history written", log.get("history") == [])
     warn = log["trades"][0].get("venue_warning") or {}
     check("venue_warning recorded", warn.get("source") == "paxg")
-    # The lag key is only present when a lag was MEASURED — a wrong venue means
-    # "not applicable", not "could not measure" (which is the key present + null).
-    check("no lag field for a venue rejection", "lag_minutes" not in warn)
+    # The skew is measured EVEN for a series we already reject: a wrong venue and
+    # a wrong clock can both be true (a fallback feed can itself be mis-stamped),
+    # and only measuring on the happy path made the two incidents
+    # indistinguishable in the record afterwards.
+    check("lag IS measured for a venue rejection too",
+          "lag_minutes" in warn and warn["lag_minutes"] is not None)
     check("reason names the venue problem", "non-spot" in (warn.get("reason") or ""))
 
 
@@ -177,8 +180,13 @@ def _run_ticks(steps):
         snaps, outs = [], []
         try:
             for source, high_at in steps:
-                pt._fetch_m30 = (lambda *a, _s=source, _h=high_at, **k:
-                                 _bars(seed_dt, _s, _h))
+                if high_at is None:
+                    # `high_at=None` means "no series at all" — the total fetch
+                    # failure path, which used to leave no record whatsoever.
+                    pt._fetch_m30 = lambda *a, _s=source, **k: (None, _s)
+                else:
+                    pt._fetch_m30 = (lambda *a, _s=source, _h=high_at, **k:
+                                     _bars(seed_dt, _s, _h))
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
                     pt.check_outcomes({"price": 4285.0,
@@ -300,7 +308,11 @@ def test_unreadable_series_times_cannot_close():
     warn = log["trades"][0].get("venue_warning") or {}
     check("unverifiable alignment is recorded",
           "unverifiable" in (warn.get("reason") or ""))
-    check("no lag is invented", warn.get("lag_minutes") is None)
+    # The key must be PRESENT and null — asserting only "is None" passed for an
+    # absent key too, which made "could not measure" and "not applicable"
+    # indistinguishable and turned this into a false guarantee.
+    check("no lag is invented, but the key is present and null",
+          "lag_minutes" in warn and warn["lag_minutes"] is None)
 
 
 def test_close_bar_time_recorded():
@@ -385,6 +397,92 @@ def test_lag_probe_survives_weird_frames():
     check("a readable frame still measures", lag is not None and lag > 0)
 
 
+def test_real_chain_local_stamps_survive_conversion():
+    """The ACTUAL incident-B regression path: `_tv_bars_to_utc` → `_series_lag_minutes`.
+
+    Both halves were fixed separately and each was tested in isolation, so a
+    reintroduced conversion bug would only ever surface as a live 🚨 — the suite
+    would stay green. Build a frame exactly as tvDatafeed hands it over (naive
+    LOCAL stamps), run it through the real converter, and require the measured
+    skew to be small. If the converter regresses to passing local stamps through
+    as if they were UTC, the skew becomes ±8h and this fails.
+    """
+    now_local = datetime.now()                      # naive local == HKT
+    naive = pd.DataFrame([
+        {"datetime": (now_local - timedelta(minutes=30 * i)).replace(tzinfo=None),
+         "open": 4288.0, "high": 4321.0, "low": 4278.0, "close": 4285.0}
+        for i in range(1, 5)])
+    converted = pt._tv_bars_to_utc(naive)
+    lag = pt._series_lag_minutes(converted)
+    check("converted series measures at all", lag is not None)
+    fresh = lag is not None and abs(lag) <= pt.TV_STALE_MINUTES
+    check("converted series is fresh, not ±8h off (lag=%s)"
+          % ("n/a" if lag is None else "%.0fmin" % lag), fresh)
+    # …and it is decisive, i.e. the gate does not simply reject everything.
+    check("a freshened series is still allowed to decide",
+          pt._close_venue_confirmed("tv") and fresh)
+
+
+def test_total_fetch_failure_is_recorded_and_escalates():
+    """No series at all must be as audible as a WRONG series.
+
+    2026-09-18 review: this path returned after a bare print — no
+    `venue_warning`, no tick counter, no 🚨 — while the less severe
+    wrong-venue case escalated. The quieter alarm belonged to the worse outage.
+    """
+    n = pt.VENUE_STALE_ALERT_TICKS
+    snaps, outs = _run_ticks([("tv", None)] * n)
+    last = snaps[-1]["trades"][0]
+    check("total fetch failure leaves a record", last.get("venue_warning") is not None)
+    warn = last.get("venue_warning") or {}
+    check("the counter accumulates across ticks", warn.get("ticks") == n)
+    check("the reason says no series at all",
+          "no M30 series" in (warn.get("reason") or ""))
+    check("no lag is invented", warn.get("lag_minutes") is None)
+    check("the trade was not closed", last.get("status") == "LIVE")
+    check("it escalates like any other withhold",
+          any("🚨" in o for o in outs))
+
+
+def test_close_bar_before_seed_is_withheld():
+    """Booking-time invariant: a deciding bar that is NOT after the seed must
+    never book a close.
+
+    This is the 09-14-01 incident class (a close decided by a pre-entry bar).
+    `_simulate_staged_exit` cannot produce it — it skips every bar <= seed_dt —
+    so the guard is against the sim (or its inputs) lying, and it is pinned by
+    making the sim lie: a hand-built closed result whose deciding bar predates
+    the seed must be withheld, not booked.
+    """
+    seed_dt = datetime.now(timezone.utc) - timedelta(hours=4)
+    early = (seed_dt - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "paper_trade_log.json")
+        with open(path, "w") as fh:
+            json.dump({"trades": [_sell_trade(seed_dt)], "history": []}, fh)
+        orig = (pt.LOG_PATH, pt._fetch_m30, pt._simulate_staged_exit)
+        pt.LOG_PATH = path
+        pt._fetch_m30 = lambda *a, **k: _bars(seed_dt, "tv", 4210.0)
+        pt._simulate_staged_exit = lambda *a, **k: {
+            "closed": True, "result": "SL", "pnl_r": -1.0, "bars_held": 3,
+            "close_price": 4321.0, "tp1_hit": False, "tp2_hit": False,
+            "verified": True, "data_source": "tv", "close_bar_time": early}
+        try:
+            pt.check_outcomes({"price": 4285.0,
+                               "intraday_source": "TradingView (OANDA:XAUUSD)"})
+            with open(path) as fh:
+                log = json.load(fh)
+        finally:
+            pt.LOG_PATH, pt._fetch_m30, pt._simulate_staged_exit = orig
+    check("pre-seed close is NOT booked", log.get("history") == [])
+    check("trade stays LIVE", log["trades"][0]["status"] == "LIVE")
+    unv = log["trades"][0].get("last_unverified") or {}
+    check("it is recorded as unverified", bool(unv))
+    check("the reason names the invariant",
+          "not after the seed" in (unv.get("reason") or ""))
+    check("the deciding bar is kept for audit", unv.get("close_bar_time") == early)
+
+
 if __name__ == "__main__":
     tests = [
         test_tv_interval_members_exist,
@@ -399,6 +497,9 @@ if __name__ == "__main__":
         test_unreadable_series_times_cannot_close,
         test_close_bar_time_recorded,
         test_lag_probe_survives_weird_frames,
+        test_real_chain_local_stamps_survive_conversion,
+        test_total_fetch_failure_is_recorded_and_escalates,
+        test_close_bar_before_seed_is_withheld,
     ]
     failed = 0
     for fn in tests:
