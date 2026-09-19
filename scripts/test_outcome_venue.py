@@ -135,6 +135,10 @@ def test_non_spot_series_cannot_close():
     check("no history written", log.get("history") == [])
     warn = log["trades"][0].get("venue_warning") or {}
     check("venue_warning recorded", warn.get("source") == "paxg")
+    # The lag key is only present when a lag was MEASURED — a wrong venue means
+    # "not applicable", not "could not measure" (which is the key present + null).
+    check("no lag field for a venue rejection", "lag_minutes" not in warn)
+    check("reason names the venue problem", "non-spot" in (warn.get("reason") or ""))
 
 
 def test_tv_series_closes_and_is_tagged():

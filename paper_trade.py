@@ -1796,9 +1796,14 @@ def check_outcomes(data):
                 "since": prev.get("since") or prev.get("at") or now_iso,
                 "at": now_iso,
                 "ticks": ticks,
-                "lag_minutes": None if series_lag is None else round(series_lag, 1),
+                # Only meaningful when a lag was actually MEASURED. Omitting it
+                # for a non-spot series keeps "could not measure" (measured but
+                # unreadable ⇒ the key is present and null) distinguishable from
+                # "not applicable" (wrong venue).
                 "reason": f"close withheld — {venue_reason}",
             }
+            if series_lag is not None:
+                trade["venue_warning"]["lag_minutes"] = round(series_lag, 1)
             if ticks >= VENUE_STALE_ALERT_TICKS:
                 print(f"🚨 [venue] 連續 {ticks} 個 tick 扣起平倉（首次 "
                       f"{trade['venue_warning']['since']}）：{venue_reason} — "
@@ -2021,6 +2026,14 @@ def run_backtest(data):
     # 2026-09-15: refuse to backtest on a venue that is not the traded spot
     # feed. A fallback series (paxg/gc_f) is shifted against spot, so its
     # SL/TP outcomes describe a market the signals were never taken in.
+    #
+    # 2026-09-18 review: the CLOCK gate deliberately does NOT apply here. A
+    # backtest replays history from `data["generated_at"]`, so a series that is
+    # old relative to NOW is the normal case — refusing on staleness would refuse
+    # every backtest. Do not "restore parity" by copying the check_outcomes gate
+    # into this function. (The real question for a backtest is whether the series
+    # reaches back to the seed bar, which `_simulate_staged_exit`'s resume logic
+    # already handles via `last_bar_time`.)
     if not _close_venue_confirmed(data_source):
         print(f"⚠️ M30 series from '{data_source}' — non-spot venue: backtest refused")
         return
