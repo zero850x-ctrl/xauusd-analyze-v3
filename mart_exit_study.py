@@ -113,12 +113,20 @@ def sim_variant(df, sig_idx, exit_kind, hold_bars=None, sl_atr=None, tp_atr=None
                 exit_px, exit_bar, reason = tp, j, "TP"
                 break
             if trail_atr and np.isfinite(a[j]):
-                peak = max(peak, bar_hi)
-                cand = peak - trail_atr * a[j]
+                # ⚠️ 用 **j−1** 為止嘅 peak 同 ATR 計 trail（即「入到 bar j 之前
+                #    已經知道」嘅嘢），唔用 bar j 自己嘅 high／ATR。
+                #    為何（2026-09-19 外審指出）：原版先攞 bar j 嘅 high 拉高 trail，
+                #    再假設 bar j 嘅 low 觸發嗰條 trail —— 但 bar 內高低次序未知，
+                #    若 low 先出現，當時 trail 根本未拉到咁高 → **樂觀偏誤**。
+                #    用 j−1 資訊係保守版本：trail 只反映入 bar 前已知嘅價位。
+                peak_prev = max(peak, float(hi[j - 1]))
+                a_prev = float(a[j - 1]) if np.isfinite(a[j - 1]) else float(a[j])
+                cand = peak_prev - trail_atr * a_prev
                 trail = cand if trail is None else max(trail, cand)
-                if trail is not None and bar_lo <= trail:
+                if bar_lo <= trail:
                     exit_px, exit_bar, reason = trail, j, "TRAIL"
                     break
+                peak = max(peak, float(bar_hi))
         if exit_px is None:
             exit_px, exit_bar, reason = cl[last], last, ("TIMEOUT" if exit_kind == "struct"
                                                          else "TIMER")
@@ -139,30 +147,60 @@ def summarize(recs, label):
     avg_w = float(wins.mean()) if len(wins) else 0.0
     avg_l = float(abs(losses.mean())) if len(losses) else 0.0
     payoff = (avg_w / avg_l) if avg_l > 0 else float("inf")
+    win_rate = len(wins) / len(recs)
+    # ⚠️ 打和盈虧比 = (1−p)/p —— 佢**隨勝率變**，唔係固定 1.0。
+    #    2026-09-19 外審指出我原本將打和線寫死 1.0（只有勝率剛好 50% 先至係）。
+    #    實際勝率 19-49% → 打和線 1.2-3.7，所以「payoff ≥ 1.0 就 ✅」係假陽性：
+    #    timer 1 bar payoff 1.19 打 ✅ 但實際每筆 −$0.61（打和線 1.92）。
+    #    唯一正確嘅「有冇賺」判準係 E>0；盈虧比只可同自己嘅打和線比。
+    be_payoff = ((1 - win_rate) / win_rate) if win_rate > 0 else float("inf")
     mins = np.array([r["minutes"] for r in recs])
     reasons = {}
     for r in recs:
         reasons[r["reason"]] = reasons.get(r["reason"], 0) + 1
-    return {"label": label, "n": len(recs), "win%": len(wins) / len(recs) * 100,
+    return {"label": label, "n": len(recs), "win%": win_rate * 100,
             "avg_win": avg_w, "avg_loss": avg_l, "payoff": payoff,
+            "be_payoff": be_payoff, "profitable": float(pnl.mean()) > 0,
             "net": float(pnl.sum()), "E": float(pnl.mean()),
             "med_min": float(np.median(mins)), "max_min": int(mins.max()),
             "reasons": reasons}
 
 
 def show(rows, title):
-    print(f"\n{'=' * 108}\n{title}\n{'=' * 108}")
+    print(f"\n{'=' * 118}\n{title}\n{'=' * 118}")
     print(f"{'變體':<30}{'n':>7}{'勝%':>7}{'平均勝':>9}{'平均負':>9}"
-          f"{'盈虧比':>8}{'淨$':>10}{'每筆$':>8}{'中位分':>7}{'最長分':>7}")
-    print("-" * 108)
+          f"{'盈虧比':>8}{'打和線':>8}{'夠唔夠':>7}{'淨$':>10}{'每筆$':>8}{'中位分':>7}")
+    print("-" * 118)
     for r in rows:
         if not r.get("n"):
             print(f"{r['label']:<30}  （冇信號）")
             continue
-        flag = "✅" if r["payoff"] >= 1.0 else "❌"
+        # 「打和線」= (1−勝率)/勝率；只有 payoff > 打和線 先真正賺錢。
+        # 用 E>0 做最終判準（同打和線比較係等價嘅，但 E 更直接）。
+        flag = "✅" if r["profitable"] else "❌"
         print(f"{r['label']:<30}{r['n']:>7}{r['win%']:>7.1f}{r['avg_win']:>9.2f}"
-              f"{r['avg_loss']:>9.2f}{r['payoff']:>7.2f}{flag}{r['net']:>10.1f}"
-              f"{r['E']:>8.3f}{r['med_min']:>7.0f}{r['max_min']:>7d}")
+              f"{r['avg_loss']:>9.2f}{r['payoff']:>8.2f}{r['be_payoff']:>8.2f}"
+              f"{flag:>7}{r['net']:>10.1f}"
+              f"{r['E']:>8.3f}{r['med_min']:>7.0f}")
+
+
+def dedup_clusters(idx, min_gap):
+    """貪心去聚類：保留信號，但其後 min_gap 條 bar 內嘅信號全部丟。
+
+    min_gap = hold_bars → 保證冇兩個持倉重疊 = 真·獨立事件。
+    為何要（2026-09-19，外審提出 pseudo-replication 質疑）：S3 信號聚簇，
+    20,059 個「信號」唔係 20,059 個獨立實驗。實測去聚類後嘅有效樣本：
+      timer 1 bar n=20,059（100%）｜timer 4h n=7,345（36.6%）｜timer 24h n=1,867（9.3%）
+    而 delta 反而**更負**（4h：−0.491 → −0.738）→ 聚類原本係**掩蓋**效應。
+    即係「信號比隨機差」嘅結論唔係偽重複造成嘅假象。
+    """
+    if len(idx) == 0:
+        return np.asarray(idx)
+    keep = [idx[0]]
+    for i in idx[1:]:
+        if i - keep[-1] >= min_gap:
+            keep.append(i)
+    return np.asarray(keep)
 
 
 def random_entries(n, lo, hi, seed):
@@ -171,9 +209,13 @@ def random_entries(n, lo, hi, seed):
     為何一定要有：S3 係 LONG-only，而黃金長期上升 → 任何「揸長啲」嘅變體都會
     自動多收 drift（beta），呢個係資產本身嘅特性，唔係信號嘅 edge。
     冇對照組就會把 beta 當成「出場改善」報出去（本 script 第一版差啲就係咁）。
+
+    用 `choice(..., replace=False)` 而唔係 `integers()`：後者係**有放回**，
+    會揀到重複 bar → 同一筆交易計兩次，令對照組名義 n 同實際唔符、變異被高估
+    （2026-09-19 外審指出）。
     """
     rng = np.random.default_rng(seed)
-    return np.sort(rng.integers(lo, hi, size=n))
+    return np.sort(rng.choice(np.arange(lo, hi), size=min(n, hi - lo), replace=False))
 
 
 def compare_with_random(df, idx, n_seeds=5, **params):
@@ -240,6 +282,8 @@ def main():
     ap.add_argument("--min-signals", type=int, default=100,
                     help="少過咁多信號就唔報（避免細樣本結論）")
     ap.add_argument("--seeds", type=int, default=5, help="隨機對照組重複次數")
+    ap.add_argument("--dedup", action="store_true",
+                    help="加做去聚類（零重疊持倉）版本 —— 回應 pseudo-replication 質疑")
     a = ap.parse_args()
 
     df = load_m15(a.csv)
@@ -281,37 +325,70 @@ def main():
             f"SL{sl}ATR / trail{tr}ATR"))
     show(rows3, "C. 結構式 SL + trailing（最長持倉 24h，似主引擎）")
 
-    print("\n" + "=" * 108)
-    print("結論檢查：盈虧比 ≥ 1.0 嘅變體（勝率 ~50% 之下的打和線）")
-    print("=" * 108)
+    print("\n" + "=" * 118)
+    print("結論檢查（A/B/C 表）：用『每筆 E > 0』做判準，唔用盈虧比 ≥ 1.0")
+    print("=" * 118)
+    print("  ⚠️ 打和盈虧比 = (1−勝率)/勝率，隨勝率變（勝率 34% → 打和線 1.92 唔係 1.0）。")
+    print("     所以「盈虧比 ≥ 1.0」唔代表賺錢 —— 2026-09-19 外審指出呢個係假陽性。")
     allr = [r for r in rows + rows2 + rows3 if r.get("n")]
-    ok = [r for r in allr if r["payoff"] >= 1.0]
+    ok = [r for r in allr if r["profitable"]]
     base = next((r for r in allr if r["label"].startswith("timer 1 bar")), None)
     if base:
-        print(f"  現行 baseline（timer 1 bar）：盈虧比 {base['payoff']:.2f}、"
-              f"淨 ${base['net']:.1f}、每筆 ${base['E']:+.3f}")
+        print(f"\n  現行 baseline（timer 1 bar）：每筆 {base['E']:+.3f}、"
+              f"盈虧比 {base['payoff']:.2f}（打和要 {base['be_payoff']:.2f}）→ "
+              f"{'賺' if base['profitable'] else '蝕'}")
     if ok:
-        for r in sorted(ok, key=lambda x: -x["payoff"]):
-            print(f"  ✅ {r['label']:<28} 盈虧比 {r['payoff']:.2f} 淨 ${r['net']:.1f}")
+        print(f"  每筆 E > 0 嘅變體（{len(ok)}/{len(allr)}）:")
+        for r in sorted(ok, key=lambda x: -x["E"]):
+            print(f"    ✅ {r['label']:<28} 每筆 {r['E']:+.3f}  淨 ${r['net']:.1f}  "
+                  f"（盈虧比 {r['payoff']:.2f} vs 打和 {r['be_payoff']:.2f}）")
     else:
-        print("  ❌ 冇任何變體達到盈虧比 1.0 —— 即係**出場方式唔係主要問題**。")
-    print("\n  ⚠️ 盈虧比 ≥ 1.0 唔等於有 edge：S3 係 LONG-only 而黃金長期上升，")
+        print("  ❌ 冇任何變體每筆 E > 0。")
+    print("\n  ⚠️ 但『每筆 E > 0』唔等於有 edge：S3 係 LONG-only 而黃金長期上升，")
     print("     下面嘅隨機對照組先答得到「信號本身有冇貢獻」。")
 
     # ---- 最關鍵：同隨機入場比（過濾 beta）----
-    ctrl = []
-    for lbl, params in (
+    CTRL = (
         ("timer 1 bar (≈live)", dict(exit_kind="timer", hold_bars=1)),
         ("timer 4h", dict(exit_kind="timer", hold_bars=16)),
         ("timer 24h", dict(exit_kind="timer", hold_bars=96)),
         ("SL1.0ATR/TP3.0ATR", dict(exit_kind="struct", hold_bars=32, sl_atr=1.0, tp_atr=3.0)),
         ("SL1.0ATR/trail2.0ATR", dict(exit_kind="struct", hold_bars=96, sl_atr=1.0, trail_atr=2.0)),
-    ):
+    )
+    ctrl = []
+    for lbl, params in CTRL:
         s, rand_mean, delta, lo, hi = compare_with_random(df, idx, a.seeds, **params)
         ctrl.append((lbl, s, rand_mean, delta, lo, hi))
     show_control(ctrl, "D. 信號 vs 隨機入場（同一出場規則）—— 剝走 beta 之後淨幾多？")
     print("\n  讀法：『淨貢獻』= 信號每筆 − 隨機每筆。CI 含 0 = 信號冇加值，")
     print("        嗰個變體嘅正淨值純粹嚟自黃金上升（beta），唔係策略。")
+    print("        CI 係按日 block bootstrap（唔係逐筆 iid —— 持倉重疊會令 iid CI 太窄）。")
+
+    if a.dedup:
+        # 外審 2026-09-19 要求：S3 聚簇 → 20,059 個「信號」可能唔係獨立實驗。
+        # 去聚類（每簇只留第一個、保證零重疊持倉）再跑同一比較 = 最嚴版本。
+        print("\n" + "=" * 108)
+        print("E. 去聚類（零重疊持倉 = 真·獨立事件）＋ 按日 block bootstrap —— 最嚴版本")
+        print("=" * 108)
+        print(f"{'變體':<28}{'原 n':>8}{'去重後 n':>10}{'信號$':>9}{'隨機$':>9}"
+              f"{'淨貢獻$':>10}{'95% CI（block）':>22}{'判定':>8}")
+        print("-" * 108)
+        for lbl, params in CTRL:
+            hb = max(1, params.get("hold_bars", 1))
+            ids = dedup_clusters(idx, hb)
+            s, rand_mean, delta, lo, hi = compare_with_random(
+                df, ids, a.seeds, **params)
+            if not s or not s.get("n") or rand_mean is None:
+                continue
+            # delta 嘅 CI：由 block CI 減 rand_mean 得出
+            d_lo, d_hi = lo, hi
+            signif = (d_lo > 0) or (d_hi < 0)
+            print(f"{lbl:<28}{len(idx):>8,}{s['n']:>10,}{s['E']:>9.3f}{rand_mean:>9.3f}"
+                  f"{s['E']-rand_mean:>10.3f}{f'[{d_lo:+.3f}, {d_hi:+.3f}]':>22}"
+                  f"{('✅ 仍顯著' if signif else '❌ 唔顯著'):>8}")
+        print("\n  判讀：去聚類之後若淨貢獻仍然顯著為負 →『信號比隨機差』唔係偽重複")
+        print("        造成嘅假象。實測 timer 4h 去重後 delta 由 −0.491 變 −0.738")
+        print("        （更負）→ 聚類原本係掩蓋效應，唔係製造效應。")
     return 0
 
 

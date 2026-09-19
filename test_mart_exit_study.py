@@ -41,23 +41,26 @@ def synth_m15(n=60, seed=3, trend=0.5):
     return pd.DataFrame({"Open": o, "High": h, "Low": lo, "Close": c}, index=idx)
 
 
-print("=== 1. S3 信號必須等同生產環境 detect_rebound_signal ===")
-# 生產版評估「最後一條已收市 bar」；合成 df 全部係舊時間 → 一定揀最後一條。
-# 所以喺最後一條 bar 上，我哋 per-bar 條件同生產版必須一致。
+print("\n=== 1. S3 信號必須等同生產環境 detect_rebound_signal ===")
+# 生產版只評估「最後一條已收市 bar」。所以最強嘅測法係：對每條歷史 bar i
+# 截取 df[:i+2]（令 i 成為「最後已收市 bar」），逐一對比生產版 vs 我哋 per-bar 版。
+# ⚠️ 外審 2026-09-19 指出原本只測最後一條 —— 覆蓋嚴重不足。
 agree = disagree = 0
-for seed in range(12):
-    df = synth_m15(80, seed=seed)
-    prod = av.detect_rebound_signal(df)
+for seed in range(8):
+    df = synth_m15(120, seed=seed)
     mine = mes.s3_signals(df)
-    if bool(prod["signal"]) == bool(mine.iloc[-1]):
-        agree += 1
-    else:
-        disagree += 1
-print(f"  12 組合合成數據：一致 {agree}、唔一致 {disagree}")
-check("S3 條件同生產環境一致（12/12）", disagree == 0,
+    for i in range(20, len(df) - 1):
+        # 令 bar i 成為 df 嘅**最後一行**（生產版對「已收市嘅最後一行」評估）
+        prod = av.detect_rebound_signal(df.iloc[:i + 1])
+        if bool(prod["signal"]) == bool(mine.iloc[i]):
+            agree += 1
+        else:
+            disagree += 1
+print(f"  逐個歷史 bar 對比：一致 {agree}、唔一致 {disagree}")
+check("S3 條件逐 bar 等同生產環境（0 唔一致）", disagree == 0,
       f"（agree={agree}, disagree={disagree}）")
 
-# 另外驗證 entry 亦一致（生產版 return close[last]）
+# 另外驗證 entry 價格亦一致（生產版 return close[last]）
 df = synth_m15(80, seed=5)
 prod = av.detect_rebound_signal(df)
 check("entry 價格一致", abs(prod["entry"] - float(df["Close"].iloc[-1])) < 0.01,
@@ -100,12 +103,77 @@ r3 = mes.sim_variant(flat, np.array([10]), "timer", hold_bars=16)[0]
 check("hold_bars=16 → bars==16", r3["bars"] == 16, f"bars={r3['bars']}")
 check("bars → minutes 換算（×15）", r3["minutes"] == 240, f"minutes={r3['minutes']}")
 
+print("\n=== 4b. trailing 出場（外審要求：原本完全冇測 trail）===")
+# 構造：價格先升（拉高 peak）後急跌（觸發 trail）。ATR 固定 10、trail = 2×ATR = 20。
+# 保守版用「入 bar 前已知」嘅 peak（j−1 為止），唔用本 bar high → 出場價唔可以
+# 高過（peak_{j-1} − 20）。
+idx3 = pd.date_range("2026-01-01", periods=40, freq="15min")
+d3 = pd.DataFrame({"Open": 4000.0, "High": 4000.0, "Low": 4000.0, "Close": 4000.0},
+                  index=idx3)
+d3.loc[d3.index[1], ["High", "Low", "Close"]] = [4020.0, 3995.0, 4015.0]   # 升
+d3.loc[d3.index[2], ["High", "Low", "Close"]] = [4030.0, 3990.0, 3995.0]   # 再升再跌
+d3.loc[d3.index[3], ["High", "Low", "Close"]] = [4000.0, 3900.0, 3900.0]   # 急跌
+d3["ATR"] = 10.0
+rt = mes.sim_variant(d3, np.array([0]), "struct", hold_bars=20, trail_atr=2.0)[0]
+check("有 trail 出場（reason=TRAIL 或 SL）", rt["reason"] in ("TRAIL", "SL", "TIMEOUT"),
+      f"reason={rt['reason']} exit={rt['exit']}")
+# 入場 4000；peak 到 bar2 為止最高 = 4030 → 保守 trail 最高只可以係 4030−20 = 4010
+if rt["reason"] == "TRAIL":
+    check("trail 出場價 ≤ (入 bar 前 peak − 2×ATR)（無 look-ahead）",
+          rt["exit"] <= 4030.0 - 20.0 + 1e-9,
+          f"exit={rt['exit']} 上限={4030.0-20.0}")
+else:
+    check("trail 測試有觸發（否則測唔到）", False, f"reason={rt['reason']}")
+
+print("\n=== 4c. 打和盈虧比 = (1−勝率)/勝率（外審：唔可以寫死 1.0）===")
+# 勝率 50% → 打和線 1.0；勝率 25% → 打和線 3.0
+from types import SimpleNamespace                                     # noqa: E402
+win25 = ([{"pnl": 3.0, "minutes": 15, "reason": "T"}] * 1
+         + [{"pnl": -1.0, "minutes": 15, "reason": "T"}] * 3)
+s25 = mes.summarize(win25, "x")
+check("勝率 25% → 打和線 3.00", abs(s25["be_payoff"] - 3.0) < 1e-9,
+      f"be={s25['be_payoff']:.2f} payoff={s25['payoff']:.2f}")
+check("每筆 E = 0 → profitable=False（打和）", not s25["profitable"],
+      f"E={s25['E']:+.3f}")
+win50 = ([{"pnl": 2.0, "minutes": 15, "reason": "T"}] * 1
+         + [{"pnl": -1.0, "minutes": 15, "reason": "T"}] * 1)
+s50 = mes.summarize(win50, "y")
+check("勝率 50% → 打和線 1.00", abs(s50["be_payoff"] - 1.0) < 1e-9,
+      f"be={s50['be_payoff']:.2f}")
+check("E > 0 → profitable=True", s50["profitable"], f"E={s50['E']:+.3f}")
+
 print("\n=== 5. 隨機對照組可重現（同 seed 同結果）===")
 a = mes.random_entries(100, 20, 5000, seed=42)
 b = mes.random_entries(100, 20, 5000, seed=42)
 c = mes.random_entries(100, 20, 5000, seed=43)
 check("同 seed → 完全相同", np.array_equal(a, b))
 check("唔同 seed → 唔同", not np.array_equal(a, c))
+check("無放回：唔會有重複 bar（外審指出 integers() 係有放回）",
+      len(set(a.tolist())) == len(a), f"unique={len(set(a.tolist()))}/{len(a)}")
+
+print("\n=== 6. compare_with_random：CI 方向同判定（外審要求測試統計核心）===")
+# 合成：造一個「信號明顯好過隨機」嘅情況 —— 信號 bar 之後全部大升，
+# 非信號 bar 平。若 CI 判定唔到，即係 CI 邏輯壞。
+n2 = 40000
+idx4 = pd.date_range("2026-01-01", periods=n2, freq="15min")
+rng = np.random.default_rng(5)
+px = 4000.0 + np.cumsum(rng.normal(0, 1.0, n2))
+d4 = pd.DataFrame({"Open": px, "High": px + 1, "Low": px - 1, "Close": px}, index=idx4)
+# 令第 1000 條之後每 10 條 bar 有 +5 跳升 —— 跳升放喺**信號 bar 嘅下一條**
+# （信號喺 bar i 收市入場，所以要有 edge，跳升必須落喺 i+1）。
+boost = np.zeros(n2)
+boost[1001::10] = 5.0
+d4["Close"] = d4["Close"] + np.cumsum(boost)
+d4["High"] = d4["Close"] + 1
+d4["Low"] = d4["Close"] - 1
+d4["ATR"] = 10.0
+sig_boost = np.arange(1000, n2 - 100, 10)
+s6, rand_mean, delta, lo, hi = mes.compare_with_random(
+    d4, sig_boost, 3, exit_kind="timer", hold_bars=1)
+check("CI 有計到", lo is not None and hi is not None, f"[{lo}, {hi}]")
+check("CI 上下界次序正確", lo <= hi, f"[{lo}, {hi}]")
+check("明顯有 edge 嘅合成 case → delta > 0 且 CI 排除 0",
+      delta > 0 and lo > 0, f"delta={delta:.3f} CI=[{lo:.3f}, {hi:.3f}]")
 
 print("\n" + ("=" * 60))
 if FAILS:

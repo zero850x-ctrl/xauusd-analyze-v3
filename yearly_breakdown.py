@@ -92,17 +92,26 @@ def dump_trades(closed):
     direction 全 None，令「用同一把尺驗 CS chase 規則」嘅研究做唔到。
     呢個係 bug class：手寫 attribute 名只會喺 class 改名之後靜默變 None。
     改用 class 自己嘅 `to_dict()`（authoritative），再補 dump 專用欄位。
+
+    ⚠️ 第二個同形狀嘅陷阱（2026-09-19 外審指出）：第一版對「冇 to_dict()」嘅對象
+    **靜默跳過**，即係用另一個靜默置換原本嘅靜默 —— 若 Trade 改名或者傳錯 list，
+    就會靜靜 dump 0 筆而冇人知。所以而家**大聲 raise**：dump 唔到嘢係 bug，
+    唔係可以靜靜容忍嘅情況。呢個係本 bug class 嘅正確收尾方式。
     """
+    bad = [t for t in closed if not hasattr(t, "to_dict")]
+    if bad:
+        raise TypeError(
+            f"dump_trades: {len(bad)}/{len(closed)} 個對象冇 to_dict()"
+            f"（首個：{type(bad[0]).__name__}）—— 寧願炸都唔可以靜默少 dump")
     out = []
     for t in closed:
-        if not hasattr(t, "to_dict"):
-            print(f"⚠️ 跳過冇 to_dict() 嘅 trade: {type(t).__name__}")
-            continue
         row = t.to_dict()
         row["bar_idx"] = getattr(t, "bar_idx", None)
         row["limit_order"] = bool(getattr(t, "limit_order", False))
         row["entry_mode"] = getattr(t, "entry_mode", None)
         out.append(row)
+    if len(out) != len(closed):
+        raise AssertionError(f"dump_trades: 入 {len(closed)} 出 {len(out)} —— 有行被吞")
     return out
 
 

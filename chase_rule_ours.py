@@ -195,6 +195,10 @@ def from_s3(a):
     print(f"S3 信號 {len(idx)} 個（{df15.index[0]} → {df15.index[-1]}）")
 
     # chase 規則需要日開盤 = 00:00 嘅 bar；M15 有 00:00 → 用 M15 自己嘅 Open
+    # 由 idx[20:] 開始：M15 頭 20 條 bar 屬於首日，而 S3 需要 10 條 SMA warm-up
+    # ＋ 前 3 bar 高 → 頭 20 條內嘅「信號」可能係 warm-up 邊界產物（2026-09-19
+    # 外審問過呢個 magic number；實際上 np.where 已排除 NaN warm-up，
+    # 呢個 skip 只係額外保守，唔影響 20,039 vs 20,059 嘅統計）。
     rows = []
     for i in idx[20:]:
         ts = df15.index[i]
@@ -312,26 +316,61 @@ def main():
 
 
 def selftest(a):
-    """用 mentor 272 單對跑：兩邊應該得出同一組數字。"""
+    """用 mentor 272 單對跑：**自動斷言**兩邊得出同一組數字。
+
+    ⚠️ 2026-09-19 外審指出：原本只 print 兩段輸出、靠人眼比較 → 冇 fail 條件 →
+    喺 CI 入面永遠 pass（假保障）。而家 parse 兩邊數字並 assert 相等
+    （permutation p 有 MC 誤差，容許 ±0.02；n／net／obs 要完全一致）。
+    """
     if not os.path.exists(REFERENCE) or not os.path.exists(REFERENCE_ROWS):
-        print("⚠️ 搵唔到參考實作／參考數據，跳過 selftest")
-        return 0
+        # 唔可以靜默 pass：呢個係「驗證唔到」，要明顯講出嚟並回非 0
+        print("❌ 搵唔到參考實作或參考數據 —— 無法驗證等價（唔算通過）")
+        print(f"   reference: {REFERENCE}")
+        print(f"   rows     : {REFERENCE_ROWS}")
+        return 2
+    import re as _re
     import subprocess
     ref_out = subprocess.run(
         [sys.executable, REFERENCE, REFERENCE_ROWS, "--csv", a.csv,
          "--outcome", "both", "--iters", str(a.iters), "--offset", "1"],
         capture_output=True, text=True)
     if ref_out.returncode != 0:
-        # 參考實作預設會讀 /tmp/paxg_sep.json，唔存在就失敗 → 照樣印出原因
-        print(f"⚠️ 參考實作執行失敗（唔影響我哋自己嘅結果）：\n{ref_out.stderr[-400:]}")
-        return 0
-    mine = [l for l in ref_out.stdout.splitlines()
-            if "p=" in l or "CHASE" in l or "NO-CHASE" in l]
-    print("=== 參考實作（mentor 272 單, offset=1）===")
-    for l in mine:
-        print("  " + l.strip())
+        print(f"❌ 參考實作執行失敗 —— 無法驗證等價（唔算通過）:\n"
+              f"{ref_out.stderr[-400:]}")
+        return 2
 
-    # 我哋以同一份數據、同一 offset 跑自己嘅實作
+    print("=== 參考實作（mentor 272 單, offset=1）===")
+    for l in ref_out.stdout.splitlines():
+        if "p=" in l or "CHASE" in l:
+            print("  " + l.strip())
+
+    # ---- parse 參考輸出 ----
+    def parse_block(text):
+        out = {}
+        cur = None
+        for line in text.splitlines():
+            m = _re.match(r"\s*--\s*outcome\s*=\s*(\w+)", line)
+            if m:
+                cur = m.group(1)
+                out[cur] = {}
+                continue
+            if cur is None:
+                continue
+            m = _re.search(r"(CHASE|NO-CHASE)\s+n=\s*(\d+)\s+win=\s*([\d.]+)%\s+"
+                           r"net=\s*([+-][\d.]+)", line)
+            if m:
+                out[cur][m.group(1)] = {"n": int(m.group(2)), "net": float(m.group(4))}
+                continue
+            m = _re.search(r"no-chase minus chase =\s*\$?\s*([+-][\d.]+)/trade\s+"
+                           r"permutation p=([\d.]+)", line)
+            if m:
+                out[cur]["obs"] = float(m.group(1))
+                out[cur]["p"] = float(m.group(2))
+        return out
+
+    ref = parse_block(ref_out.stdout)
+
+    # ---- 我哋自己嘅實作（同一份數據、同一 offset）----
     rows = json.load(open(REFERENCE_ROWS))
     conv = []
     for r in rows:
@@ -342,17 +381,42 @@ def selftest(a):
                      "pnl": float(r["pnl"]),
                      "cp": (abs(float(r["cp"])) if r.get("cp") not in (None, "N/A") else None),
                      "lot": (float(r["lot"]) if r.get("lot") else None)})
-    df = load_ohlc(a.csv, a.extra) if hasattr(a, "extra") else load_ohlc(a.csv)
+    df = load_ohlc(a.csv, a.extra)
     ranked = apply_chase(conv, df, 1)
-    ch = [r for r in ranked if r["chase"]]
-    nc = [r for r in ranked if not r["chase"]]
-    print(f"\n=== 我哋實作（同一份數據、同一 offset=1）===")
+    print("\n=== 我哋實作（同一份數據、同一 offset=1）===")
+    fails = []
     for k in ("pnl", "pnl_imp"):
+        ch = [r for r in ranked if r["chase"]]
+        nc = [r for r in ranked if not r["chase"]]
         p, obs = permutation_p([r[k] for r in nc], [r[k] for r in ch], a.iters)
-        print(f"  {k:8s} CHASE n={len(ch):3d} net={sum(r[k] for r in ch):+9.2f} | "
-              f"NO-CHASE n={len(nc):3d} net={sum(r[k] for r in nc):+9.2f} | "
+        mine = {"CHASE": {"n": len(ch), "net": sum(r[k] for r in ch)},
+                "NO-CHASE": {"n": len(nc), "net": sum(r[k] for r in nc)},
+                "obs": obs, "p": p}
+        print(f"  {k:8s} CHASE n={mine['CHASE']['n']:3d} net={mine['CHASE']['net']:+9.2f} | "
+              f"NO-CHASE n={mine['NO-CHASE']['n']:3d} net={mine['NO-CHASE']['net']:+9.2f} | "
               f"obs={obs:+7.2f} p={p:.4f}")
-    print("\n  若上面兩段嘅 n 同 net 一樣 → 兩個實作等價，我哋嘅結果可信。")
+        # ---- 自動斷言 ----
+        rk = ref.get(k)
+        if not rk:
+            fails.append(f"{k}: 參考輸出 parse 唔到（格式改咗？）")
+            continue
+        for side in ("CHASE", "NO-CHASE"):
+            if rk[side]["n"] != mine[side]["n"]:
+                fails.append(f"{k}/{side}: n {rk[side]['n']} vs {mine[side]['n']}")
+            if abs(rk[side]["net"] - mine[side]["net"]) > 0.01:
+                fails.append(f"{k}/{side}: net {rk[side]['net']} vs {mine[side]['net']}")
+        if abs(rk["obs"] - mine["obs"]) > 0.01:
+            fails.append(f"{k}: obs {rk['obs']} vs {mine['obs']}")
+        if abs(rk["p"] - mine["p"]) > 0.02:      # permutation MC 誤差
+            fails.append(f"{k}: p {rk['p']} vs {mine['p']}")
+
+    print()
+    if fails:
+        print("❌ selftest 失敗 —— 實作同參考唔等價:")
+        for f in fails:
+            print("   - " + f)
+        return 1
+    print("✅ selftest 通過：n / net / obs / p 全部同參考實作一致（自動斷言）")
     return 0
 
 

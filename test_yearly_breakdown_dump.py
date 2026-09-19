@@ -66,15 +66,43 @@ check("`limit_order` 係 bool", isinstance(r.get("limit_order"), bool),
       f"{r.get('limit_order')!r}")
 check("`bar_idx` 帶住", r.get("bar_idx") == 42, f"{r.get('bar_idx')!r}")
 
-print("\n=== 反脆弱：唔可以因為冇 to_dict() 就當成功 ===")
-bad = yb.dump_trades([object()])
-check("冇 to_dict() 嘅對象 → 跳過（唔會炸、亦唔會當成有效行）", len(bad) == 0,
-      f"n={len(bad)}")
+print("\n=== 反脆弱：dump 唔到嘢必須大聲炸（唔可以靜默少 dump）===")
+# ⚠️ 2026-09-19 外審指出：第一版對「冇 to_dict()」靜默跳過 —— 即係用另一個靜默
+#    置換原本嘅靜默，同歷史 bug 同一形狀。而家必須 raise。
+try:
+    yb.dump_trades([object()])
+    check("冇 to_dict() → 應該 raise", False, "冇 raise！靜默失敗風險仍在")
+except TypeError as e:
+    check("冇 to_dict() → raise TypeError", True, str(e)[:60])
+
+# 混合：一好一壞都要炸（唔可以 dump 一半）
+try:
+    yb.dump_trades([make_trade("BUY"), object()])
+    check("混合好／壞輸入 → 應該 raise", False, "冇 raise！")
+except TypeError:
+    check("混合好／壞輸入 → raise（唔會 dump 一半）", True)
 
 print("\n=== 冇任何欄位係全 None（防『靜默全空』復活）===")
 allnone = [k for k in r if all(x.get(k) is None for x in rows)]
-# bar_idx 例外唔應該存在；呢個斷言就係防止再有欄位靜默變 None
 check("冇欄位係全域 None", not allnone, f"全 None 欄位: {allnone}")
+
+print("\n=== dump → consumer pipeline（外審要求：釘死成條鏈，唔止單邊）===")
+# 歷史 bug 正正係 dump／consumer 漂移。呢個 test 由真 Trade 一路走到
+# chase_rule_ours.to_chase_rows，斷言 0 筆被跳過。
+try:
+    import chase_rule_ours as cro       # noqa: PLC0415
+    conv, skipped = cro.to_chase_rows(rows)
+    check("dump rows → chase rows：0 筆被跳過", skipped == 0 and len(conv) == len(rows),
+          f"conv={len(conv)} skipped={skipped}")
+    check("`side` 喺 pipeline 之後仍然有值",
+          all(c["side"] in ("buy", "sell") for c in conv),
+          f"{[c['side'] for c in conv]}")
+    # entry_mode 傳遞 —— P2 confound 檢查全靠佢（外審點出：冇測試保護）
+    check("`entry_mode` 傳遞到 chase rows（confound 檢查依賴）",
+          all(c.get("entry_mode") == "breakout" for c in conv),
+          f"{[c.get('entry_mode') for c in conv]}")
+except ImportError as e:
+    check("chase_rule_ours 可 import", False, str(e))
 
 print("\n" + "=" * 60)
 if FAILS:
