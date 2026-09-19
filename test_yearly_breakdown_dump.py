@@ -57,6 +57,38 @@ check("`tp1` 有值（舊版叫 take_profit → None）", r.get("tp1") not in (N
 check("`entry` 有值", r.get("entry") not in (None, ""), f"entry={r.get('entry')!r}")
 check("`exit` 有值", r.get("exit") not in (None, ""), f"exit={r.get('exit')!r}")
 check("`pnl` 有值", r.get("pnl") not in (None, ""), f"pnl={r.get('pnl')!r}")
+
+# ⚠️⚠️ 最重要嘅一組（2026-09-19 外審 kimi-k3 §8）：斷言**確切值**，唔止「有值」。
+# 為何：今次歷史 bug 係「錯 mapping」，而佢咁啱錯嘅名全部映射到 None，所以
+# 「非 None」斷言捉到。但**同一 bug class 下次嘅形態會係「映射到另一個非 None
+# 欄位」**（例：`stop` 錯映射去 `t.atr` = 10.0）→ 上面嗰堆非 None 斷言會**照過**。
+# 只有同真值逐一比對才可以捉到。呢個就係「用錯嘅欄位但唔覺」嘅唯一防線。
+check("`entry` == 4000.0（真值，唔止『有值』）", r.get("entry") == 4000.0,
+      f"entry={r.get('entry')!r}")
+check("`stop` == 3980.0（真值；錯映射去 atr 會變 10.0）", r.get("stop") == 3980.0,
+      f"stop={r.get('stop')!r}")
+check("`tp1` == 4020.0（真值；錯映射去 tp2 會變 4040.0）", r.get("tp1") == 4020.0,
+      f"tp1={r.get('tp1')!r}")
+check("`exit` == 4010.0（真值）", r.get("exit") == 4010.0,
+      f"exit={r.get('exit')!r}")
+check("`side` == 'BUY'", r.get("side") == "BUY", f"side={r.get('side')!r}")
+_tr = make_trade("BUY")
+check("`pnl` == Trade.total_pnl（對得上權威欄位）",
+      abs(float(r.get("pnl") or 0) - float(_tr.total_pnl)) < 1e-9,
+      f"pnl={r.get('pnl')!r} vs total_pnl={_tr.total_pnl!r}")
+
+# ⚠️ Contract keys：`chase_rule_ours.to_chase_rows` 要嘅係邊幾個？
+# 核實過原始碼（唔靠外審轉述 —— kimi §8 講「需要 entry_date/entry_time」，
+# 實際碼係 `t.get("entry_date") or t.get("entry_time")` → **entry_time 只係
+# fallback，唔係必要**）。真實必要條件：
+#   side（或 direction）／entry／pnl 三者必要；時間戳要 entry_date **或** entry_time。
+check("有 `entry_date`（to_chase_rows 唯一必要嘅時間戳）", bool(r.get("entry_date")),
+      f"entry_date={r.get('entry_date')!r}")
+_ts = r.get("entry_date") or r.get("entry_time")
+check("時間戳至少有一個（entry_date 或 entry_time）", bool(_ts), f"ts={_ts!r}")
+# position：`to_chase_rows` 用 `if t.get("position")` → falsy 唔算錯，係 optional
+check("`position` key 存在（optional，但 pipeline 會讀）", "position" in r,
+      f"keys 有 position={'position' in r}")
 check("兩個方向都保留到", {x.get("side") for x in rows} == {"BUY", "SELL"},
       f"{[x.get('side') for x in rows]}")
 
@@ -82,9 +114,16 @@ try:
 except TypeError:
     check("混合好／壞輸入 → raise（唔會 dump 一半）", True)
 
-print("\n=== 冇任何欄位係全 None（防『靜默全空』復活）===")
-allnone = [k for k in r if all(x.get(k) is None for x in rows)]
-check("冇欄位係全域 None", not allnone, f"全 None 欄位: {allnone}")
+print("\n=== 關鍵欄位逐個非 None（白名單，唔用「冇欄位全域 None」）===")
+# ⚠️ 2026-09-19 外審 kimi-k3 §8 指出：「冇任何欄位係全域 None」有**假陽性風險** ——
+# 任何 to_dict() 嘅合法 optional 欄位（例：tp2、exit_reason），只要兩個合成交易
+# 都係 None 就會誤觸紅燈，令人以為漏 dump。改為白名單：只斷言**一定要有值**嘅
+# 關鍵欄位，其他 optional 欄位唔管。
+_REQUIRED = ("side", "entry", "stop", "tp1", "exit", "pnl", "entry_date", "position")
+for k in _REQUIRED:
+    check(f"關鍵欄位 `{k}` 非 None（兩筆都有）",
+          all(x.get(k) is not None and x.get(k) != "" for x in rows),
+          f"{[x.get(k) for x in rows]}")
 
 print("\n=== dump → consumer pipeline（外審要求：釘死成條鏈，唔止單邊）===")
 # 歷史 bug 正正係 dump／consumer 漂移。呢個 test 由真 Trade 一路走到

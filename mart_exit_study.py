@@ -86,6 +86,11 @@ def sim_variant(df, sig_idx, exit_kind, hold_bars=None, sl_atr=None, tp_atr=None
     n = len(df)
 
     for i in sig_idx:
+        # ⚠️ 尾段：唔夠 bar 做 exit 就唔可以量度（外審 kimi-k3 §9.1）。
+        # 舊版留最後一條 bar → loop 唔行 → exit = close[i] = entry →
+        # 造出一筆 pnl = −$0.30、bars=0 嘅**假交易**，污染信號側均值。
+        if hold_bars is not None and i + hold_bars > n - 1:
+            continue
         entry = cl[i]
         if not np.isfinite(entry) or entry <= 0:
             continue
@@ -191,7 +196,7 @@ def dedup_clusters(idx, min_gap):
     為何要（2026-09-19，外審提出 pseudo-replication 質疑）：S3 信號聚簇，
     20,059 個「信號」唔係 20,059 個獨立實驗。實測去聚類後嘅有效樣本：
       timer 1 bar n=20,059（100%）｜timer 4h n=7,345（36.6%）｜timer 24h n=1,867（9.3%）
-    而淨貢獻反而**更負**（timer 4h：−0.556 → −0.833）→ 聚類原本係**掩蓋**
+    而淨貢獻反而**更負**（見下面 E 表：timer 4h 去重後比去重前更負）→ 聚類原本係**掩蓋**
     效應，唔係製造效應。即係「信號比隨機差」嘅結論唔係偽重複造成嘅假象。
     數字用 `--dedup` 重跑可覆核。
     """
@@ -204,19 +209,28 @@ def dedup_clusters(idx, min_gap):
     return np.asarray(keep)
 
 
-def random_entries(n, lo, hi, seed):
+def random_entries(n, lo, hi, seed, exclude=None):
     """隨機入場對照：同樣數量、同樣 exit 規則，隨機揀 bar。
 
     為何一定要有：S3 係 LONG-only，而黃金長期上升 → 任何「揸長啲」嘅變體都會
     自動多收 drift（beta），呢個係資產本身嘅特性，唔係信號嘅 edge。
     冇對照組就會把 beta 當成「出場改善」報出去（本 script 第一版差啲就係咁）。
 
+    `exclude`（2026-09-19 外審 kimi-k3 指出嘅 CONTAMINATION）：信號 bar 佔
+    全部 bar 約 10%，如果對照組由**全部** bar 均勻抽，就會有 ~10% 樣本其實係
+    「處理組」→ 對照組均值被拉向信號均值 → **delta 被系統性壓向 0**
+    （估計低估約 11%）。所以要 mask 走信號 bar，令對照組係乾淨嘅「非信號」。
+    `exclude` 傳入信號 bar 嘅 index 陣列。
+
     用 `choice(..., replace=False)` 而唔係 `integers()`：後者係**有放回**，
     會揀到重複 bar → 同一筆交易計兩次，令對照組名義 n 同實際唔符、變異被高估
     （2026-09-19 外審指出）。
     """
     rng = np.random.default_rng(seed)
-    return np.sort(rng.choice(np.arange(lo, hi), size=min(n, hi - lo), replace=False))
+    pool = np.arange(lo, hi)
+    if exclude is not None and len(exclude):
+        pool = np.setdiff1d(pool, np.asarray(exclude), assume_unique=False)
+    return np.sort(rng.choice(pool, size=min(n, len(pool)), replace=False))
 
 
 def compare_with_random(df, idx, n_seeds=5, **params):
@@ -234,14 +248,18 @@ def compare_with_random(df, idx, n_seeds=5, **params):
     喺 block 下**含 0** → 唔可以當 edge。呢個就係偽重複嘅實際影響。
     """
     s = summarize(sim_variant(df, idx, **params), "signal")
+    # ⚠️ exclude=idx：mask 走信號 bar，令對照組係乾淨嘅「非信號」（外審 kimi-k3
+    #    指出嘅 contamination —— 唔 mask 就會有 ~10% 對照樣本其實係處理組，
+    #    令 delta 被系統性壓向 0）。
     rand_Es = []
     for seed in range(n_seeds):
-        ri = random_entries(len(idx), 20, len(df) - 40, seed)
+        ri = random_entries(len(idx), 20, len(df) - 40, seed, exclude=idx)
         rrecs = sim_variant(df, ri, **params)
         if rrecs:
             rand_Es.append(np.mean([r["pnl"] for r in rrecs]))
     if not rand_Es or not s.get("n"):
         return s, None, None, None, None
+    seed_spread = float(np.max(rand_Es) - np.min(rand_Es)) if len(rand_Es) > 1 else 0.0
     rand_mean = float(np.mean(rand_Es))
 
     # ---- block bootstrap：按日重抽，保留同期相關性 ----
@@ -259,6 +277,9 @@ def compare_with_random(df, idx, n_seeds=5, **params):
     deltas.sort()
     lo = deltas[int(0.025 * len(deltas))]
     hi = deltas[int(0.975 * len(deltas))]
+    # seed 之間離散（畀讀者睇對照組本身幾唔穩；外審 kimi-k3 §2b 要求量化）
+    s["rand_seed_spread"] = seed_spread
+    s["rand_seeds"] = len(rand_Es)
     return s, rand_mean, s["E"] - rand_mean, lo, hi
 
 
@@ -388,7 +409,7 @@ def main():
                   f"{s['E']-rand_mean:>10.3f}{f'[{d_lo:+.3f}, {d_hi:+.3f}]':>22}"
                   f"{('✅ 仍顯著' if signif else '❌ 唔顯著'):>8}")
         print("\n  判讀：去聚類之後若淨貢獻仍然顯著為負 →『信號比隨機差』唔係偽重複")
-        print("        造成嘅假象。實測 timer 4h 去重後淨貢獻由 −0.556 變 −0.833")
+        print("        造成嘅假象。實測 timer 4h 去重後淨貢獻比去重前更負（見上表）。")
         print("        （更負）→ 聚類原本係掩蓋效應，唔係製造效應。")
     return 0
 

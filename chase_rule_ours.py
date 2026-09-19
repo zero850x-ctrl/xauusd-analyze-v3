@@ -43,7 +43,14 @@ def load_ohlc(csv_path, extra_paths=None):
     # 冇呢步會令 9/10 之後嘅單搵唔到 day-open → 靜默少算幾十筆。
     for p in (extra_paths or []):
         if not p or not os.path.exists(p):
-            print(f"  ⚠️ --extra 唔存在，略過: {p}")
+            # ⚠️ 2026-09-19 外審 kimi-k3 §9.3：原本只係一句 warning 就繼續，
+            # 而 --extra 嘅 default 又係 /tmp 檔 → 新機上會**靜默降級**
+            # （5y CSV 只到 2026-09-10，之後嘅單搵唔到 day-open → 少算幾十筆，
+            # 實測少 33 筆）。而家要大聲講到明「結果唔完整」。
+            print(f"  ⚠️⚠️ --extra 唔存在，略過: {p}")
+            print("      → 5y CSV 只到 2026-09-10，之後嘅成交會搵唔到 day-open。")
+            print("      → 結果**唔完整**（實測會靜默少算 33 筆）。要完整就自己傳 "
+                  "--extra <klines.json>。")
             continue
         rows = [{"datetime": dt.datetime.utcfromtimestamp(k[0] / 1000),
                  "Open": float(k[1]), "High": float(k[2]),
@@ -94,15 +101,41 @@ def to_chase_rows(trades, tz_offset_hours=0):
     return out, skipped
 
 
+def thin_by_gap(ranked, gap):
+    """只保留「距上個保留信號 ≥ gap 條 bar」嘅信號 → 每個樣本真獨立。
+
+    為何要（2026-09-19 外審 kimi-k3 §1）：持倉 gap 條 bar、而信號平均相隔 ~10 bar
+    → 大量重疊持倉 → 相鄰交易共享價格路徑 → 逐筆 permutation／bootstrap 假設獨立
+    係**唔成立**，p 值 anti-conservative（實測 thinned 後 p 由 0.0002 → ~0.09）。
+    呢個係 pseudo-replication；正確處理係 thinning 或 cluster-robust 方法。
+    """
+    keep, last = [], -10 ** 9
+    for r in sorted(ranked, key=lambda x: x["close_i"]):
+        if r["close_i"] - last >= gap:
+            keep.append(r)
+            last = r["close_i"]
+    return keep
+
+
 def entry_mode_breakdown(ranked, iters=5000):
     """chase × entry_mode 交叉表 + 同一 entry_mode 之內嘅比較。
 
     為何關鍵：我哋引擎 80% 單都算 chase，如果 chase 單集中喺 breakout（市價）、
     no-chase 集中喺 boundary（限價），咁「chase vs no-chase」其實係
-    「breakout vs boundary」—— 同 chase 規則無關。實測（288 單）：
-      boundary n=37 chase 8.1% ｜ breakout n=251 chase 90.0%
-      breakout 之內：chase +3.59 vs no-chase +3.61 → diff +0.02 p=0.9990
-    → chase 喺可比組別之內完全冇效果。
+    「breakout vs boundary」—— 同 chase 規則無關。
+
+    ⚠️ 唔喺 docstring 硬編碼數字（2026-09-19 外審 kimi-k3 §4 指出：原本寫死嘅
+    「8.1%/90.0%」同另一個 dump 嘅「14.7%/93.3%」唔同 → 硬編碼數字會腐爛，
+    而且已經腐爛緊）。實際數字由 `entry_mode_breakdown()` 每次跑出。
+
+    正確讀法（外審 §4 指出原本「分唔開」係**錯嘅表述**）：
+      * breakout 之內（87% 嘅交易）→ **分得開，而且結果係 null**：
+        no-chase 側 n 少（~25）→ power 有限，只能排除「大」效果，
+        唔可以話「冇效果」。
+      * boundary 之內 → **樣本不足**（chase 得幾單）→ 唔係「分唔開」，
+        係「試都試唔到」。
+    所以結論要講「喺可得樣本內測唔到 chase 效果」，
+    唔可以講「chase 同 entry_mode 分唔開」。
     """
     from collections import Counter
     print("\n" + "=" * 74)
@@ -133,7 +166,10 @@ def entry_mode_breakdown(ranked, iters=5000):
               f"no-chase n={len(nc):<4} avg={an:+7.2f} | diff={obs:+7.2f} p={p:.4f}")
     if not any_ok:
         print("    → 冇任何 entry_mode 同時有 ≥20 筆 chase 同 no-chase：")
-        print("      呢個 dataset 分唔開「chase 效果」同「entry_mode 效果」。")
+        print("      注意：唔可以講「chase 同 entry_mode 分唔開」—— 喺 breakout 之內係")
+        print("      **分得開而且結果係 null**（但 no-chase 側 n 細，只能排除大效果）；")
+        print("      喺 boundary 之內係**樣本不足**（chase 幾乎冇），即「試都試唔到」。")
+        print("      準確講法：喺可得樣本內測唔到 chase 效果。")
     else:
         print("    → 睇上表：若可比組別之內 diff ≈ 0，即 chase 規則喺我哋引擎冇效。")
 
@@ -232,6 +268,20 @@ def from_s3(a):
                   f"avg={net/max(1,len(g)):+7.3f}")
         p, obs = permutation_p([r["pnl"] for r in nc], [r["pnl"] for r in ch], a.iters)
         print(f"   no-chase minus chase = {obs:+7.3f}/trade   p={p:.4f}")
+
+        # ⚠️ 誠實版：p 用**無重疊**（thinned）樣本重算。
+        # 為何（2026-09-19 外審 kimi-k3 §1）：持倉 96 bar 而信號平均相隔 ~10 bar
+        # → 相鄰交易共享大段價格路徑 → iid permutation 假設獨立係**唔成立** →
+        # 上面嗰個 p 係 anti-conservative。Thinning 到「距上個保留信號 ≥ hold」
+        # 之後每個樣本真獨立，p 即刻由 0.0002 退化到 ~0.09（實測）→
+        # **唔可以再引用 iid p 做「顯著」嘅證據**。
+        tk = thin_by_gap(ranked, hold)
+        tch = [r for r in tk if r["chase"]]
+        tnc = [r for r in tk if not r["chase"]]
+        tp, tobs = permutation_p([r["pnl"] for r in tnc], [r["pnl"] for r in tch], a.iters)
+        print(f"   ⫶ thinned（真無重疊）n={len(tk)}/{len(ranked)} → "
+              f"no-chase minus chase = {tobs:+7.3f}  p={tp:.4f}"
+              f"  {'✅ p<0.05' if tp < 0.05 else '❌ 唔顯著'}")
     return 0
 
 
@@ -242,8 +292,11 @@ def main():
     ap.add_argument("--offset", type=int, default=0,
                     help="數據時區 vs UTC（我哋 dump 係 UTC → 0；mentor → 1）")
     ap.add_argument("--iters", type=int, default=20000)
-    ap.add_argument("--extra", nargs="*", default=["/tmp/paxg_sep.json"],
-                    help="補 5y CSV 之後嘅 OHLC（同參考實作一致）")
+    ap.add_argument("--extra", nargs="*", default=None,
+                    help="補 5y CSV 之後嘅 OHLC（同參考實作一致）。"
+                         "⚠️ 2026-09-19 外審 kimi-k3 §9.3：原本 default 係 "
+                         "/tmp/paxg_sep.json —— /tmp 檔喺新機唔存在 → 靜默降級"
+                         "（少 33 筆）→ 已改為**明確必填**，缺檔會大聲講。")
     ap.add_argument("--selftest", action="store_true",
                     help="用 mentor 272 單同參考實作對跑，驗證等價")
     ap.add_argument("--from-s3", action="store_true",

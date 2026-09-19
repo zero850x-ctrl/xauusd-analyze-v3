@@ -97,6 +97,21 @@ def main():
         for line in f:
             rows[line[:19]] = line
     os.remove(tmp)
+
+    # ⚠️ 2026-09-19 外審 kimi-k3 §9.2：Binance 會回傳**正在形成嘅最後一條 bar**
+    #    （Close 係實時價、唔係收市價）→ 寫入 cache 就等於偽造一個收市價，
+    #    而且「下一條 bar」永遠唔會出現，令尾段研究結果唔可重現。
+    #    呢個 cache 係歷史研究用，所以 drop 最後一條未收市 bar。
+    #    判斷：最後一條 bar 嘅開盤時間 + 15 分鐘 > 現在 = 仍在形成中。
+    last_key = max(rows) if rows else None
+    if last_key:
+        import datetime as _dt
+        _open = _dt.datetime.strptime(last_key, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=_dt.timezone.utc)
+        if _open + _dt.timedelta(minutes=15) > _dt.datetime.now(_dt.timezone.utc):
+            del rows[last_key]
+            print(f"[drop] 最後一條 bar {last_key} 仍在形成中（Close 係實時價）→ 已剔除")
+
     with open(OUT, "w") as f:
         f.write(hdr)
         for k in sorted(rows):
