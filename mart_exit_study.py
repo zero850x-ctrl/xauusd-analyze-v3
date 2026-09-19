@@ -181,6 +181,14 @@ def compare_with_random(df, idx, n_seeds=5, **params):
 
     對照組用同一個 exit 規則、同樣數量、隨機時間 → 得出「純 drift + 成本」基線。
     signal 減 random 就係信號嘅淨貢獻。
+
+    ⚠️ CI 用 **block bootstrap（按日重抽）**，唔用 iid 逐筆重抽。
+    為何（2026-09-19 自查）：S3 信號集群唔嚴重（14,843 runs / 20,059 信號 = 1.4），
+    但**持倉重疊嚴重** —— 持 24h 時中位 9 個並行持倉、最多 35 個 → 相鄰信號收益
+    相關 → iid bootstrap 會低估不確定性。實測日級 block CI 闊度倍數：
+      timer 1 bar 0.83×｜timer 4h 2.13×｜timer 24h **3.37×**｜SL/TP 1.65×
+    後果：timer 24h 喺 iid 下 CI [+0.009, +2.613]（似有 edge），
+    喺 block 下**含 0** → 唔可以當 edge。呢個就係偽重複嘅實際影響。
     """
     s = summarize(sim_variant(df, idx, **params), "signal")
     rand_Es = []
@@ -192,13 +200,19 @@ def compare_with_random(df, idx, n_seeds=5, **params):
     if not rand_Es or not s.get("n"):
         return s, None, None, None, None
     rand_mean = float(np.mean(rand_Es))
-    # bootstrap：對 signal 嘅 per-trade pnl 重抽，睇 delta 嘅不確定性
-    sig_pnl = np.array([r["pnl"] for r in sim_variant(df, idx, **params)])
-    rng = np.random.default_rng(7)
+
+    # ---- block bootstrap：按日重抽，保留同期相關性 ----
+    recs = sim_variant(df, idx, **params)
+    pnl = np.array([r["pnl"] for r in recs])
+    days = pd.DatetimeIndex(df.index[np.array([r["i"] for r in recs])]).normalize()
+    per = pd.DataFrame({"pnl": pnl, "day": days}).groupby("day")["pnl"]
+    day_sum, day_cnt = per.sum().values, per.count().values
+    cnt_mean = float(day_cnt.mean()) if len(day_cnt) else 1.0
+    rng = np.random.default_rng(13)
     deltas = []
     for _ in range(4000):
-        samp = rng.choice(sig_pnl, size=len(sig_pnl), replace=True)
-        deltas.append(samp.mean() - rand_mean)
+        pick = rng.integers(0, len(day_sum), len(day_sum))
+        deltas.append(day_sum[pick].sum() / (cnt_mean * len(day_sum)) - rand_mean)
     deltas.sort()
     lo = deltas[int(0.025 * len(deltas))]
     hi = deltas[int(0.975 * len(deltas))]
