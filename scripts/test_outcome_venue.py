@@ -51,6 +51,13 @@ def _bars(seed_dt, source, high_at):
     return pd.DataFrame(rows), source
 
 
+def _bars_without_time(seed_dt, high_at):
+    """Same shape, but the time axis is unreadable — the missing-column path
+    that `_fetch_m30`'s TV branch can hand back after its own KeyError is
+    swallowed (so the frame is non-empty and the fallback chain never fires)."""
+    return _bars(seed_dt, "tv", high_at)[0].drop(columns=["datetime"])
+
+
 def _sell_trade(seed_dt):
     return {
         "id": "test-venue-01",
@@ -68,9 +75,15 @@ def _sell_trade(seed_dt):
     }
 
 
-def _run_check(source, high_at):
-    """Run check_outcomes against an injected series; return the saved log."""
-    seed_dt = datetime.now(timezone.utc) - timedelta(hours=4)
+def _run_check(source, high_at, seed_hours_ago=4, bars=None):
+    """Run check_outcomes against an injected series; return the saved log.
+
+    `seed_hours_ago` moves the trade (and, unless `bars` is passed, the series
+    with it) back in time — the freshness gate needs a case where the bars are
+    stale but still AFTER the seed, i.e. bars that WOULD pierce the stop if
+    nothing withheld them.
+    """
+    seed_dt = datetime.now(timezone.utc) - timedelta(hours=seed_hours_ago)
     with tempfile.TemporaryDirectory() as td:
         path = os.path.join(td, "paper_trade_log.json")
         with open(path, "w") as fh:
@@ -78,7 +91,8 @@ def _run_check(source, high_at):
 
         orig_path, orig_fetch = pt.LOG_PATH, pt._fetch_m30
         pt.LOG_PATH = path
-        pt._fetch_m30 = lambda *a, **k: _bars(seed_dt, source, high_at)
+        frame = bars if bars is not None else _bars(seed_dt, source, high_at)[0]
+        pt._fetch_m30 = lambda *a, **k: (frame, source)
         try:
             pt.check_outcomes({"price": 4285.0, "intraday_source": "TradingView (OANDA:XAUUSD)"})
             with open(path) as fh:
@@ -121,6 +135,13 @@ def test_non_spot_series_cannot_close():
     check("no history written", log.get("history") == [])
     warn = log["trades"][0].get("venue_warning") or {}
     check("venue_warning recorded", warn.get("source") == "paxg")
+    # The skew is measured EVEN for a series we already reject: a wrong venue and
+    # a wrong clock can both be true (a fallback feed can itself be mis-stamped),
+    # and only measuring on the happy path made the two incidents
+    # indistinguishable in the record afterwards.
+    check("lag IS measured for a venue rejection too",
+          "lag_minutes" in warn and warn["lag_minutes"] is not None)
+    check("reason names the venue problem", "non-spot" in (warn.get("reason") or ""))
 
 
 def test_tv_series_closes_and_is_tagged():
@@ -159,8 +180,13 @@ def _run_ticks(steps):
         snaps, outs = [], []
         try:
             for source, high_at in steps:
-                pt._fetch_m30 = (lambda *a, _s=source, _h=high_at, **k:
-                                 _bars(seed_dt, _s, _h))
+                if high_at is None:
+                    # `high_at=None` means "no series at all" — the total fetch
+                    # failure path, which used to leave no record whatsoever.
+                    pt._fetch_m30 = lambda *a, _s=source, **k: (None, _s)
+                else:
+                    pt._fetch_m30 = (lambda *a, _s=source, _h=high_at, **k:
+                                     _bars(seed_dt, _s, _h))
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
                     pt.check_outcomes({"price": 4285.0,
@@ -230,6 +256,346 @@ def test_venue_deferral_counter_escalates():
           all("🚨" in o for o in outs[pt.VENUE_STALE_ALERT_TICKS - 1:]))
 
 
+def test_series_freshness_is_a_precondition_not_an_accident():
+    """Pin the fixture the close tests rely on.
+
+    The freshness gate withholds once the newest bar lags > TV_STALE_MINUTES, so
+    "the tv series closes" only means something while that series IS fresh. A
+    fixture edit that quietly ages the frame would otherwise turn those tests
+    into assertions about the gate — or fail them for a confusing reason.
+    """
+    seed_dt = datetime.now(timezone.utc) - timedelta(hours=4)
+    lag = pt._series_lag_minutes(_bars(seed_dt, "tv", 4321.0)[0])
+    check("the standard fixture is fresh",
+          lag is not None and lag <= pt.TV_STALE_MINUTES)
+    print(f"     (fixture lag {lag:.0f}min, limit {pt.TV_STALE_MINUTES}min)")
+
+
+def test_stale_tv_series_cannot_close():
+    """A spot series whose clock is stale must NOT decide a close.
+
+    2026-09-18 review: this was the last silent hole. `_tv_bars_to_utc` only
+    PRINTED a warning and returned the bars, and the venue gate looked at the
+    source tag alone — so stale tv bars were still decisive, and still got
+    tagged `close_data_source="tv"`. The realistic trigger is the mirror of the
+    09-15 bug: tvDatafeed switching to `utcfromtimestamp()` would make the local
+    →UTC shift push the whole series 8h into the past (~480min of lag).
+
+    The fixture keeps the stop-piercing bar AFTER the seed, so nothing except the
+    freshness gate can explain the trade staying LIVE.
+    """
+    log = _run_check("tv", high_at=4321.0, seed_hours_ago=6)
+    check("stale spot series does NOT close the trade",
+          log["trades"][0]["status"] == "LIVE")
+    check("no history written", log.get("history") == [])
+    warn = log["trades"][0].get("venue_warning") or {}
+    check("stale deferral is recorded", "stale" in (warn.get("reason") or ""))
+    check("the measured lag is recorded for audit",
+          (warn.get("lag_minutes") or 0) > pt.TV_STALE_MINUTES)
+    check("the warning still names the venue", warn.get("source") == "tv")
+
+
+def test_unreadable_series_times_cannot_close():
+    """A series whose bar times cannot be read is unverifiable → not decisive.
+
+    Same fail-closed reasoning as the venue gate: the sim compares bar times
+    against the seed, so an unmeasurable clock cannot be assumed correct.
+    """
+    seed_dt = datetime.now(timezone.utc) - timedelta(hours=4)
+    log = _run_check("tv", high_at=4321.0, bars=_bars_without_time(seed_dt, 4321.0))
+    check("unreadable times do NOT close the trade",
+          log["trades"][0]["status"] == "LIVE")
+    warn = log["trades"][0].get("venue_warning") or {}
+    check("unverifiable alignment is recorded",
+          "unverifiable" in (warn.get("reason") or ""))
+    # The key must be PRESENT and null — asserting only "is None" passed for an
+    # absent key too, which made "could not measure" and "not applicable"
+    # indistinguishable and turned this into a false guarantee.
+    check("no lag is invented, but the key is present and null",
+          "lag_minutes" in warn and warn["lag_minutes"] is None)
+
+
+def test_close_bar_time_recorded():
+    """The record must say WHICH bar decided, not just when we noticed.
+
+    `closed_time` is wall clock, so a close replayed out of a feed outage (the
+    sim walks the missed bars from `last_bar_time`) looks identical to a live
+    one — and the 09-14-01 phantom stop was only ever caught by comparing bar
+    time against seed time. Keep that comparison possible in the record itself.
+    """
+    log = _run_check("tv", high_at=4321.0)          # bar at seed+90min pierces
+    hist = log["history"][0]
+    check("close bar time is recorded", bool(hist.get("close_bar_time")))
+    seed = datetime.strptime(hist["seeded_time"], "%Y-%m-%dT%H:%M:%SZ")
+    bar = datetime.strptime(hist["close_bar_time"], "%Y-%m-%dT%H:%M:%SZ")
+    check("close bar is the bar that pierced the stop",
+          bar == seed + timedelta(minutes=90))
+    check("close bar is never after the wall clock",
+          bar <= datetime.strptime(hist["closed_time"], "%Y-%m-%dT%H:%M:%SZ"))
+
+
+def test_future_dated_series_cannot_close():
+    """Symmetric case — and the direction the ORIGINAL 09-15 bug ran.
+
+    Naive LOCAL stamps read as UTC put the series +8h into the FUTURE: the sim
+    walked bars that had not happened yet and booked a close off a pre-entry
+    price. Rejecting only *old* series would leave a regression in the other
+    direction free to book closes at prices the market never traded.
+    """
+    future_seed = datetime.now(timezone.utc) + timedelta(hours=2)
+    log = _run_check("tv", high_at=4321.0, bars=_bars(future_seed, "tv", 4321.0)[0])
+    check("future-dated series does NOT close the trade",
+          log["trades"][0]["status"] == "LIVE")
+    check("no history written", log.get("history") == [])
+    warn = log["trades"][0].get("venue_warning") or {}
+    check("future skew is recorded as such",
+          "ahead of now" in (warn.get("reason") or ""))
+    check("the skew is negative for a future series",
+          (warn.get("lag_minutes") or 0) < -pt.TV_STALE_MINUTES)
+
+
+def test_lag_probe_survives_weird_frames():
+    """`_series_lag_minutes` must RETURN None for anything it cannot measure.
+
+    It is the last line of defence for close decisions, and it runs INSIDE the
+    tick: an exception escaping it kills the whole tick and skips the
+    `venue_warning` write, so the escalation would silently never fire. Its
+    contract is therefore "measure or None", never "raise".
+
+    The reachable one is the object-dtype column: `.max()` hands back a stdlib
+    `datetime`, which has a `tzinfo` attribute but no `.tz_convert`.
+    """
+    from datetime import datetime as _dt
+    unreadable = {
+        "empty frame": pd.DataFrame({"datetime": []}),
+        "missing column": pd.DataFrame({"open": [1.0]}),
+        "all NaT": pd.DataFrame({"datetime": [pd.NaT]}),
+        "None": None,
+        "not a frame": [1, 2, 3],
+        "object-dtype aware datetime":
+            pd.DataFrame({"datetime": [_dt(2026, 9, 18, 12, 0, tzinfo=timezone.utc)]},
+                         dtype=object),
+        "object-dtype Timedelta":
+            pd.DataFrame({"datetime": [pd.Timedelta(days=1)]}, dtype=object),
+    }
+    for name, obj in unreadable.items():
+        try:
+            got = pt._series_lag_minutes(obj)
+        except Exception as e:                      # noqa: BLE001 - the whole point
+            raise AssertionError(f"{name}: raised {type(e).__name__}: {e}")
+        check(f"{name} → None (never raises)", got is None)
+    # A naive column is NOT unreadable: assuming naive == UTC is this module's
+    # standing convention (`_parse_dt`), and the real path always hands over a
+    # naive frame because `_tv_bars_to_utc` strips the tz after converting. So an
+    # object-dtype naive datetime measures — it must not be lumped in above.
+    naive_obj = pd.DataFrame({"datetime": [_dt(2026, 9, 18, 12, 0)]}, dtype=object)
+    check("object-dtype naive datetime still measures (naive == UTC convention)",
+          pt._series_lag_minutes(naive_obj) is not None)
+    # …and a normal frame still measures
+    seed = datetime.now(timezone.utc) - timedelta(hours=4)
+    lag = pt._series_lag_minutes(_bars(seed, "tv", 4321.0)[0])
+    check("a readable frame still measures", lag is not None and lag > 0)
+
+
+def test_real_chain_local_stamps_survive_conversion():
+    """The ACTUAL incident-B regression path: `_tv_bars_to_utc` → `_series_lag_minutes`.
+
+    Both halves were fixed separately and each was tested in isolation, so a
+    reintroduced conversion bug would only ever surface as a live 🚨 — the suite
+    would stay green.
+
+    The local offset is PINNED and the stamps are built with that same offset.
+    Picking the offset up from the host would make this vacuous on a UTC machine
+    (a no-op conversion is harmless when local == UTC, so `|lag| <= 90` would
+    pass while the bug is live) — the same self-certifying-test trap that had to
+    be removed from `test_tv_tz_alignment.py`.
+    """
+    off = timezone(timedelta(hours=8))              # fixed, no DST
+    orig_tz = pt._LOCAL_TZ
+    pt._LOCAL_TZ = off
+    try:
+        now_local = datetime.now(off)               # naive local == this offset
+        naive = pd.DataFrame([
+            {"datetime": (now_local - timedelta(minutes=30 * i)).replace(tzinfo=None),
+             "open": 4288.0, "high": 4321.0, "low": 4278.0, "close": 4285.0}
+            for i in range(1, 5)])
+        converted = pt._tv_bars_to_utc(naive)
+        lag = pt._series_lag_minutes(converted)
+    finally:
+        pt._LOCAL_TZ = orig_tz
+    check("converted series measures at all", lag is not None)
+    fresh = lag is not None and abs(lag) <= pt.TV_STALE_MINUTES
+    check("converted series is fresh, not ±8h off (lag=%s)"
+          % ("n/a" if lag is None else "%.0fmin" % lag), fresh)
+    # …and it is decisive, i.e. the gate does not simply reject everything.
+    check("a freshened series is still allowed to decide",
+          pt._close_venue_confirmed("tv") and fresh)
+
+
+def test_total_fetch_failure_is_recorded_and_escalates():
+    """No series at all must be as audible as a WRONG series.
+
+    2026-09-18 review: this path returned after a bare print — no
+    `venue_warning`, no tick counter, no 🚨 — while the less severe
+    wrong-venue case escalated. The quieter alarm belonged to the worse outage.
+    """
+    n = pt.VENUE_STALE_ALERT_TICKS
+    snaps, outs = _run_ticks([("tv", None)] * n)
+    last = snaps[-1]["trades"][0]
+    check("total fetch failure leaves a record", last.get("venue_warning") is not None)
+    warn = last.get("venue_warning") or {}
+    check("the counter accumulates across ticks", warn.get("ticks") == n)
+    check("the reason says no series at all",
+          "no M30 series" in (warn.get("reason") or ""))
+    check("no lag is invented, but the key is present and null",
+          "lag_minutes" in warn and warn["lag_minutes"] is None)
+    check("the trade was not closed", last.get("status") == "LIVE")
+    check("it escalates like any other withhold",
+          any("🚨" in o for o in outs))
+
+
+def _run_forced_sim(close_bar_time, source="tv", verified=True, bad_seed=False):
+    """One tick with a HAND-BUILT closed sim result.
+
+    The guards below protect against the sim (or its inputs) reporting a close
+    that must not be booked, and `_simulate_staged_exit` cannot produce such a
+    result by construction — so the only way to pin them is to make the sim
+    misbehave on purpose. Returns (log, stdout).
+    """
+    seed_dt = datetime.now(timezone.utc) - timedelta(hours=4)
+    forced = {"closed": True, "result": "SL", "pnl_r": -1.0, "bars_held": 3,
+              "close_price": 4321.0, "tp1_hit": False, "tp2_hit": False,
+              "verified": verified, "data_source": source,
+              "close_bar_time": close_bar_time}
+    seed_trade = _sell_trade(seed_dt)
+    if bad_seed:
+        seed_trade["seeded_time"] = "not-a-timestamp"
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "paper_trade_log.json")
+        with open(path, "w") as fh:
+            json.dump({"trades": [seed_trade], "history": []}, fh)
+        orig = (pt.LOG_PATH, pt._fetch_m30, pt._simulate_staged_exit)
+        pt.LOG_PATH = path
+        pt._fetch_m30 = lambda *a, **k: _bars(seed_dt, source, 4210.0)
+        pt._simulate_staged_exit = lambda *a, **k: dict(forced)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                pt.check_outcomes({"price": 4285.0,
+                                   "intraday_source": "TradingView (OANDA:XAUUSD)"})
+            with open(path) as fh:
+                log = json.load(fh)
+        finally:
+            pt.LOG_PATH, pt._fetch_m30, pt._simulate_staged_exit = orig
+    return log, buf.getvalue()
+
+
+def test_close_bar_before_seed_is_withheld():
+    """Booking-time invariant: a deciding bar that is NOT after the seed must
+    never book a close.
+
+    This is the 09-14-01 incident class (a close decided by a pre-entry bar).
+    """
+    early = (datetime.now(timezone.utc) - timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    log, _ = _run_forced_sim(early)
+    check("pre-seed close is NOT booked", log.get("history") == [])
+    check("trade stays LIVE", log["trades"][0]["status"] == "LIVE")
+    unv = log["trades"][0].get("last_unverified") or {}
+    check("it is recorded as unverified", bool(unv))
+    check("the reason names the invariant",
+          "not after the seed" in (unv.get("reason") or ""))
+    check("the deciding bar is kept for audit", unv.get("close_bar_time") == early)
+
+
+def test_unreadable_deciding_bar_is_withheld():
+    """Fail-CLOSED when the deciding bar cannot be read.
+
+    The clock gate already withholds when the SERIES clock is unreadable, so
+    booking a close whose DECIDING bar is unreadable would apply the opposite
+    rule to the same question (kimi-k3 round 3). The withhold must also escalate
+    — a sim stuck reporting an unbookable close would otherwise be a silent
+    permanent no-close.
+    """
+    log, out = _run_forced_sim(None)
+    check("unreadable deciding bar does NOT book a close", log.get("history") == [])
+    check("trade stays LIVE", log["trades"][0]["status"] == "LIVE")
+    trade = log["trades"][0]
+    unv = trade.get("last_unverified") or {}
+    check("the reason says the bar time is unreadable",
+          "unreadable" in (unv.get("reason") or ""))
+    check("the withhold is recorded on the shared counter",
+          (trade.get("venue_warning") or {}).get("ticks") == 1)
+    check("and it is printed", "UNVERIFIED" in out or "⚠️" in out)
+
+
+def test_unreadable_seed_time_is_withheld():
+    """A corrupt `seeded_time` must not silently open the door.
+
+    The invariant guard used to sit inside `seed_dt is not None`, so an
+    unparseable `seeded_time` skipped the whole check and booked the close with
+    no record — the same fail-open shape the PR removes elsewhere.
+    """
+    log, _ = _run_forced_sim(
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), bad_seed=True)
+    check("unreadable seed does NOT book a close", log.get("history") == [])
+    check("trade stays LIVE", log["trades"][0]["status"] == "LIVE")
+    unv = log["trades"][0].get("last_unverified") or {}
+    check("the reason names the seed", "seed time unreadable" in (unv.get("reason") or ""))
+
+
+def test_run_backtest_refuses_unverifiable_clock():
+    """No lag measured → refuse. Same rule as the live path.
+
+    The future-series check alone left `lag is None` fail-OPEN in the research
+    path, which contradicted the gate's own principle.
+    """
+    orig = (pt._fetch_m30, pt._simulate_staged_exit)
+    called = []
+    seed_dt = datetime.now(timezone.utc) - timedelta(hours=2)
+    pt._fetch_m30 = lambda *a, **k: (_bars_without_time(seed_dt, 4300.0), "tv")
+    pt._simulate_staged_exit = lambda *a, **k: called.append(1) or {}
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            pt.run_backtest({"setups": [{"direction": "SELL", "entry": 4300.0,
+                                         "stop_loss": 4350.0, "tp1": 4250.0,
+                                         "tp2": 4200.0, "atr_30m": 15}],
+                             "generated_at": seed_dt.strftime("%Y-%m-%dT%H:%M:%SZ")})
+    finally:
+        pt._fetch_m30, pt._simulate_staged_exit = orig
+    out = buf.getvalue()
+    check("unverifiable clock → backtest refused", "unverifiable" in out)
+    check("no setup was simulated", called == [])
+
+
+def test_run_backtest_refuses_future_series():
+    """A FUTURE-dated series is never legitimate — backtest included.
+
+    "Stale" is the normal case for a backtest (it replays history) so that half
+    of the clock gate must NOT apply there; the future half must, or the
+    `utcfromtimestamp()` mirror would silently shift every backtest by 8h with no
+    gate and no warning.
+    """
+    seed_dt = datetime.now(timezone.utc) + timedelta(hours=2)
+    orig = (pt._fetch_m30, pt._simulate_staged_exit)
+    called = []
+    pt._fetch_m30 = lambda *a, **k: _bars(seed_dt, "tv", 4300.0)
+    pt._simulate_staged_exit = lambda *a, **k: called.append(1) or {}
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            pt.run_backtest({"setups": [{"direction": "SELL", "entry": 4300.0,
+                                         "stop_loss": 4350.0, "tp1": 4250.0,
+                                         "tp2": 4200.0, "atr_30m": 15}],
+                             "generated_at": datetime.now(timezone.utc).strftime(
+                                 "%Y-%m-%dT%H:%M:%SZ")})
+    finally:
+        pt._fetch_m30, pt._simulate_staged_exit = orig
+    out = buf.getvalue()
+    check("future series → backtest refused", "FUTURE" in out)
+    check("no setup was simulated", called == [])
+
+
 if __name__ == "__main__":
     tests = [
         test_tv_interval_members_exist,
@@ -238,6 +604,19 @@ if __name__ == "__main__":
         test_venue_warning_cleared_on_clean_tick,
         test_venue_warning_lifecycle_across_ticks,
         test_venue_deferral_counter_escalates,
+        test_series_freshness_is_a_precondition_not_an_accident,
+        test_stale_tv_series_cannot_close,
+        test_future_dated_series_cannot_close,
+        test_unreadable_series_times_cannot_close,
+        test_close_bar_time_recorded,
+        test_lag_probe_survives_weird_frames,
+        test_real_chain_local_stamps_survive_conversion,
+        test_total_fetch_failure_is_recorded_and_escalates,
+        test_close_bar_before_seed_is_withheld,
+        test_unreadable_deciding_bar_is_withheld,
+        test_unreadable_seed_time_is_withheld,
+        test_run_backtest_refuses_unverifiable_clock,
+        test_run_backtest_refuses_future_series,
     ]
     failed = 0
     for fn in tests:
