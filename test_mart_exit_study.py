@@ -32,7 +32,9 @@ def check(name, cond, detail=""):
 
 def synth_m15(n=60, seed=3, trend=0.5):
     rng = np.random.default_rng(seed)
-    idx = pd.date_range("2026-01-01", periods=n, freq="15min")
+    # Far in the past vs wall clock: detect_rebound_signal skips a still-forming
+    # last bar using pd.Timestamp.now(). Dates near "today" make that test flake.
+    idx = pd.date_range("2020-01-01", periods=n, freq="15min")
     base = 4000 + np.cumsum(rng.normal(trend, 3, n))
     o = base + rng.normal(0, 0.4, n)
     c = base + rng.normal(0, 0.4, n)
@@ -174,6 +176,34 @@ check("CI 有計到", lo is not None and hi is not None, f"[{lo}, {hi}]")
 check("CI 上下界次序正確", lo <= hi, f"[{lo}, {hi}]")
 check("明顯有 edge 嘅合成 case → delta > 0 且 CI 排除 0",
       delta > 0 and lo > 0, f"delta={delta:.3f} CI=[{lo:.3f}, {hi:.3f}]")
+
+print("\n=== 7. 對照組 n 跟 hold_bars（舊 hi=n-40 會長持倉 silent drop）===")
+n7 = 500
+idx7 = pd.date_range("2020-01-01", periods=n7, freq="15min")
+flat7 = pd.DataFrame({"Open": 4000.0, "High": 4000.0, "Low": 4000.0, "Close": 4000.0},
+                     index=idx7)
+flat7["ATR"] = 1.0
+hb = 96
+hi_new = mes._entry_hi(n7, hb)
+hi_old = n7 - 40
+check("_entry_hi(500, 96) == 404（n − hold_bars）", hi_new == 404, f"hi={hi_new}")
+check("_entry_hi 唔 floor 喺 21（短序列長持倉）", mes._entry_hi(100, 96) == 4,
+      f"got={mes._entry_hi(100, 96)}")
+empty = mes.random_entries(10, 20, 20, seed=1)
+check("空 pool → 空陣列（唔 crash）", len(empty) == 0)
+ri_old = mes.random_entries(80, 20, hi_old, seed=0)
+r_old = mes.sim_variant(flat7, ri_old, "timer", hold_bars=hb)
+check("舊 hi=n-40：sim_variant 會 drop 尾段對照組", len(r_old) < len(ri_old),
+      f"kept={len(r_old)}/{len(ri_old)}")
+ri_new = mes.random_entries(80, 20, hi_new, seed=0)
+r_new = mes.sim_variant(flat7, ri_new, "timer", hold_bars=hb)
+check("新 hi：對照組 sim 後 n 不變", len(r_new) == len(ri_new),
+      f"kept={len(r_new)}/{len(ri_new)}")
+sig7 = np.arange(50, 200, 20)
+s7, _, _, _, _ = mes.compare_with_random(
+    flat7, sig7, 3, exit_kind="timer", hold_bars=hb)
+check("compare_with_random 長持倉：信號 n 同輸入一樣",
+      s7.get("n") == len(sig7), f"n={s7.get('n')} sig={len(sig7)}")
 
 print("\n" + ("=" * 60))
 if FAILS:

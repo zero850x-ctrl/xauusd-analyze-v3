@@ -230,7 +230,24 @@ def random_entries(n, lo, hi, seed, exclude=None):
     pool = np.arange(lo, hi)
     if exclude is not None and len(exclude):
         pool = np.setdiff1d(pool, np.asarray(exclude), assume_unique=False)
+    if len(pool) == 0:
+        return np.asarray([], dtype=int)
     return np.sort(rng.choice(pool, size=min(n, len(pool)), replace=False))
+
+
+def _entry_hi(n_bars, hold_bars):
+    """Exclusive upper bound so `sim_variant` will not drop the trade for lack of exit bars.
+
+    Skip rule is `i + hold_bars > n - 1` → max inclusive i is `n - 1 - hold_bars`,
+    exclusive hi is `n - hold_bars`. Without this, random_entries(..., hi=n-40)
+    still draws bars that `sim_variant` silently continues past, so the control
+    n is smaller than the signal n (worse for long holds).
+    """
+    # Do not floor at 21: a long hold on a short series can have hi < 20.
+    # Flooring would sample bars that sim_variant then silently drops.
+    if not hold_bars:
+        return max(0, n_bars - 1)
+    return max(0, n_bars - int(hold_bars))
 
 
 def compare_with_random(df, idx, n_seeds=5, **params):
@@ -246,14 +263,23 @@ def compare_with_random(df, idx, n_seeds=5, **params):
       timer 1 bar 0.83×｜timer 4h 2.13×｜timer 24h **3.37×**｜SL/TP 1.65×
     後果：timer 24h 喺 iid 下 CI [+0.009, +2.613]（似有 edge），
     喺 block 下**含 0** → 唔可以當 edge。呢個就係偽重複嘅實際影響。
+    2026-09-19 review：per-trade mean 用 resampled 日權重；對照組 seed 均值
+    每輪重抽，唔當常數（否則 CI 只反映信號側、偏窄）。
     """
+    n_bars = len(df)
+    hb = params.get("hold_bars")
+    hi = _entry_hi(n_bars, hb)
+    idx = np.asarray(idx)
+    idx = idx[(idx >= 20) & (idx < hi)]
     s = summarize(sim_variant(df, idx, **params), "signal")
     # ⚠️ exclude=idx：mask 走信號 bar，令對照組係乾淨嘅「非信號」（外審 kimi-k3
     #    指出嘅 contamination —— 唔 mask 就會有 ~10% 對照樣本其實係處理組，
     #    令 delta 被系統性壓向 0）。
+    # ⚠️ hi=_entry_hi：對照組只抽「夠 bar 做完呢個 exit」嘅入場，否則
+    #    sim_variant 會 silently continue，控制組 n < 信號 n。
     rand_Es = []
     for seed in range(n_seeds):
-        ri = random_entries(len(idx), 20, len(df) - 40, seed, exclude=idx)
+        ri = random_entries(len(idx), 20, hi, seed, exclude=idx)
         rrecs = sim_variant(df, ri, **params)
         if rrecs:
             rand_Es.append(np.mean([r["pnl"] for r in rrecs]))
@@ -263,24 +289,32 @@ def compare_with_random(df, idx, n_seeds=5, **params):
     rand_mean = float(np.mean(rand_Es))
 
     # ---- block bootstrap：按日重抽，保留同期相關性 ----
+    # 分母用 resampled day_cnt 總和（真 per-trade mean），唔用 cnt_mean * n_days
+    # （每日單數唔均勻時後者偏）。對照組唔當常數：每輪從 seed 均值裏抽一個。
     recs = sim_variant(df, idx, **params)
     pnl = np.array([r["pnl"] for r in recs])
     days = pd.DatetimeIndex(df.index[np.array([r["i"] for r in recs])]).normalize()
     per = pd.DataFrame({"pnl": pnl, "day": days}).groupby("day")["pnl"]
     day_sum, day_cnt = per.sum().values, per.count().values
-    cnt_mean = float(day_cnt.mean()) if len(day_cnt) else 1.0
     rng = np.random.default_rng(13)
+    rand_Es = np.asarray(rand_Es, dtype=float)
     deltas = []
     for _ in range(4000):
         pick = rng.integers(0, len(day_sum), len(day_sum))
-        deltas.append(day_sum[pick].sum() / (cnt_mean * len(day_sum)) - rand_mean)
+        w = float(day_cnt[pick].sum())
+        if w <= 0:
+            continue
+        sig_mean = day_sum[pick].sum() / w
+        rand_b = float(rng.choice(rand_Es))
+        deltas.append(sig_mean - rand_b)
+    if len(deltas) < 50:
+        return s, rand_mean, s["E"] - rand_mean, None, None
     deltas.sort()
     lo = deltas[int(0.025 * len(deltas))]
-    hi = deltas[int(0.975 * len(deltas))]
-    # seed 之間離散（畀讀者睇對照組本身幾唔穩；外審 kimi-k3 §2b 要求量化）
+    hi_ci = deltas[int(0.975 * len(deltas))]
     s["rand_seed_spread"] = seed_spread
-    s["rand_seeds"] = len(rand_Es)
-    return s, rand_mean, s["E"] - rand_mean, lo, hi
+    s["rand_seeds"] = int(len(rand_Es))
+    return s, rand_mean, s["E"] - rand_mean, lo, hi_ci
 
 
 def show_control(rows, title):

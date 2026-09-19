@@ -12,6 +12,9 @@ p=0.0112（price-implied 口徑 p=0.1224）。
 但呢條規則**從來未喺我哋自己引擎度驗過**。呢支 script 就係做嗰件事 ——
 定義完全照抄（frozen 2026-09-12），只係數據換成 `trades_5y.json`。
 
+結論口徑：引擎 319 單嘅 chase 效果唔顯著；S3 長持倉嘅 iid permutation p
+（例如 0.0002）**唔可以當顯著證據**——持倉重疊，要以 thinned p 為準。
+
 用法:
     python3 chase_rule_ours.py                       # 用 trades_5y.json
     python3 chase_rule_ours.py --rows <dump.json>
@@ -52,7 +55,7 @@ def load_ohlc(csv_path, extra_paths=None):
             print("      → 結果**唔完整**（實測會靜默少算 33 筆）。要完整就自己傳 "
                   "--extra <klines.json>。")
             continue
-        rows = [{"datetime": dt.datetime.utcfromtimestamp(k[0] / 1000),
+        rows = [{"datetime": dt.datetime.fromtimestamp(k[0] / 1000, tz=dt.timezone.utc).replace(tzinfo=None),
                  "Open": float(k[1]), "High": float(k[2]),
                  "Low": float(k[3]), "Close": float(k[4]), "Volume": float(k[5])}
                 for k in json.load(open(p))]
@@ -267,7 +270,8 @@ def from_s3(a):
             print(f"   {name:9s} n={len(g):5d} win={win:5.1%} net={net:+10.1f} "
                   f"avg={net/max(1,len(g)):+7.3f}")
         p, obs = permutation_p([r["pnl"] for r in nc], [r["pnl"] for r in ch], a.iters)
-        print(f"   no-chase minus chase = {obs:+7.3f}/trade   p={p:.4f}")
+        print(f"   no-chase minus chase = {obs:+7.3f}/trade   p={p:.4f}"
+              f"  （iid / 重疊持倉 → 唔引用）")
 
         # ⚠️ 誠實版：p 用**無重疊**（thinned）樣本重算。
         # 為何（2026-09-19 外審 kimi-k3 §1）：持倉 96 bar 而信號平均相隔 ~10 bar
