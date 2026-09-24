@@ -109,7 +109,7 @@ Architecture: fetch_data → add_indicators → find_swings → detect patterns
 → inject kline scores (step 7b) → generate report (reuses kline_* fields)
 """
 
-import os, json, argparse
+import os, json, argparse, sys
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 import numpy as np
@@ -2239,6 +2239,70 @@ def cron_push_eligible(setup):
     if entry_mode in ('pullback', 'boundary', 'fib', 'fib0786'):
         return priority <= 3
     return priority <= 2
+
+
+_CONTRACT_GAP_SEEN = set()
+
+
+def _report_contract_gap(setup):
+    """「eligible 但缺 push_suppressed」= producer 契約破損，要出聲（唔可以靜默）。
+
+    刻意保留 `push_eligible()` 嘅 fail-open 回傳值（要 mirror 歷史，見其
+    docstring），但唔可以連警告都冇：新 producer 若唔記得跑
+    `_inject_push_metadata`，一個 0-15% 勝率嘅限價訊號會被當成可推送
+    → 直接去真錢用戶。守衛唔可以係 no-op（同類：重試語義／靜默失敗家族）。
+
+    警告去 **stderr** —— 唔污染 stdout（cron 報告由 stdout／JSON 驅動），
+    並按 (entry_mode, pattern) 去重，免得掃 79 日歷史報告時洗版。
+    """
+    key = (setup.get('entry_mode'), setup.get('pattern'))
+    if key in _CONTRACT_GAP_SEEN:
+        return
+    _CONTRACT_GAP_SEEN.add(key)
+    print(f"⚠️ producer contract: eligible setup 缺 push_suppressed "
+          f"(entry_mode={setup.get('entry_mode')!r}, pattern={setup.get('pattern')!r}) "
+          f"— fail-open 放行; 若見於**新**報告 = _inject_push_metadata 冇跑",
+          file=sys.stderr)
+
+
+def push_eligible(setup):
+    """最終推送規則 — 「呢個 setup 會被推去 WhatsApp／Hermes 嗎？」嘅唯一真相。
+
+    2026-09-24 抽出：原本 `main()` 嘅 `push_candidates` 係 inline 兩條件，
+    `backtest.py` 只抄咗第一條（`cron_push_eligible`）而漏咗 `push_suppressed`
+    → 回測會 trade 四個限價模式（boundary/pullback/fib/fib0786），而**現行策略**
+    唔推呢批。實測同一 6 個月：97 單 vs 82 單（15 單 = 15% 係推唔到嘅），
+    勝率 45.4% vs 53.7%。n=15 本身喺噪音範圍 —— 呢個修嘅價值係 **fidelity**
+    （回測要 mirror live 實際會推嘅嘢），唔係「回測變好咗」，唔好當 alpha 證據。
+
+    抽出單一真相函數嘅目的係令「兩份實作各自漂移」唔會再無聲發生（本次事故
+    正是如此：一個條件被抄漏，冇任何東西會發現）。
+
+    回測 mirror 嘅係**現行**推送政策（`_inject_push_metadata` 每個 bar 都寫
+    bool），唔係 09-08 之前嗰段日曆。`run_backtest` 唔會行到缺 key 分支。
+
+    ⚠️ 缺 `push_suppressed` key 時 fail-open（回 True）只服務**舊 JSON**：
+    09-08 之前嘅報告有 `cron_push_eligible=True` 但冇呢個欄（當時限價係有推）。
+    key **存在但唔係 bool**（`null` / `1` / `"True"`）係契約破損，**fail-closed**
+    （只有明確 `False` 先當「冇壓制」），同時 `_report_contract_gap()` 出聲。
+    缺 key 都出聲，但回傳值保持 fail-open，先唔會改寫嗰批舊報告。
+
+    ⚠️ 同 `cron_push_eligible` 嘅分工（兩者係唔同問題，唔可以互換）:
+      • `cron_push_eligible` = 紀律閘／「可執行嗎」→ paper_trade seeding 用佢。
+        限價模式經 walk-forward 證實無 edge，唔推送但要照 seed（累積真 fill
+        樣本做裁決）。
+      • `push_eligible` = 推送閘 → 報告／cron／回測用佢。
+    任何「決定會被推嗎」嘅消費者（含 backtest harness）一律 call 呢個，
+    唔好自己讀 `cron_push_eligible`（2026-09-24 事故正是如此）。
+    """
+    cron_ok = setup.get('cron_push_eligible') is True
+    has_key = 'push_suppressed' in setup
+    val = setup.get('push_suppressed')
+    if cron_ok and not isinstance(val, bool):
+        _report_contract_gap(setup)
+    if not has_key:
+        return cron_ok
+    return cron_ok and val is False
 
 
 def _parse_entry_price_from_setup(setup, current_price=None):
@@ -4654,11 +4718,9 @@ def main():
             # 2026-09-08 (Cursor round-2 follow-up): code-level push list so the
             # cron prompt doesn't have to re-derive push eligibility by reading
             # flags via natural language. Prompt reads ONLY this list.
-            'push_candidates': [
-                s for s in setups
-                if s.get('cron_push_eligible') is True
-                and s.get('push_suppressed') is not True
-            ],
+            # 2026-09-24: 改為 call `push_eligible()` 單一真相 —— 呢兩條條件
+            # 曾經喺 backtest.py 被抄漏一半（見 push_eligible docstring）。
+            'push_candidates': [s for s in setups if push_eligible(s)],
         }
         json_path = output_path.replace('.md', '.json')
         with open(json_path, 'w', encoding='utf-8') as f:

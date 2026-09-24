@@ -1,0 +1,33 @@
+{
+  "setups": [
+    {
+      "pattern": "BO",
+      "direction": "BUY",
+      "entry_price": 4000,
+      "priority": 2,
+      "cron_push_eligible": true,
+      "push_suppressed": false,
+      "entry_mode": "breakout"
+    },
+    {
+      "pattern": "BD",
+      "direction": "SELL",
+      "entry_price": 4100,
+      "priority": 3,
+      "cron_push_eligible": true,
+      "push_suppressed": true,
+      "entry_mode": "boundary"
+    }
+  ],
+  "push_candidates": [
+    {
+      "pattern": "BO",
+      "direction": "BUY",
+      "entry_price": 4000,
+      "priority": 2,
+      "cron_push_eligible": true,
+      "push_suppressed": false,
+      "entry_mode": "breakout"
+    }
+  ]
+}

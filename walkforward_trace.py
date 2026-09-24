@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Trace the limit-order lifecycle: PEND count, FILL count, EXP (unfilled expiry)."""
+"""Trace the limit-order lifecycle: PEND count, FILL count, EXP (unfilled expiry).
+
+Default push gate drops limit modes. Set LIMIT_MODE_PUSH=1 or pend stays empty.
+"""
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from collections import Counter

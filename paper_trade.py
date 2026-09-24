@@ -144,6 +144,18 @@ def _setup_is_seedable(setup):
     return '等待' not in status
 
 
+def _ledger_push_suppressed(setup):
+    """Tri-state provenance for the paper ledger.
+
+    True/False only when the producer stored a bool. Missing or null stays
+    None — coercing that to False would label unknown seeds as "was pushed".
+    """
+    if not isinstance(setup, dict):
+        return None
+    val = setup.get('push_suppressed')
+    return val if isinstance(val, bool) else None
+
+
 def _parse_entry_from_setup(setup, current_price):
     """Parse machine-readable entry price from setup JSON."""
     if setup.get('entry_price') is not None:
@@ -1535,6 +1547,15 @@ def seed_trades(data, setups=None):
             "rr_tp1": round(rr_tp1, 2),
             "lot_size": vol,
             "cron_push_eligible": True,
+            # 2026-09-24（外審 finding 5）: 記 provenance。seeding 刻意唔受
+            # push_suppressed 影響（限價模式唔推送但要照 seed 去累積真 fill
+            # 樣本），但咁樣 ledger 就混合咗兩個 population：「live 會推」同
+            # 「live 永遠唔推（實驗）」。冇呢個欄位，下游分唔開 —— 任何人將
+            # paper 績效讀做 would-be-live 表現，睇到嘅數字都係污染嘅（同
+            # backtest 97 單事故同一種病，只係搬咗去 ledger）。
+            # ⚠️ 雙軌統計（live_mirror vs experimental）係 follow-up；呢度先
+            # 保住資料 —— 唔記就永遠冇得補。
+            "push_suppressed": _ledger_push_suppressed(s),
             "quality_grade": s.get("quality", "?"),
             "priority": s.get("priority", 99),
             "counter_trend_severity": s.get("counter_trend_severity", "?"),

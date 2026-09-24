@@ -57,6 +57,7 @@ from analyze_v3 import (
     _inject_kline_scores,
     _inject_push_metadata,
     _time_quality_for_hour,
+    push_eligible,
     BROKER_UTC_OFFSET_HOURS,
     TRAIL_PROFIT_ATR,
     TRAIL_STOP_ATR,
@@ -559,8 +560,18 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
         side = 'BUY' if is_buy else 'SELL'
         entry_mode = s.get('entry_mode', 'breakout')
 
-        # ── 2026-08-08 FIX: enforce cron_push_eligible gate (aligned with paper_trade) ──
-        if not s.get('cron_push_eligible', False):
+        # ── 2026-09-24 FIX: 用 `push_eligible()`（推送閘），唔係 paper seed 嘅紀律閘 ──
+        # 原本只讀 cron_push_eligible → 漏咗 push_suppressed ⇒ 回測會 trade 四個
+        # 限價模式（boundary/pullback/fib/fib0786），而現行策略唔推（2026-09-08
+        # walk-forward 裁決：真 fill 後 0-15% 勝率，近乎零成交）。實測同一 6 個月：
+        # 97 單／勝率 45.4%／PF 1.14（舊）vs 82 單／53.7%／PF 1.20（修好後）。
+        # ⚠️ 呢個改動順手收緊咗**型別**：舊寫法 `s.get(..., False)` 對 truthy
+        # 非-bool（1／"True"）會放行，新寫法 `is True` 同 live 一致。實測 79 日
+        # 真報告零個非-bool 值 ⇒ 對歷史數字零影響，但值得知（若有舊資料源出過
+        # truthy 值，單數會再變）。
+        # 呢個 gate 會被所有經 run_backtest 嘅 harness 繼承（yearly_breakdown、
+        # analyze_entry_split、walkforward_*、reconcile_boundary、verify_*）。
+        if not push_eligible(s):
             continue
 
         entry_str = s.get('entry_trigger', '')

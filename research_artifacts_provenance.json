@@ -1,0 +1,6 @@
+{
+  "status": "stale_pre_push_gate_parity",
+  "do_not_cite_as_current_live_mirror": true,
+  "files": ["trades_5y.json", "entry_split.json", "yearly_breakdown.json"],
+  "why": "Dumped before backtest.setups_to_trades called push_eligible. trades_5y.json is 319 trades (breakout 285 + boundary 34). Default run_backtest now drops limit modes. Regenerate before citing, or set LIMIT_MODE_PUSH=1 only when the study is about those modes."
+}

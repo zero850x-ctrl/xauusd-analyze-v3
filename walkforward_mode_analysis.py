@@ -5,6 +5,9 @@ Walk-forward analysis (claude-fable-5-1 recommendation, 2026-09-08):
 - Per entry_mode: expectancy, PF, max drawdown, win rate, fill rate
 - Real spread in backtest (SLIPPAGE_TICKS=0.15/side, 0.30 round-trip = live MART_COST_PER_OZ)
 - Limit-fill verification ON: boundary/pullback/fib fill only on bar-touch
+
+Default run_backtest mirrors the current push gate and drops limit modes.
+Set LIMIT_MODE_PUSH=1 before running if this study needs those modes.
 """
 import sys, os, statistics
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

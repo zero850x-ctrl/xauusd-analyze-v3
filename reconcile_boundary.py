@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Reconcile boundary TEST numbers: 23.1% win / E(R) +0.56 / PF 1.02
-Check per-trade pnl_r vs pnl_$ basis and position sizes."""
+Check per-trade pnl_r vs pnl_$ basis and position sizes.
+
+Default run_backtest drops limit modes. Set LIMIT_MODE_PUSH=1 first.
+"""
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from backtest import fetch_backtest_data, run_backtest
@@ -12,6 +15,9 @@ trades = run_backtest(bars.iloc[mid:], day, verbose=False)
 
 boundary = [t for t in trades if t.entry_mode == 'boundary']
 print(f"boundary TEST n={len(boundary)}")
+if not boundary:
+    print("limit modes are push-suppressed by default. Re-run with LIMIT_MODE_PUSH=1.")
+    sys.exit(2)
 print("\nper-trade:")
 for t in boundary:
     risk = abs(t.entry_price - t.stop_price)

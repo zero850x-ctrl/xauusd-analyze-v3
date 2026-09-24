@@ -18,7 +18,7 @@ XAUUSD / 黃金技術分析 + 紙交易監控系統。由 Hermes Agent cron job 
 
 1. **分析**：`analyze_v3.py --json` 生成 setup（形態辨識、趨勢、K線確認、R:R 評級）
 2. **新鮮度檢查**：報告檔案超過 5 分鐘 → 停止並回報
-3. **讀取 setup**：提取 `setups[]`，只保留 `cron_push_eligible == true`
+3. **讀取 setup**：提取 `setups[]`，只保留**推送閘**通過者 —— `analyze_v3.push_eligible()` = `cron_push_eligible == true` **且** `push_suppressed != true`。報告已預濾成 JSON `push_candidates[]`，cron 只讀呢個 list（唔好自己重新推導）
 4. **數據源完整性檢查**（2026-08-24 新增）：
    - `TradingView (OANDA:XAUUSD)`：正常，可推送
    - `Yahoo Finance PAXG-USD (現貨錨定)`：可信，可推送（如實標註）
@@ -49,6 +49,12 @@ TradingView OANDA spot  →  PAXG-USD (yfinance, 現貨錨定, 差 ~$7)  →  GC
 - **Momentum-hold 續算**（2026-09-08）：`check_outcomes` 每次 cron 持久化 `sim_state`（tp1_hit / trail_stop / r_tp1 …）；若 M30 bar window 唔夠追溯到 seed bar，由持久化狀態續算，唔會忘記 TP1/BE 而喺 −1R 平倉
 - **SL floor**：`SL_MIN_ATR_MULT=0.8`（2026-08-22 由 0.5 提高，減少 noise stop-out）
 - **Seed dedup**（2026-08-24 / PR #28）：同 pattern+direction+entry_mode 已 LIVE（任何日）或今日 CLOSED → skip；trade ID 用 trades+history max suffix +1
+- **推送閘 vs 紀律閘（2026-09-24，唔可以互換）**：兩個唔同問題，各自一個入口 ——
+  - `analyze_v3.push_eligible(setup)` = **推送閘**：「會被推去 WhatsApp／Hermes 嗎」。報告層（`push_candidates[]`）、cron、**回測**一律讀呢個。
+  - `analyze_v3.cron_push_eligible(setup)` = **紀律閘**：「可執行嗎」。`paper_trade.py` seed 讀呢個。
+  兩者刻意唔一致：四個限價模式（`boundary`/`pullback`/`fib`/`fib0786`）經 2026-09-08 walk-forward 裁決**唔推送**（真 fill 後 0-15% 勝率、近乎零成交；**09-08 之前係有推**，真 fill 樣本正係嗰時累積），但**照樣 seed** 去累積三個月真 fill 樣本。唔好「順手對齊」—— 對齊 seeding 就等於放棄嗰批樣本。
+  事故：`backtest.py` 原本只讀 `cron_push_eligible`，漏咗 `push_suppressed` ⇒ 回測 trade 咗現行策略唔推嘅限價單。同一 6 個月實測：**97 單／勝率 45.4%／PF 1.14（舊）vs 82 單／53.7%／PF 1.20（修好後）** —— 15 單（15%）係推唔到嘅。⚠️ n=15 本身喺**噪音範圍**，呢個修嘅價值係 **fidelity**（回測要 mirror live 實際會推嘅嘢），**唔係 alpha 證據**，唔好引用嚟講「回測變好」。缺口會傳染全部經 `run_backtest` 嘅 harness（`yearly_breakdown`、`analyze_entry_split`、`walkforward_*`、`reconcile_boundary`、`verify_*`）。回歸保護 = `test_backtest_push_gate_parity.py`（fixture `testdata/push_gate/`，唔靠 `~/.hermes/reports`）。回測 mirror **現行**推送政策，唔係 09-08 之前嘅日曆。研究限價模式要設 `LIMIT_MODE_PUSH=1`（`walkforward_mode_analysis`、`reconcile_boundary`、`walkforward_trace`、`analyze_entry_split`）。`trades_5y.json` / `entry_split.json` / `yearly_breakdown.json` 係閘之前嘅 dump（見 `research_artifacts_provenance.json`），唔好當現行 live-mirror。
+- **Ledger provenance（2026-09-24，未完成 — follow-up）**：`push_suppressed` 已經寫入 paper trade 記錄，但**統計仍然混軌**。因為 seeding 刻意唔受 suppression 影響，ledger 同時裝住「live 會推」同「live 唔會推（實驗）」兩個 population；任何人將 paper 績效讀做 would-be-live 表現，數字都係污染嘅（同上面 backtest 事故係同一種病，只係搬咗去 ledger）。**待做**：所有 ledger 統計雙軌 —— per-mode 裁決讀 `experimental`（`push_suppressed=True`），aggregate 績效讀 `live_mirror`。
 
 ## 已知事故記錄
 
@@ -71,7 +77,7 @@ python3 paper_trade.py --backtest
 # Guard 離線測試（單一檔；全部測試請用下面嘅 run_tests.sh）
 python3 scripts/test_paper_trade_guards.py
 
-# 全部測試 —— 掃 repo root 同 scripts/ 兩邊（root 13 + scripts 7 = 20 個）
+# 全部測試 —— 掃 repo root 同 scripts/ 兩邊
 bash run_tests.sh
 ```
 > 跑測試一律用 `bash run_tests.sh`（唔好自己 `python3 test_*.py`：root glob 會漏晒 `scripts/` 嗰批 stacking / seed / path-overlay 斷言）。exit 0 = 全部 test pass 而且 run 期間冇 test 寫到 `~/.hermes/reports/*.json`。
