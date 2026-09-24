@@ -221,6 +221,113 @@ if pt is not None:
           pt._setup_is_seedable(_sup2) is True)
     check("E2 同一 setup：seed 放行但 push 拒收（兩者係唔同問題）",
           pt._setup_is_seedable(_sup2) is True and av.push_eligible(_sup2) is False)
+    # 外審 finding 5：ledger 要記 provenance，否則「live-mirror」同「實驗性」
+    # 兩個 population 冇得分開統計。呢度釘住 seed 記錄有保存嗰個欄位。
+    _ptsrc = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "paper_trade.py"), encoding="utf-8").read()
+    check("E3 seed 記錄有保存 push_suppressed（provenance，外審 finding 5）",
+          '"push_suppressed": bool(s.get("push_suppressed"))' in _ptsrc)
+
+print("== F. Anti-drift guard：生產消費者唔可以自己 inline 呢條規則 ==")
+# 本次事故根因 = 有第二份複本。呢個 guard 唔定義語義（語義由 push_eligible
+# 定義），只係禁止複製 —— 同「唔靠 source grep 做真值表」嘅原則無衝突。
+# 精確度刻意收窄到「同一行同時出現兩個 token」= 真正嘅 rule 重實作；
+# paper_trade 記 provenance 係另一行，唔會誤中。純註釋行要剔走 —— 註釋**講**
+# 呢條規則（例如 backtest.py 解釋歷史）係好事，唔算重實作。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _fn in ("backtest.py", "paper_trade.py", "xauusd_report.py"):
+    _p = os.path.join(_HERE, _fn)
+    if not os.path.exists(_p):
+        continue
+    _bad = [i + 1 for i, l in enumerate(open(_p, encoding="utf-8").read().splitlines())
+            if not l.lstrip().startswith("#")
+            and "cron_push_eligible" in l and "push_suppressed" in l]
+    check(f"F[{_fn}] 冇 inline 重實作（同一行兩個 token）", not _bad, f"lines={_bad}")
+check("F[backtest.py] 真嘅 call push_eligible(",
+      "push_eligible(s)" in open(os.path.join(_HERE, "backtest.py"),
+                                 encoding="utf-8").read())
+
+print("== G. Producer 契約破損要出聲（fail-open 但唔可以靜默）==")
+import io
+import contextlib
+
+av._CONTRACT_GAP_SEEN.clear()
+_gap_setup = {"cron_push_eligible": True, "push_suppressed": None,
+              "entry_mode": "boundary", "pattern": "GAP-TEST"}
+del _gap_setup["push_suppressed"]
+_buf = io.StringIO()
+with contextlib.redirect_stderr(_buf):
+    _g = av.push_eligible(_gap_setup)
+check("G1 缺 key 仍然 fail-open（回傳值唔變，mirror 歷史）", _g is True)
+check("G2 但同時印警告上 stderr（唔可以 no-op）",
+      "producer contract" in _buf.getvalue(), _buf.getvalue()[:80])
+_buf2 = io.StringIO()
+with contextlib.redirect_stderr(_buf2):
+    av.push_eligible(_gap_setup)
+check("G3 同一個 (mode, pattern) 唔會重覆洗版", _buf2.getvalue() == "")
+_buf3 = io.StringIO()
+with contextlib.redirect_stderr(_buf3):
+    av.push_eligible({"cron_push_eligible": True, "push_suppressed": False,
+                      "entry_mode": "breakout", "pattern": "OK-TEST"})
+check("G4 正常 setup（有 key）唔會出警告", _buf3.getvalue() == "")
+
+print("== H. 壓制判定同日期無關（防將來有人改成 date-gated）==")
+_real_dt = av.datetime
+
+
+class _FrozenDT(_real_dt):
+    _fixed = _real_dt(2000, 1, 1)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._fixed if tz is None else cls._fixed.astimezone(tz)
+
+
+def _suppressed_at(datestr, mode="boundary"):
+    _FrozenDT._fixed = _real_dt.fromisoformat(datestr)
+    av.datetime = _FrozenDT
+    try:
+        return inject(mode).get("push_suppressed")
+    finally:
+        av.datetime = _real_dt
+
+
+try:
+    _sep = _suppressed_at("2026-09-05T10:00:00+00:00")
+    _dec = _suppressed_at("2026-12-05T10:00:00+00:00")
+    _old = _suppressed_at("2026-01-05T10:00:00+00:00")
+    check("H1 同一 mode 喺三個日期壓制結果一致（唔係 date-gated）",
+          _sep is True and _dec is True and _old is True,
+          f"sep={_sep} dec={_dec} jan={_old}")
+except Exception as e:
+    av.datetime = _real_dt
+    check(f"H1 時鐘 frozen 測試（例外: {type(e).__name__}）", False, str(e)[:80])
+
+print("== I. fail-open 分支係 load-bearing（真歷史有數據行到）==")
+# 外審 finding 1：我原本用「忠於 live」論證 fail-open，但 refactor 之後
+# push_eligible 自己就係定義 → 循環論證。真正理由係歷史契約，呢度量度出嚟：
+# 改 fail-closed 會改動幾多筆真歷史記錄。
+_n_gap = 0
+_n_diff = 0
+for _f in _reports:
+    try:
+        with open(_f) as fh:
+            _d2 = json.load(fh)
+    except Exception:
+        continue
+    for _s in (_d2.get("setups") or []):
+        _fo = (_s.get("cron_push_eligible") is True
+               and _s.get("push_suppressed") is not True)
+        _fc = (_s.get("cron_push_eligible") is True
+               and _s.get("push_suppressed") is False)
+        if _fo != _fc:
+            _n_diff += 1
+            if "push_suppressed" not in _s:
+                _n_gap += 1
+check("I1 真歷史確實行到 fail-open 分支（>=1 筆）", _n_gap >= 1, f"n={_n_gap}")
+check("I2 fail-closed 會改動嘅歷史筆數 == fail-open 分支筆數",
+      _n_diff == _n_gap, f"diff={_n_diff} gap={_n_gap}")
+print(f"     （實測：改 fail-closed 會改動 {_n_diff} 筆真歷史嘅推送判定）")
 
 print()
 print("=" * 70)

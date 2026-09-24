@@ -52,8 +52,9 @@ TradingView OANDA spot  →  PAXG-USD (yfinance, 現貨錨定, 差 ~$7)  →  GC
 - **推送閘 vs 紀律閘（2026-09-24，唔可以互換）**：兩個唔同問題，各自一個入口 ——
   - `analyze_v3.push_eligible(setup)` = **推送閘**：「會被推去 WhatsApp／Hermes 嗎」。報告層（`push_candidates[]`）、cron、**回測**一律讀呢個。
   - `analyze_v3.cron_push_eligible(setup)` = **紀律閘**：「可執行嗎」。`paper_trade.py` seed 讀呢個。
-  兩者刻意唔一致：四個限價模式（`boundary`/`pullback`/`fib`/`fib0786`）經 2026-09-08 walk-forward 裁決**唔推送**（真 fill 後 0-15% 勝率、近乎零成交），但**照樣 seed** 去累積三個月真 fill 樣本。唔好「順手對齊」—— 對齊 seeding 就等於放棄嗰批樣本。
-  事故：`backtest.py` 原本只讀 `cron_push_eligible`，漏咗 `push_suppressed` ⇒ 回測 trade 咗 live 永遠唔推嘅限價單。同一 6 個月實測：**97 單／勝率 45.4%／PF 1.14（舊）vs 82 單／53.7%／PF 1.20（修好後）**，即過往 `backtest_*.md` 數字混入咗推唔到嘅單，而且係拖低方向。缺口會傳染全部經 `run_backtest` 嘅 harness（`yearly_breakdown`、`analyze_entry_split`、`walkforward_*`、`reconcile_boundary`、`verify_*`）。回歸保護 = `test_backtest_push_gate_parity.py`（真 emitter + 真歷史 JSON 契約 + 行為 + mutation 5/5）。
+  兩者刻意唔一致：四個限價模式（`boundary`/`pullback`/`fib`/`fib0786`）經 2026-09-08 walk-forward 裁決**唔推送**（真 fill 後 0-15% 勝率、近乎零成交；**09-08 之前係有推**，真 fill 樣本正係嗰時累積），但**照樣 seed** 去累積三個月真 fill 樣本。唔好「順手對齊」—— 對齊 seeding 就等於放棄嗰批樣本。
+  事故：`backtest.py` 原本只讀 `cron_push_eligible`，漏咗 `push_suppressed` ⇒ 回測 trade 咗現行策略唔推嘅限價單。同一 6 個月實測：**97 單／勝率 45.4%／PF 1.14（舊）vs 82 單／53.7%／PF 1.20（修好後）** —— 15 單（15%）係推唔到嘅。⚠️ n=15 本身喺**噪音範圍**，呢個修嘅價值係 **fidelity**（回測要 mirror live 實際會推嘅嘢），**唔係 alpha 證據**，唔好引用嚟講「回測變好」。缺口會傳染全部經 `run_backtest` 嘅 harness（`yearly_breakdown`、`analyze_entry_split`、`walkforward_*`、`reconcile_boundary`、`verify_*`）。回歸保護 = `test_backtest_push_gate_parity.py`（45 斷言：真 emitter + 真歷史 JSON 契約 + 行為 + anti-drift guard + mutation 9/9）。
+- **Ledger provenance（2026-09-24，未完成 — follow-up）**：`push_suppressed` 已經寫入 paper trade 記錄，但**統計仍然混軌**。因為 seeding 刻意唔受 suppression 影響，ledger 同時裝住「live 會推」同「live 唔會推（實驗）」兩個 population；任何人將 paper 績效讀做 would-be-live 表現，數字都係污染嘅（同上面 backtest 事故係同一種病，只係搬咗去 ledger）。**待做**：所有 ledger 統計雙軌 —— per-mode 裁決讀 `experimental`（`push_suppressed=True`），aggregate 績效讀 `live_mirror`。
 
 ## 已知事故記錄
 
