@@ -2241,6 +2241,28 @@ def cron_push_eligible(setup):
     return priority <= 2
 
 
+def push_eligible(setup):
+    """最終推送規則 — 「呢個 setup 會被推去 WhatsApp／Hermes 嗎？」嘅唯一真相。
+
+    2026-09-24 抽出：原本 `main()` 嘅 `push_candidates` 係 inline 兩條件，
+    `backtest.py` 只抄咗第一條（`cron_push_eligible`）而漏咗 `push_suppressed`
+    → 回測會 trade 四個限價模式（boundary/pullback/fib/fib0786），而 live 從來
+    唔推呢批。實測同一 6 個月：回測 97 單 vs live-faithful 82 單，勝率
+    45.4% vs 53.7%、PF 1.14 vs 1.20 — 即係過往 backtest 數字混入咗推唔到嘅單，
+    而且係拖低嘅方向。抽出單一真相函數令同類 drift 唔會再無聲發生。
+
+    ⚠️ 同 `cron_push_eligible` 嘅分工（兩者係唔同問題，唔可以互換）:
+      • `cron_push_eligible` = 紀律閘／「可執行嗎」→ paper_trade seeding 用佢。
+        限價模式經 walk-forward 證實無 edge，**唔推送但要照 seed**（累積真
+        fill 樣本），所以 seeding 讀 `cron_push_eligible` 唔讀呢個函數。
+      • `push_eligible` = 推送閘 → 報告／cron／回測用佢。
+    任何「決定會被推嗎」嘅消費者（含 backtest harness）一律 call 呢個，
+    唔好自己讀 `cron_push_eligible`（2026-09-24 事故正是如此）。
+    """
+    return (setup.get('cron_push_eligible') is True
+            and setup.get('push_suppressed') is not True)
+
+
 def _parse_entry_price_from_setup(setup, current_price=None):
     """Machine-readable entry price for paper_trade / backtest seeding."""
     if setup.get('entry_price') is not None:
@@ -4654,11 +4676,9 @@ def main():
             # 2026-09-08 (Cursor round-2 follow-up): code-level push list so the
             # cron prompt doesn't have to re-derive push eligibility by reading
             # flags via natural language. Prompt reads ONLY this list.
-            'push_candidates': [
-                s for s in setups
-                if s.get('cron_push_eligible') is True
-                and s.get('push_suppressed') is not True
-            ],
+            # 2026-09-24: 改為 call `push_eligible()` 單一真相 —— 呢兩條條件
+            # 曾經喺 backtest.py 被抄漏一半（見 push_eligible docstring）。
+            'push_candidates': [s for s in setups if push_eligible(s)],
         }
         json_path = output_path.replace('.md', '.json')
         with open(json_path, 'w', encoding='utf-8') as f:
