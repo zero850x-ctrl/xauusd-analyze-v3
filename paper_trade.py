@@ -144,6 +144,18 @@ def _setup_is_seedable(setup):
     return '等待' not in status
 
 
+def _ledger_push_suppressed(setup):
+    """Tri-state provenance for the paper ledger.
+
+    True/False only when the producer stored a bool. Missing or null stays
+    None — coercing that to False would label unknown seeds as "was pushed".
+    """
+    if not isinstance(setup, dict):
+        return None
+    val = setup.get('push_suppressed')
+    return val if isinstance(val, bool) else None
+
+
 def _parse_entry_from_setup(setup, current_price):
     """Parse machine-readable entry price from setup JSON."""
     if setup.get('entry_price') is not None:
@@ -1543,7 +1555,7 @@ def seed_trades(data, setups=None):
             # backtest 97 單事故同一種病，只係搬咗去 ledger）。
             # ⚠️ 雙軌統計（live_mirror vs experimental）係 follow-up；呢度先
             # 保住資料 —— 唔記就永遠冇得補。
-            "push_suppressed": bool(s.get("push_suppressed")),
+            "push_suppressed": _ledger_push_suppressed(s),
             "quality_grade": s.get("quality", "?"),
             "priority": s.get("priority", 99),
             "counter_trend_severity": s.get("counter_trend_severity", "?"),

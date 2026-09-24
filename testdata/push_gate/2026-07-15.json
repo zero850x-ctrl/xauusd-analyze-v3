@@ -1,0 +1,22 @@
+{
+  "setups": [
+    {
+      "pattern": "Hist Gap",
+      "direction": "SELL",
+      "entry_price": 3300,
+      "priority": 2,
+      "cron_push_eligible": true,
+      "entry_mode": "boundary"
+    }
+  ],
+  "push_candidates": [
+    {
+      "pattern": "Hist Gap",
+      "direction": "SELL",
+      "entry_price": 3300,
+      "priority": 2,
+      "cron_push_eligible": true,
+      "entry_mode": "boundary"
+    }
+  ]
+}

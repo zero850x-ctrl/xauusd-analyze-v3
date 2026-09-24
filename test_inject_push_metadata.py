@@ -81,8 +81,7 @@ for mode in ("boundary", "pullback", "fib", "fib0786"):
     check(f"{mode}: limit_mode_blocked=True", s.get("limit_mode_blocked") is True)
     # The 3-month verdict pipeline: setup appears in setups (recorded) but NOT
     # in push_candidates (not pushed). This is the exact blocker contract.
-    is_pc = s.get("cron_push_eligible") is True and s.get("push_suppressed") is not True
-    check(f"{mode}: eligible 但唔喺 push_candidates", not is_pc)
+    check(f"{mode}: eligible 但唔喺 push_candidates", av.push_eligible(s) is False)
 
 print("== 2. breakout 唔受影響（priority ≤2 先 eligible）==")
 s = run_inject("breakout", priority=3)
@@ -91,15 +90,13 @@ check("breakout(p3): cron_push_eligible=False (breakout 要 ≤2)",
       s.get("cron_push_eligible") is False, f"={s.get('cron_push_eligible')}")
 s2 = run_inject("breakout", priority=2)
 check("breakout(p2): cron_push_eligible=True", s2.get("cron_push_eligible") is True)
-is_pc = s2.get("cron_push_eligible") is True and s2.get("push_suppressed") is not True
-check("breakout(p2): 喺 push_candidates", is_pc)
+check("breakout(p2): 喺 push_candidates", av.push_eligible(s2) is True)
 
 print("== 3. LIMIT_MODE_PUSH=1 恢復推送 ==")
 s = run_inject("boundary", env="1")
 check("boundary+env1: push_suppressed=False", s.get("push_suppressed") is False)
 check("boundary+env1: cron_push_eligible=True", s.get("cron_push_eligible") is True)
-is_pc = s.get("cron_push_eligible") is True and s.get("push_suppressed") is not True
-check("boundary+env1: 喺 push_candidates（恢復）", is_pc)
+check("boundary+env1: 喺 push_candidates（恢復）", av.push_eligible(s) is True)
 check("boundary+env1: limit_mode_blocked 唔再 set",
       s.get("limit_mode_blocked") is not True, f"={s.get('limit_mode_blocked')}")
 
@@ -108,8 +105,7 @@ print("== 4. 未觸發 limit mode（price 未到 entry）==")
 for mode in ("boundary", "pullback", "fib", "fib0786"):
     s = run_inject(mode, triggered=False, current_price=4410.0)
     check(f"{mode} 未觸發: seedable=False", s.get("seedable") is False)
-    is_pc = s.get("cron_push_eligible") is True and s.get("push_suppressed") is not True
-    check(f"{mode} 未觸發: 唔喺 push_candidates (suppressed)", not is_pc)
+    check(f"{mode} 未觸發: 唔喺 push_candidates (suppressed)", av.push_eligible(s) is False)
 
 print("== 5. 未觸發 eligible 語義（還原 main）：boundary/fib0786 有 entry_price → eligible；pullback/fib → False ==")
 for mode in ("boundary", "fib0786"):
@@ -123,7 +119,7 @@ for mode in ("pullback", "fib"):
 
 print("== 6. push_candidates 列表過濾（JSON 層）==")
 setups = [run_inject("boundary"), run_inject("breakout", priority=2)]
-cands = [x for x in setups if x.get("cron_push_eligible") is True and x.get("push_suppressed") is not True]
+cands = [x for x in setups if av.push_eligible(x)]
 check("push_candidates 過濾: 只剩 breakout", len(cands) == 1 and cands[0]["entry_mode"] == "breakout",
       f"n={len(cands)} modes={[c['entry_mode'] for c in cands]}")
 

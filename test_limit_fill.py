@@ -91,7 +91,7 @@ setups = [{
     'direction': 'SELL', 'entry_mode': 'boundary',
     'entry_trigger': '📍 邊界沽出 (限價入場)', 'entry_price': 4200.0,
     'stop_loss': '$4220 (1.5 ATR)', 'tp1': '$4180 (1:1 RR)', 'tp2': '$4140 (2:1 RR)',
-    'cron_push_eligible': True, 'confidence': 'HIGH',
+    'cron_push_eligible': True, 'push_suppressed': False, 'confidence': 'HIGH',
     'counter_trend_severity': 'ALIGNED', 'daily_alignment': '✅ 順日線',
     'recommended_volume': 0.02,
 }]

@@ -560,8 +560,7 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
         side = 'BUY' if is_buy else 'SELL'
         entry_mode = s.get('entry_mode', 'breakout')
 
-        # ── 2026-08-08 FIX: enforce the cron push gate (aligned with paper_trade) ──
-        # ── 2026-09-24 FIX: 用 `push_eligible()` 而唔係 `cron_push_eligible` ──
+        # ── 2026-09-24 FIX: 用 `push_eligible()`（推送閘），唔係 paper seed 嘅紀律閘 ──
         # 原本只讀 cron_push_eligible → 漏咗 push_suppressed ⇒ 回測會 trade 四個
         # 限價模式（boundary/pullback/fib/fib0786），而現行策略唔推（2026-09-08
         # walk-forward 裁決：真 fill 後 0-15% 勝率，近乎零成交）。實測同一 6 個月：

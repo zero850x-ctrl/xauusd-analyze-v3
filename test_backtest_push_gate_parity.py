@@ -6,13 +6,13 @@
 `analyze_v3.main()` 寫 `push_candidates` 用兩條條件：
     cron_push_eligible is True  AND  push_suppressed is not True
 但 `backtest.py` 只抄咗第一條 → 回測會 trade 四個限價模式
-（boundary/pullback/fib/fib0786），而 live 從來唔推呢批（2026-09-08
-walk-forward 裁決：真 fill 後 0-15% 勝率、近乎零成交）。
+（boundary/pullback/fib/fib0786），而**現行**策略唔推呢批（2026-09-08
+walk-forward 裁決：真 fill 後 0-15% 勝率、近乎零成交；09-08 之前係有推）。
 
 後果實測（同一 6 個月，TradingView M30 8642 bars）：
     舊：97 單 / 勝率 45.4% / PF 1.14
     新：82 單 / 勝率 53.7% / PF 1.20
-⇒ 過往 backtest 數字混入咗 live 推唔到嘅單，而且係拖低嘅方向。
+⇒ 過往 backtest 數字混入咗現行策略推唔到嘅單。n=15 喺噪音範圍，價值係 fidelity。
 缺口會傳染全部經 `run_backtest` 嘅 harness（yearly_breakdown、
 analyze_entry_split、walkforward_*、reconcile_boundary、verify_*）。
 
@@ -24,7 +24,7 @@ analyze_entry_split、walkforward_*、reconcile_boundary、verify_*）。
 呢個 test 驗四件事（唔靠 source grep，全部行為／真數據）：
   A. 純函數真值表（含 `is True` 嚴格比較、缺 key 語義）
   B. Producer contract：真 emitter `_inject_push_metadata` 出嘅 flags
-  C. 真歷史契約：helper 重現 79 日真 JSON 已記錄嘅 push_candidates
+  C. 契約：helper 重現 testdata/push_gate 嘅 push_candidates（有本機報告先加掃）
   D. 行為：`setups_to_trades` 真嘅拒絕 suppressed setup、放行對照組
   E. 分工：paper_trade seeding 刻意唔受 push_suppressed 影響（唔可以「順手對齊」）
 """
@@ -103,8 +103,10 @@ check("A3 eligible=False + suppressed=False → False",
 # 缺 push_suppressed key：live 語義係 `is not True` ⇒ 當「冇被壓制」。呢個係
 # 刻意忠於 live 表達式（唔可以 fail-closed，否則同 live 分歧，回測就唔再係 mirror）。
 # 真 pipeline 永遠有呢個 key —— 由 B 段 producer contract 釘住。
-check("A4 eligible=True + 缺 suppressed key → True（live 語義，唔可以 fail-closed）",
+check("A4 eligible=True + 缺 suppressed key → True（舊 JSON fail-open）",
       av.push_eligible({"cron_push_eligible": True}) is True)
+check("A4b eligible=True + suppressed=null → False（非 bool fail-closed）",
+      av.push_eligible({"cron_push_eligible": True, "push_suppressed": None}) is False)
 check("A5 eligible=None → False（嚴格 is True）",
       av.push_eligible({"cron_push_eligible": None, "push_suppressed": False}) is False)
 check("A6 eligible='True' 字串 → False（唔可以 truthy 當 True）",
@@ -141,7 +143,7 @@ check("B[LIMIT_MODE_PUSH=1] escape hatch 仍然有效（suppressed=False）",
 check("B[LIMIT_MODE_PUSH=1] push_eligible=True（env 復原路徑唔可以斷）",
       av.push_eligible(sl) is True)
 
-print("== C. 真歷史契約：helper 重現記錄落 JSON 嘅 push_candidates ==")
+print("== C. 契約：helper 重現記錄落 JSON 嘅 push_candidates ==")
 
 
 def _key(s):
@@ -149,12 +151,15 @@ def _key(s):
             str(s.get("entry_price")), s.get("priority"))
 
 
-_reports = sorted(glob.glob(os.path.expanduser("~/.hermes/reports/xauusd_v3_*.json")))
-_days = _mism = 0
+_HERE_C = os.path.dirname(os.path.abspath(__file__))
+_fix = sorted(glob.glob(os.path.join(_HERE_C, "testdata", "push_gate", "*.json")))
+_live = sorted(glob.glob(os.path.expanduser("~/.hermes/reports/xauusd_v3_*.json")))
+_reports = _fix + _live
+_days = _fix_days = _mism = 0
 _seen = 0
 for _f in _reports:
     try:
-        with open(_f) as fh:
+        with open(_f, encoding="utf-8") as fh:
             _d = json.load(fh)
     except Exception:
         continue
@@ -163,18 +168,19 @@ for _f in _reports:
         continue
     _seen += len(_su)
     if "push_candidates" not in _d:
-        continue            # 2026-09-08 之前嘅舊報告冇呢個欄
+        continue
     _days += 1
+    if _f in _fix:
+        _fix_days += 1
     _mine = sorted(_key(s) for s in _su if av.push_eligible(s))
     _rec = sorted(_key(s) for s in (_d.get("push_candidates") or []))
     if _mine != _rec:
         _mism += 1
         print(f"     mismatch {os.path.basename(_f)}: helper={len(_mine)} 記錄={len(_rec)}")
-check(f"C1 helper == 真 emitter 記錄（{_days} 日 / {_seen} setups）", _mism == 0,
-      f"mismatch={_mism}")
-# 防真空：若日後報告欄位改名／清空，呢個契約會靜靜變成冇驗任何嘢
-check("C2 契約唔係真空（真嘅掃到 >= 10 日有 push_candidates 欄）", _days >= 10,
-      f"days={_days}")
+check(f"C1 helper == 記錄（fixture {_fix_days} + live {max(0, _days - _fix_days)} 日 / {_seen} setups）",
+      _mism == 0, f"mismatch={_mism}")
+check("C2 fixture 契約唔係真空（>= 2 個 committed JSON）", _fix_days >= 2,
+      f"fixture_days={_fix_days} files={len(_fix)}")
 
 print("== D. 行為：setups_to_trades 真嘅用呢個閘 ==")
 try:
@@ -223,10 +229,14 @@ if pt is not None:
           pt._setup_is_seedable(_sup2) is True and av.push_eligible(_sup2) is False)
     # 外審 finding 5：ledger 要記 provenance，否則「live-mirror」同「實驗性」
     # 兩個 population 冇得分開統計。呢度釘住 seed 記錄有保存嗰個欄位。
-    _ptsrc = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "paper_trade.py"), encoding="utf-8").read()
-    check("E3 seed 記錄有保存 push_suppressed（provenance，外審 finding 5）",
-          '"push_suppressed": bool(s.get("push_suppressed"))' in _ptsrc)
+    check("E3a missing key → None（唔當 False）",
+          pt._ledger_push_suppressed({}) is None)
+    check("E3b True 保留",
+          pt._ledger_push_suppressed({"push_suppressed": True}) is True)
+    check("E3c False 保留",
+          pt._ledger_push_suppressed({"push_suppressed": False}) is False)
+    check("E3d null → None",
+          pt._ledger_push_suppressed({"push_suppressed": None}) is None)
 
 print("== F. Anti-drift guard：生產消費者唔可以自己 inline 呢條規則 ==")
 # 本次事故根因 = 有第二份複本。呢個 guard 唔定義語義（語義由 push_eligible
@@ -270,6 +280,14 @@ with contextlib.redirect_stderr(_buf3):
     av.push_eligible({"cron_push_eligible": True, "push_suppressed": False,
                       "entry_mode": "breakout", "pattern": "OK-TEST"})
 check("G4 正常 setup（有 key）唔會出警告", _buf3.getvalue() == "")
+av._CONTRACT_GAP_SEEN.clear()
+_buf4 = io.StringIO()
+with contextlib.redirect_stderr(_buf4):
+    _gnull = av.push_eligible({"cron_push_eligible": True, "push_suppressed": None,
+                               "entry_mode": "boundary", "pattern": "NULL-TEST"})
+check("G5 null 唔係 bool → fail-closed 而且出聲",
+      _gnull is False and "producer contract" in _buf4.getvalue(),
+      f"eligible={_gnull} warn={_buf4.getvalue()[:60]!r}")
 
 print("== H. 壓制判定同日期無關（防將來有人改成 date-gated）==")
 _real_dt = av.datetime
@@ -311,7 +329,7 @@ _n_gap = 0
 _n_diff = 0
 for _f in _reports:
     try:
-        with open(_f) as fh:
+        with open(_f, encoding="utf-8") as fh:
             _d2 = json.load(fh)
     except Exception:
         continue
@@ -324,7 +342,7 @@ for _f in _reports:
             _n_diff += 1
             if "push_suppressed" not in _s:
                 _n_gap += 1
-check("I1 真歷史確實行到 fail-open 分支（>=1 筆）", _n_gap >= 1, f"n={_n_gap}")
+check("I1 fixture／報告有缺 key 嘅 fail-open（>=1 筆）", _n_gap >= 1, f"n={_n_gap}")
 check("I2 fail-closed 會改動嘅歷史筆數 == fail-open 分支筆數",
       _n_diff == _n_gap, f"diff={_n_diff} gap={_n_gap}")
 print(f"     （實測：改 fail-closed 會改動 {_n_diff} 筆真歷史嘅推送判定）")

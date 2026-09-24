@@ -7,6 +7,9 @@ trades), so if the two fill types have very different economics, the walk-forwar
 PF was never a forecast of what live would do.
 
 Uses the unmodified engine + a wrapper that records every Trade object created.
+
+Default run_backtest drops limit modes (push_eligible). The limit bucket is
+empty unless LIMIT_MODE_PUSH=1. entry_split.json is stale_pre_push_gate_parity.
 """
 import os, sys, json, argparse, time
 import pandas as pd

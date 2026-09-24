@@ -2278,17 +2278,14 @@ def push_eligible(setup):
     抽出單一真相函數嘅目的係令「兩份實作各自漂移」唔會再無聲發生（本次事故
     正是如此：一個條件被抄漏，冇任何東西會發現）。
 
-    ⚠️ 缺 `push_suppressed` key 時 fail-open（回 True）係**刻意**，唔係疏忽。
-    理由唔係「忠於舊 inline 表達式」（refactor 之後 `push_eligible` 自己就係
-    定義，講「忠於 live」係循環論證），而係：
-      1. **歷史契約**：真報告有 11 個 `cron_push_eligible=True` 但缺呢個 key 嘅
-         setup（全部 2026-07-13～08-21，即 09-08 引入 suppression 之前）。當時
-         限價模式**係有推**嘅（真 fill 樣本正係嗰時累積出嚟），所以 fail-open
-         才同歷史一致；改 fail-closed 會令回測唔再 mirror 當時嘅 live。
-      2. **可達性**：呢條分支只有「過咗紀律閘但冇經 `_inject_push_metadata`」嘅
-         setup 行得到 = producer 契約破損，唔係常態資料。
-    但契約破損唔可以靜默 ⇒ `_report_contract_gap()` 保留 fail-open 回傳值嘅
-    同時出聲。呢兩件事（回傳值忠於歷史 vs 契約破損要報警）唔矛盾，要一齊做。
+    回測 mirror 嘅係**現行**推送政策（`_inject_push_metadata` 每個 bar 都寫
+    bool），唔係 09-08 之前嗰段日曆。`run_backtest` 唔會行到缺 key 分支。
+
+    ⚠️ 缺 `push_suppressed` key 時 fail-open（回 True）只服務**舊 JSON**：
+    09-08 之前嘅報告有 `cron_push_eligible=True` 但冇呢個欄（當時限價係有推）。
+    key **存在但唔係 bool**（`null` / `1` / `"True"`）係契約破損，**fail-closed**
+    （只有明確 `False` 先當「冇壓制」），同時 `_report_contract_gap()` 出聲。
+    缺 key 都出聲，但回傳值保持 fail-open，先唔會改寫嗰批舊報告。
 
     ⚠️ 同 `cron_push_eligible` 嘅分工（兩者係唔同問題，唔可以互換）:
       • `cron_push_eligible` = 紀律閘／「可執行嗎」→ paper_trade seeding 用佢。
@@ -2298,10 +2295,14 @@ def push_eligible(setup):
     任何「決定會被推嗎」嘅消費者（含 backtest harness）一律 call 呢個，
     唔好自己讀 `cron_push_eligible`（2026-09-24 事故正是如此）。
     """
-    if setup.get('cron_push_eligible') is True and 'push_suppressed' not in setup:
+    cron_ok = setup.get('cron_push_eligible') is True
+    has_key = 'push_suppressed' in setup
+    val = setup.get('push_suppressed')
+    if cron_ok and not isinstance(val, bool):
         _report_contract_gap(setup)
-    return (setup.get('cron_push_eligible') is True
-            and setup.get('push_suppressed') is not True)
+    if not has_key:
+        return cron_ok
+    return cron_ok and val is False
 
 
 def _parse_entry_price_from_setup(setup, current_price=None):
