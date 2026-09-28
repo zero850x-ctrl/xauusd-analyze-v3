@@ -44,6 +44,9 @@ SETUP = {
     "entry_price": 4434.0, "stop_loss": 4384.0, "tp1": 4484.0, "tp2": 4534.0,
     "rr_tp1": 1.0, "risk_amount": 50.0, "confidence": "HIGH",
     "entry_mode": "breakout", "cron_push_eligible": True,
+    # 2026-09-28: build_format_a 讀 tp2_active 決定 TP2 係「(1/3)」定「⚠️ 停用」。
+    # 呢個 fixture 測價錢清潔 → 明確聲明 legacy/active 模式（唔靠預設值）。
+    "tp2_active": True,
 }
 
 
@@ -147,7 +150,7 @@ def t_clean_price():
     check("帶 $ + 描述", R._clean_price("$4284 (1:1 RR, 止賺 1/3)") == "4284")
     check("純數字", R._clean_price(4329.43) == "4329.43")
     check("None", R._clean_price(None) is None)
-    a = R.build_format_a(make_data(push_candidates=[dict(SETUP)]), [dict(SETUP, stop_loss="$4375", tp1="$4284 (1:1 RR, 止賺 1/3)", tp2="$4236 (1.0 Fib ext, 止賺 1/3)")])
+    a = R.build_format_a(make_data(push_candidates=[dict(SETUP)]), [dict(SETUP, stop_loss="$4375", tp1="$4284 (1:1 RR, 止賺 1/3)", tp2="$4236 (1.0 Fib ext, 止賺 1/3)", tp2_active=True)])
     check("無 $$ 重複", "$$" not in a, [l for l in a.splitlines() if "止損" in l or "TP" in l])
     check("止損乾淨", "**止損: $4375**" in a)
     check("TP1 乾淨", "**TP1: $4284 (1/3)**" in a)
