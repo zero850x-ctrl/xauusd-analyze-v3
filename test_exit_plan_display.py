@@ -242,6 +242,23 @@ check("D1 momentum-hold: 價穿過 TP2 都唔會喺 TP2 平倉（證明「停用
       _new["tp2_hit"] is False, f"tp2_hit={_new.get('tp2_hit')} closed={_new.get('closed')}")
 check("D2 legacy 對照組: 同一組 bars 會喺 TP2 平（證明 D1 唔係假通過）",
       _old["tp2_hit"] is True, f"tp2_hit={_old.get('tp2_hit')}")
+# D1b: 「TP1 之後 TP2 退休」嘅機制要驗到**真正嘅臨界**：gap 跳過 TP1 都唔可以
+# 令 TP2 fire。sell 開盤 4350 已經低過 TP2 4360 同 TP1 4380 —— 喺同一支 bar
+# TP1 先被檢查（`tp1` 喺 entry 同 tp2 之間），所以 tp1_hit 先變 True，TP2 條件
+# `not (momentum_hold and tp1_hit)` 變 False ⇒ 唔會 fire。
+_gap = pd.DataFrame([_bar(1, 4350, 4356, 4340, 4345)])
+_g = _run(_gap, True)
+check("D1b gap 跳過 TP1 時 TP1 仍然先 register，TP2 照樣唔 fire",
+      _g["tp1_hit"] is True and _g["tp2_hit"] is False,
+      f"tp1_hit={_g['tp1_hit']} tp2_hit={_g['tp2_hit']}")
+# D1c: 但「停用」係**有界**嘅 —— 退化 setup（tp1 <= 0，根本冇 TP1 可觸）之下
+# momentum-hold 唔會短路，TP2 真係會 fire。所以報告寫「TP1 後唔會 fire」係準確嘅，
+# 而「永久唔會 fire」係誇張講法。呢條釘住邊界，唔准當佢係絕對。
+_degen = pt._simulate_staged_exit(_gap, entry=4400, stop=4420, tp1=0, tp2=4360,
+                                  direction="SELL", atr=10, data_source="tv")
+check("D1c 邊界: 退化 tp1=0 時 TP2 真係會 fire（『停用』唔係絕對）",
+      _degen["tp2_hit"] is True and _degen["tp1_hit"] is False,
+      f"tp1_hit={_degen['tp1_hit']} tp2_hit={_degen['tp2_hit']}")
 # TP1 只佔 1/3 → 餘下必然 2/3（報告聲稱嘅 2/3）。乘 3 還原全倉等值；
 # 容忍滑價（SLIPPAGE_TICKS=0.15 對 $20 risk = 0.75%）。
 _port = 3.0 * _new["r_tp1"]
@@ -257,9 +274,16 @@ print("== E. 結構守衛: 三個欄只可以由 exit_fields 產生 ==")
 
 
 def _rogue(values, expect):
-    """回傳唔係 expect、但明顯係喺砌顯示字串（含 f-string 或 $）嘅賦值。"""
+    """回傳唔係 expect、亦唔係**純內部數值**（bare identifier）嘅賦值。
+
+    ⚠️ 舊版只捉「含 f-string 或 `$`」→ 用 helper 或者變數拼接就繞得過：
+    `'tp2': build_tp2(x)` / `'tp2': PREFIX + px` 一樣係砌 display 字串，但唔含
+    f-string 字面亦唔含 `$` ⇒ 舊守衛放行 = **假守衛**。
+    收緊之後只准兩種：① expect（`_ef[N]`）② 純 bare name（`_staged_targets`
+    嘅 `'tp2': tp2` 呢類內部數值）。凡含括號／引號／運算子 = 砌字串 → 一定要 _ef。
+    """
     return [v for v in values
-            if v != expect and ('f"' in v or "f'" in v or '"$' in v or "'$" in v)]
+            if v != expect and not re.fullmatch(r"'[a-z_0-9]+':\s*[A-Za-z_]\w*", v)]
 
 
 _tp2_a = [x.strip() for x in re.findall(r"'tp2':[^\n,]*", _av_src)]
