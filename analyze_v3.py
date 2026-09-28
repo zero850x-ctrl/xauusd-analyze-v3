@@ -145,8 +145,108 @@ TV_OHLC_MAP = {
     'close': 'Close', 'volume': 'Volume',
 }
 MIN_BARS = {'m30': 50, 'h1': 30, 'm15': 30, 'm5': 100, 'day': 20}
-TRAIL_PROFIT_ATR = float(os.environ.get('TRAIL_PROFIT_ATR', '2.0'))
-TRAIL_STOP_ATR = float(os.environ.get('TRAIL_STOP_ATR', '1.5'))
+
+
+def _env_float(name, default, tag, allow_zero=False):
+    """Parse-safe, DOMAIN-safe float env read.
+
+    同 paper_trade.py 嘅同名 helper **行為必須一致**（test_exit_plan_display.py
+    有 behavioral parity 守衛，逐個壞值對比，唔係對比源碼字面）。
+
+    唔可以淨係 catch ValueError：`nan` 會 parse 成功但令所有比較變 False（規則
+    靜靜消失），`inf` 就永遠觸發 —— 兩者都係「靜默反轉」而唔係 crash。而
+    analyze_v3 係 cron 每支 tick 跑嘅 signal producer，一個 typo 令 import
+    crash 就等於**完全冇信號**。無效值一律 warn + 用預設。
+    """
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        print(f"⚠️ [{tag}] {name}={raw!r} 唔係數字 — 用預設 {default}")
+        return float(default)
+    if (val != val) or val in (float("inf"), float("-inf")) \
+            or val < 0 or (val == 0 and not allow_zero):
+        desc = "唔係有限非負數" if allow_zero else "唔係有限正數"
+        print(f"⚠️ [{tag}] {name}={raw!r} {desc} — 用預設 {default}")
+        return float(default)
+    return val
+
+
+TRAIL_PROFIT_ATR = _env_float('TRAIL_PROFIT_ATR', 2.0, '出場')
+TRAIL_STOP_ATR = _env_float('TRAIL_STOP_ATR', 1.5, '出場')
+
+# ── 出場模式（2026-09-28）────────────────────────────────────────────────
+# paper_trade.py 擁有**行為**；呢度係**讀者**，唔係第二份實作。兩邊預設必須
+# 一致 —— test_exit_plan_display.py 會逐字對比 source literal 釘住，唔靠記憶。
+#
+# momentum-hold（預設開）: TP1 之後餘下 2/3 掛移動止損跟勢，TP2 **永久唔會
+# fire**（paper_trade.py 條件短路）。legacy (=0) 才會 TP2 止賺 1/3、尾倉 1/3。
+MOMENTUM_HOLD_EXIT = os.environ.get('MOMENTUM_HOLD_EXIT', '1') == '1'
+# 2026-09-28 第 2 項修好之前，paper_trade.py 嘅 momentum-hold 路徑**硬編碼
+# 1.5**、唔讀 TRAIL_STOP_ATR，所以呢度唯有如實寫死 1.5。修好之後兩邊都讀
+# 同一個 TRAIL_STOP_ATR ⇒ 直接引用，改環境變數顯示同實際一齊變。
+MOM_HOLD_TRAIL_ATR = TRAIL_STOP_ATR
+
+
+def exit_fields(tp2_price, tp2_label, tp3_trail_legacy, rr1=None):
+    """回傳 (tp2, tp3, exit_plan) 三個成品字串 —— 出場計劃文字嘅**單一入口**。
+
+    2026-09-28 事故: 報告同時寫「tp2 ... 止賺 1/3」同「exit_plan ... 餘下 2/3
+    無固定TP」。兩個都出自同一份報告，但只有後者同 ledger 一致（momentum-hold
+    令 TP2 短路），用戶按前者以為仲有 TP2/TP3 兩級止賺。所以三個欄要由同一個
+    函數產生，令佢哋**唔可能互相矛盾**。
+
+    legacy (=0) 分支: tp2/tp3 文字**逐字保留**原本寫法；`exit_plan` 就**刻意改咗**——
+    原本嗰句「餘下 2/3 無固定TP」係照抄 momentum-hold 版本，但 legacy 之下 TP2 係
+    有效目標，所以嗰句本身係錯。今次一併改準（唔係「唔改行為之外嘅嘢」，而係
+    「兩個模式嘅文字都要同實際一致」—— 呢個正正就係今次修嘅目的）。
+    """
+    if MOMENTUM_HOLD_EXIT:
+        tp2 = (f"${tp2_price:.0f} ({tp2_label})"
+               f" — ⚠️ 停用 (momentum-hold，TP1 後唔會 fire)")
+        tp3 = (f"TP1 後餘下 2/3 跟 {MOM_HOLD_TRAIL_ATR:g}×ATR 移動止損跟勢"
+               f" (無固定目標，唔會止賺)")
+        if rr1 is not None:
+            plan = (f"TP1 (+{rr1:.1f}R) 後 SL→BE; 餘下 2/3 無固定TP, "
+                    f"{MOM_HOLD_TRAIL_ATR:g} ATR trailing 跟勢 "
+                    f"(前輩式放飛: 平均贏$126/輸$27)")
+        else:
+            plan = (f"TP1 後 SL→BE; 餘下 2/3 無固定TP, "
+                    f"{MOM_HOLD_TRAIL_ATR:g} ATR trailing 跟勢")
+        return tp2, tp3, plan
+
+    tp2 = f"${tp2_price:.0f} ({tp2_label}, 止賺 1/3)"
+    tp3 = f"放飛 + {tp3_trail_legacy} (尾倉 1/3)"
+    # ⚠️ legacy 嘅 exit_plan 原本係照抄 momentum-hold 版本（「餘下 2/3 無固定TP」），
+    # 但 legacy 之下 TP2 係**有效**目標 ⇒ 嗰句係錯嘅。呢度改成準確描述，
+    # 令兩個模式嘅文字都同實際一致（呢個就係今次修嘅目的）。
+    if rr1 is not None:
+        plan = (f"TP1 (+{rr1:.1f}R) 後 SL→BE; 餘下 2/3: 1/3 到 TP2, "
+                f"1/3 跟 1.5 ATR 移動止損 (前輩式放飛: 平均贏$126/輸$27)")
+    else:
+        plan = ("TP1 後 SL→BE; 餘下 2/3: 1/3 到 TP2, 1/3 跟 1.5 ATR 移動止損")
+    return tp2, tp3, plan
+
+
+def rr_tp2_cell(setup):
+    """Markdown 表嘅「R:R TP2」格 —— 三態（生效／停用／未確認）。
+
+    2026-09-28: 以前無條件印 `{rr_tp2}:1`。但 momentum-hold（預設開）之下 TP2
+    **永遠唔會 fire** ⇒ 呢個係一個永遠唔會實現嘅回報風險比 = 假數字。同 `tp2`
+    欄一樣要講清楚。
+
+    ⚠️ 缺 key 唔可以當 False：舊 JSON（09-28 前）冇 `rr_tp2_active`，當 False 會
+    反過來印成「停用」—— 由「假目標」變「假停用」，即係事故嘅鏡像版。所以三態。
+    """
+    rr = setup.get('rr_tp2')
+    active = setup.get('rr_tp2_active')
+    if active is True:
+        return f"{rr}:1"
+    if active is False:
+        return f"{rr}:1 — ⚠️ 停用 (TP2 唔會 fire)"
+    return f"{rr}:1 — ⚠️ 未確認 (記錄缺 rr_tp2_active)"
 
 
 def _log(msg):
@@ -2961,6 +3061,7 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
 
     if side == 'BEARISH':
         swing_label = f"前頂 ${fib['swing_start']:.0f}"
+        _ef = exit_fields(tp2, '2:1 RR', tp3_trail)
         return {
             'direction': '🔴 SELL',
             'priority': setup_priority(side, False, daily_trend, h1_trend, quality),
@@ -2975,17 +3076,18 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
             'stop_loss': f"${stop_level:.0f}",
             'stop_rationale': f"{swing_label} + 1 ATR",
             'tp1': f"${tp1:.0f} (0.618 RR, 止賺 1/3)",
-            'tp2': f"${tp2:.0f} (2:1 RR, 止賺 1/3)",
-            'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
-            'exit_plan': "TP1 後 SL→BE; 餘下 2/3 無固定TP, 1.5 ATR trailing 跟勢",
+            'tp2': _ef[0], 'tp2_active': not MOMENTUM_HOLD_EXIT,
+            'tp3': _ef[1],
+            'exit_plan': _ef[2],
             'risk_amount': round(risk, 1),
             'rr_tp1': round(rr_tp1, 1),
-            'rr_tp2': round(rr_tp2, 1),
+            'rr_tp2': round(rr_tp2, 1), 'rr_tp2_active': not MOMENTUM_HOLD_EXIT,
             'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
             'note': '' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='Fib'),
         }
 
     swing_label = f"前底 ${fib['swing_start']:.0f}"
+    _ef = exit_fields(tp2, '2:1 RR', tp3_trail)
     return {
         'direction': '🟢 BUY',
         'priority': setup_priority(side, False, daily_trend, h1_trend, quality),
@@ -3000,12 +3102,12 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
         'stop_loss': f"${stop_level:.0f}",
         'stop_rationale': f"{swing_label} - 1 ATR",
         'tp1': f"${tp1:.0f} (0.618 RR, 止賺 1/3)",
-        'tp2': f"${tp2:.0f} (2:1 RR, 止賺 1/3)",
-        'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
-        'exit_plan': "TP1 後 SL→BE; 餘下 2/3 無固定TP, 1.5 ATR trailing 跟勢",
+        'tp2': _ef[0], 'tp2_active': not MOMENTUM_HOLD_EXIT,
+        'tp3': _ef[1],
+        'exit_plan': _ef[2],
         'risk_amount': round(risk, 1),
         'rr_tp1': round(rr_tp1, 1),
-        'rr_tp2': round(rr_tp2, 1),
+        'rr_tp2': round(rr_tp2, 1), 'rr_tp2_active': not MOMENTUM_HOLD_EXIT,
         'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
         'note': '' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='Fib'),
     }
@@ -3053,6 +3155,7 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
             entry_status = '⏳ 接近 0.786 Fib (待觸及)'
         else:
             entry_status = _entry_status_bearish(False, aligned, quality, 'fib0786', severity)
+        _ef = exit_fields(tp2, '跌浪最低點', tp3_trail)
         return {
             'direction': '🔴 SELL',
             'priority': setup_priority(side, False, daily_trend, h1_trend, quality),
@@ -3070,12 +3173,12 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
             'stop_loss': f"${stop_level:.0f}",
             'stop_rationale': f"前頂 ${fib['swing_start']:.0f} (回調浪最高點) + 1 ATR",
             'tp1': f"${tp1:.0f} (0.618 Fib 位, 止賺 1/3)",
-            'tp2': f"${tp2:.0f} (跌浪最低點, 止賺 1/3)",
-            'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
-            'exit_plan': "TP1 後 SL→BE; 餘下 2/3 無固定TP, 1.5 ATR trailing 跟勢",
+            'tp2': _ef[0], 'tp2_active': not MOMENTUM_HOLD_EXIT,
+            'tp3': _ef[1],
+            'exit_plan': _ef[2],
             'risk_amount': round(risk, 1),
             'rr_tp1': round(rr_tp1, 1),
-            'rr_tp2': round(rr_tp2, 1),
+            'rr_tp2': round(rr_tp2, 1), 'rr_tp2_active': not MOMENTUM_HOLD_EXIT,
             'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
             'note': '0.786 深度回調 — 實驗性（港股 playbook；未經 XAUUSD 138-sample 驗證）' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='0.786 Fib'),
         }
@@ -3087,6 +3190,7 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
         entry_status = '⏳ 接近 0.786 Fib (待觸及)'
     else:
         entry_status = _entry_status_bullish(False, aligned, quality, 'fib0786', severity)
+    _ef = exit_fields(tp2, '升浪最高點', tp3_trail)
     return {
         'direction': '🟢 BUY',
         'priority': setup_priority(side, False, daily_trend, h1_trend, quality),
@@ -3104,12 +3208,12 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
         'stop_loss': f"${stop_level:.0f}",
         'stop_rationale': f"前底 ${fib['swing_start']:.0f} (回調浪最低點) - 1 ATR",
         'tp1': f"${tp1:.0f} (0.618 Fib 位, 止賺 1/3)",
-        'tp2': f"${tp2:.0f} (升浪最高點, 止賺 1/3)",
-        'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
-        'exit_plan': "TP1 後 SL→BE; 餘下 2/3 無固定TP, 1.5 ATR trailing 跟勢",
+        'tp2': _ef[0], 'tp2_active': not MOMENTUM_HOLD_EXIT,
+        'tp3': _ef[1],
+        'exit_plan': _ef[2],
         'risk_amount': round(risk, 1),
         'rr_tp1': round(rr_tp1, 1),
-        'rr_tp2': round(rr_tp2, 1),
+        'rr_tp2': round(rr_tp2, 1), 'rr_tp2_active': not MOMENTUM_HOLD_EXIT,
         'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
         'note': '0.786 深度回調 — 實驗性（港股 playbook；未經 XAUUSD 138-sample 驗證）' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='0.786 Fib'),
     }
@@ -3494,6 +3598,11 @@ def _make_setup(side, pattern, daily_trend, h1_trend, tp3_trail, *,
     broken_for_priority = already_broken if priority_broken is None else priority_broken
     if note is None:
         note = '' if aligned else _counter_trend_note(side, daily_trend, h1_trend)
+    _ef = exit_fields(
+        targets['tp2'],
+        _tp_method_label(pattern, targets['tp2'], targets['fib_tp'], targets['rr_tp'],
+                         targets['tp2_fib'], targets['tp2_rr']),
+        tp3_trail, rr1=targets['rr1'])
     rec = {
         'direction': '🔴 SELL' if order == 'SELL' else '🟢 BUY',
         'priority': setup_priority(side, broken_for_priority, daily_trend, h1_trend, quality),
@@ -3508,18 +3617,12 @@ def _make_setup(side, pattern, daily_trend, h1_trend, tp3_trail, *,
         'stop_loss': f"${stop_loss:.0f}",
         'stop_rationale': stop_rationale,
         'tp1': f"${targets['tp1']:.0f} ({_tp_method_label(pattern, targets['tp1'], targets['fib_tp'], targets['rr_tp'])}, 止賺 1/3)",
-        'tp2': f"${targets['tp2']:.0f} ({_tp_method_label(pattern, targets['tp2'], targets['fib_tp'], targets['rr_tp'], targets['tp2_fib'], targets['tp2_rr'])}, 止賺 1/3)",
-        'tp3': f"放飛 + {tp3_trail} (尾倉 1/3)",
-        # 2026-09-01 momentum-hold plan (mentor 129-trade: avg win $126 vs avg loss $27,
-        # 42% win still net +$4,808): after TP1 move SL to BE, tail rides a
-        # 1.5-ATR trailing stop instead of fixed TP2 — cut losses fast, let winners run.
-        'exit_plan': (
-            f"TP1 (+{targets['rr1']:.1f}R) 後 SL→BE; 餘下 2/3 無固定TP, "
-            f"1.5 ATR trailing 跟勢 (前輩式放飛: 平均贏$126/輸$27)"
-        ),
+        'tp2': _ef[0], 'tp2_active': not MOMENTUM_HOLD_EXIT,
+        'tp3': _ef[1],
+        'exit_plan': _ef[2],
         'risk_amount': round(risk, 1),
         'rr_tp1': round(targets['rr1'], 1),
-        'rr_tp2': round(targets['rr2'], 1),
+        'rr_tp2': round(targets['rr2'], 1), 'rr_tp2_active': not MOMENTUM_HOLD_EXIT,
         'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
         'note': note,
     }
@@ -4188,7 +4291,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 🎯 TP3 (1/3) | {s['tp3']} |
 | 風險金額 | ${s['risk_amount']:.0f} |
 | R:R TP1 | {s['rr_tp1']}:1 |
-| R:R TP2 | {s['rr_tp2']}:1 |
+| R:R TP2 | {rr_tp2_cell(s)} |
 {zone_row}
 {note}
 """
