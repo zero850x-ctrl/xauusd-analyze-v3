@@ -235,12 +235,17 @@ def build_format_a(data, candidates):
         if s.get("tp2"):
             # 2026-09-28: momentum-hold 之下 TP2 已經停用（paper_trade 條件短路），
             # 唔可以再寫死「(1/3)」—— 用戶就係睇住呢行以為仲有第二級止賺（真事故）。
-            # 讀 producer 出嘅 tp2_active，唔喺呢度自己讀環境變數推導（唔要第三份實作）。
-            # 缺欄位時當「唔主張」= fail-safe：唔可以無中生有一個目標出嚟。
-            if s.get("tp2_active", False):
-                lines.append(f"**TP2: ${_clean_price(s.get('tp2'))} (1/3)**")
+            # 讀 producer 出嘅 tp2_active，唔喺呢度自己讀環境變數推導（唔要第四份實作）。
+            # ⚠️ 缺欄位時**兩邊都唔主張**：印「(1/3)」= 重演今次事故；印「停用」= 鏡像版
+            # 假主張（legacy 之下 TP2 真係會 fire）。所以三態，唔係二態。
+            _tp2_active = s.get("tp2_active")
+            _tp2_px = _clean_price(s.get('tp2'))
+            if _tp2_active is True:
+                lines.append(f"**TP2: ${_tp2_px} (1/3)**")
+            elif _tp2_active is False:
+                lines.append(f"**TP2: ${_tp2_px} — ⚠️ 停用**")
             else:
-                lines.append(f"**TP2: ${_clean_price(s.get('tp2'))} — ⚠️ 停用**")
+                lines.append(f"**TP2: ${_tp2_px} (狀態未確認 — 以引擎為準)**")
         # 尾倉計劃（momentum-hold: 餘下 2/3 移動止損；legacy: 放飛尾倉）——
         # 由 exit_fields 產生，兩個模式都準確，所以直接照印。
         if s.get("tp3"):

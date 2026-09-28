@@ -169,7 +169,10 @@ def exit_fields(tp2_price, tp2_label, tp3_trail_legacy, rr1=None):
     令 TP2 短路），用戶按前者以為仲有 TP2/TP3 兩級止賺。所以三個欄要由同一個
     函數產生，令佢哋**唔可能互相矛盾**。
 
-    legacy (=0) 分支逐字保留原文字 —— 唔改行為之外嘅嘢。
+    legacy (=0) 分支: tp2/tp3 文字**逐字保留**原本寫法；`exit_plan` 就**刻意改咗**——
+    原本嗰句「餘下 2/3 無固定TP」係照抄 momentum-hold 版本，但 legacy 之下 TP2 係
+    有效目標，所以嗰句本身係錯。今次一併改準（唔係「唔改行為之外嘅嘢」，而係
+    「兩個模式嘅文字都要同實際一致」—— 呢個正正就係今次修嘅目的）。
     """
     if MOMENTUM_HOLD_EXIT:
         tp2 = (f"${tp2_price:.0f} ({tp2_label})"

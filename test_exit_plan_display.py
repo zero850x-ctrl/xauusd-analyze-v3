@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """出場計劃顯示一致性測試（2026-09-28）。
 
-事故: 同一份報告同時寫「tp2 $4048 (1.0 Fib ext, 止賺 1/3)」同「exit_plan ...
-餘下 2/3 無固定TP」，而 Telegram 更加直接印「**TP2: $4048 (1/3)**」。
+事故: 同一份報告同時寫「tp2 $4017 (1.0 Fib ext, 止賺 1/3)」同「exit_plan ...
+餘下 2/3 無固定TP」，而 Telegram 更加直接印「**TP2: $4017 (1/3)**」。
 momentum-hold（預設開）令 TP2 永久唔 fire，所以呢啲都係**假目標** ——
 用戶睇住佢以為仲有第二級止賺，問「為何 TP2 未止賺 / TP3 係咩」。
 
@@ -10,10 +10,10 @@ momentum-hold（預設開）令 TP2 永久唔 fire，所以呢啲都係**假目�
   A/B  兩個模式嘅文字正確
   C    analyze_v3 嘅讀數 == paper_trade 嘅行為來源（anti-drift，讀 source literal）
   D    報告講嘅嘢 == 真 sim 做嘅嘢（行為驗證，唔靠 source grep）
-  E    結構守衛：三個欄只可以由 exit_fields 產生
-  G    Telegram 報告層唔可以主張假 TP2
-  H    paper_trade 解析器喺新格式之下仍然有效
-  F    矛盾偵測器有牙 —— 用真 09-28 報告原文證明佢捉得到
+  E    結構守衛：三個欄只可以由 exit_fields 產生；paper_trade 冇 inline 重複
+  G    Telegram 報告層唔可以主張假 TP2（三態：active / 停用 / 未確認）
+  H    paper_trade 嘅**真**解析 helper 有效，且同舊 inline 逐值一致（唔係複製品）
+  F    矛盾偵測器有牙 —— inline 事故 fixture（唔靠本機檔，任何機器都跑得）
 
 Run:  python3 test_exit_plan_display.py
 """
@@ -126,10 +126,30 @@ check("D3 TP1 只 book 1/3 倉（⇒ 餘下 2/3，同報告一致）",
       abs(_port - _full) < 0.02, f"3*r_tp1={_port:.4f} 全倉={_full:.4f}")
 
 print("== E. 結構守衛: 三個欄只可以由 exit_fields 產生 ==")
-check("E1 冇殘留 raw tp2『止賺』字串",
-      not re.search(r"'tp2': f\"\$\{tp2", _av_src)
-      and not re.search(r"'tp2': f\"\$\{targets\[.tp2", _av_src))
-check("E2 冇殘留 raw tp3『放飛』字串", "'tp3': f\"放飛" not in _av_src)
+# ⭐ 收緊版：唔止 regex 兩種已知 inline 形態（用中間變數就繞得過）——
+# 要求**每一個會產生字串嘅** 'tp2'/'tp3'/'exit_plan' 賦值都係 _ef 產出。
+# 內部數值 dict（例如 _staged_targets 嘅 `'tp2': tp2`）唔算顯示欄，但要
+# 明確區分：凡係含 f-string 或 "$" 嘅值 = 顯示字串 → 一定要係 _ef。
+
+
+def _rogue(values, expect):
+    """回傳唔係 expect、但明顯係喺砌顯示字串（含 f-string 或 $）嘅賦值。"""
+    return [v for v in values
+            if v != expect and ('f"' in v or "f'" in v or '"$' in v or "'$" in v)]
+
+
+_tp2_a = [x.strip() for x in re.findall(r"'tp2':[^\n,]*", _av_src)]
+_tp3_a = [x.strip() for x in re.findall(r"'tp3':[^\n,]*", _av_src)]
+_pl_a = [x.strip() for x in re.findall(r"'exit_plan':[^\n,]*", _av_src)]
+check("E1 全部 'tp2' 顯示字串都係 _ef[0]",
+      not _rogue(_tp2_a, "'tp2': _ef[0]"), _rogue(_tp2_a, "'tp2': _ef[0]"))
+check("E2 全部 'tp3' 顯示字串都係 _ef[1]",
+      not _rogue(_tp3_a, "'tp3': _ef[1]"), _rogue(_tp3_a, "'tp3': _ef[1]"))
+check("E2b 全部 'exit_plan' 顯示字串都係 _ef[2]",
+      not _rogue(_pl_a, "'exit_plan': _ef[2]"), _rogue(_pl_a, "'exit_plan': _ef[2]"))
+check("E2c 顯示欄數目齊（5 個 setup site）",
+      sum(1 for x in _tp2_a if x == "'tp2': _ef[0]") == 5,
+      _tp2_a)
 check("E3 5 個 site 定義 _ef、15 處使用",
       _av_src.count("_ef = exit_fields(") == 5 and _av_src.count("_ef[") == 15,
       f"def={_av_src.count('_ef = exit_fields(')} use={_av_src.count('_ef[')}")
@@ -137,6 +157,10 @@ check("E4 _ef 先定義後使用", _av_src.index("_ef = exit_fields(") < _av_src
 check("E5 5 個 site 都 emit tp2_active（report 層靠佢）",
       _av_src.count("'tp2_active': not MOMENTUM_HOLD_EXIT") == 5,
       f"n={_av_src.count(chr(39) + 'tp2_active' + chr(39) + ': not MOMENTUM_HOLD_EXIT')}")
+# ⭐ paper_trade 唔可以再有 inline 重複（原本 4 處）—— 顯示格式一改就靜靜爆
+_pt_dup = _pt_src.count('split("$")[1].split(" ")[0]')
+check("E6 paper_trade 只淨 1 處抽價（helper 本身），冇 inline 重複",
+      _pt_dup == 1, f"n={_pt_dup}")
 
 print("== G. Report 層（Telegram 文字）唔可以主張假 TP2 ==")
 _base = {"pattern": "🚩 Bear Flag (熊旗)", "direction": "🔴 SELL", "entry_price": 4157.0,
@@ -163,32 +187,73 @@ check("G1 momentum-hold: TP2 標停用、冇『(1/3)』",
 check("G2 momentum-hold: 印埋尾倉計劃（餘下 2/3）",
       any("2/3" in ln for ln in _mom.splitlines()),
       [ln for ln in _mom.splitlines() if "2/3" in ln])
+check("G2b 尾倉計劃只印一次（唔可以重複）",
+      sum(1 for ln in _mom.splitlines() if "移動止損" in ln) == 1,
+      [ln for ln in _mom.splitlines() if "移動止損" in ln])
 _leg = _fmt(tp2=L[0], tp3=L[1], tp2_active=True)
 check("G3 legacy: TP2 保持 (1/3)", "**TP2: $4048 (1/3)**" in _leg,
       [ln for ln in _leg.splitlines() if "TP2" in ln])
-check("G4 缺 tp2_active → 唔主張（fail-safe，唔會重演事故）",
-      "停用" in _fmt(tp2=M[0], tp3=M[1]))
+# ⭐ 缺欄位 = 三態第三態：唔可以主張「(1/3)」（重演事故），亦唔可以主張「停用」
+#   （鏡像版假主張 —— legacy 之下 TP2 真係會 fire）。兩邊都唔講。
+_unk_line = next((ln for ln in _fmt(tp2=M[0], tp3=M[1]).splitlines() if "TP2" in ln), "")
+check("G4 缺 tp2_active → 兩邊都唔主張",
+      "止賺" not in _unk_line and "停用" not in _unk_line and "未確認" in _unk_line,
+      _unk_line)
 check("G5 價錢清潔唔受新格式影響", R._clean_price(M[0]) == "4048", R._clean_price(M[0]))
 
-print("== H. paper_trade 解析 tp2 價錢仍然有效（格式改動後）==")
+print("== H. paper_trade 嘅真解析 helper（唔係複製品）==")
 
 
-def _parse_tp2(txt):
-    """同 paper_trade.py 完全一樣嘅抽法。"""
-    return float(txt.split("$")[1].split(" ")[0])
-
-
-for _lbl, _txt in (("momentum", M[0]),
-                   ("legacy", L[0]),
-                   ("fib0786 跌浪", av.exit_fields(4048, '跌浪最低點', 'T')[0]),
-                   ("_make_setup", av.exit_fields(4048, '1.0 Fib ext', 'T', rr1=1.0)[0])):
+def _h4():
+    """格式壞嘅時候 helper 應該照 raise（同舊 inline 一樣，唔靜靜吞）。"""
     try:
-        _v = _parse_tp2(_txt)
-        check(f"H {_lbl} 解析到 4048", abs(_v - 4048) < 1e-9, f"got {_v}")
-    except Exception as _e:
-        check(f"H {_lbl} 解析到 4048", False, f"{type(_e).__name__}: {_e} @ {_txt!r}")
+        pt._setup_price({"tp2": "no-dollar"}, "tp2")
+        return "no-raise"
+    except Exception as e:  # noqa: BLE001
+        return e
 
-print("== F. 矛盾偵測器有牙（用真 09-28 報告原文驗證）==")
+
+check("H1 新格式（momentum）抽到價",
+      pt._setup_price({"tp2": M[0]}, "tp2") == 4048.0)
+check("H2 新格式（legacy）抽到價",
+      pt._setup_price({"tp2": L[0]}, "tp2") == 4048.0)
+check("H3 缺 key → 0.0（同舊 inline 一樣）", pt._setup_price({}, "tp2") == 0.0)
+check("H4 格式壞 → 照 raise（唔靜靜吞）", isinstance(_h4(), Exception), _h4())
+
+
+# ⭐ 最強：用**真 live setup** 逐值對比真 helper vs 舊 inline 表達式
+#   （證明抽 helper 冇改任何行為 —— 同 PR #52 嘅 T3 同一手法）
+def _orig_parse(s, key):
+    return float(s[key].split("$")[1].split(" ")[0]) if key in s else 0
+
+
+_n_ok = _n_bad = 0
+_bad_ex = ""
+for _f in sorted(glob.glob(os.path.expanduser("~/.hermes/reports/xauusd_v3_*.json"))):
+    try:
+        _d = json.load(open(_f, encoding="utf-8"))
+    except Exception:
+        continue
+    for _s in (_d.get("setups") or []):
+        for _k in ("tp1", "tp2"):
+            try:
+                _x = pt._setup_price(dict(_s), _k)
+            except Exception as _e:  # noqa: BLE001
+                _x = f"raise:{type(_e).__name__}"
+            try:
+                _y = _orig_parse(dict(_s), _k)
+            except Exception as _e:  # noqa: BLE001
+                _y = f"raise:{type(_e).__name__}"
+            if _x == _y:
+                _n_ok += 1
+            else:
+                _n_bad += 1
+                if not _bad_ex:
+                    _bad_ex = f"{os.path.basename(_f)} {_k}: helper={_x} inline={_y}"
+check("H5 真 helper vs 舊 inline 表達式喺真 setup 上逐值一致",
+      _n_ok > 0 and _n_bad == 0, f"一致 {_n_ok}／唔同 {_n_bad} {_bad_ex}")
+
+print("== F. 矛盾偵測器有牙 ==")
 
 
 def claims_both(setup):
@@ -199,8 +264,21 @@ def claims_both(setup):
     return ("止賺" in tp2) and ("無固定TP" in plan) and ("2/3" in tp3 or "2/3" in plan)
 
 
-_f1 = False
-_f1_txt = ""
+# F1: 今次事故嘅原文（inline fixture —— 唔靠本機檔案，任何機器／CI 都跑得）
+# 來源: ~/.hermes/reports/xauusd_v3_2026-09-28.json 真 setup（未修之前嘅輸出）
+_INCIDENT = {
+    "tp2": "$4017 (1.0 Fib ext, 止賺 1/3)",
+    "tp3": "放飛 + 追蹤止損: 每 +$23 利潤, 止損移 $17 (尾倉 1/3)",
+    "exit_plan": ("TP1 (+1.0R) 後 SL→BE; 餘下 2/3 無固定TP, 1.5 ATR trailing "
+                  "跟勢 (前輩式放飛: 平均贏$126/輸$27)"),
+}
+check("F1 偵測器捉到今次事故嘅原文（inline fixture，唔靠本機檔）",
+      claims_both(_INCIDENT), _INCIDENT["tp2"])
+check("F2 新格式唔會誤報", not claims_both({"tp2": M[0], "tp3": M[1], "exit_plan": M[2]}), M[0])
+check("F3 legacy 格式唔誤報", not claims_both({"tp2": L[0], "tp3": L[1], "exit_plan": L[2]}), L[2])
+
+# 額外情報（唔係斷言）：本機有舊報告就順手數一數
+_live_hits = 0
 for _f in sorted(glob.glob(os.path.expanduser("~/.hermes/reports/xauusd_v3_2026-09-28*.json"))):
     try:
         _d = json.load(open(_f, encoding="utf-8"))
@@ -208,14 +286,8 @@ for _f in sorted(glob.glob(os.path.expanduser("~/.hermes/reports/xauusd_v3_2026-
         continue
     for _s in (_d.get("setups") or []):
         if claims_both(_s):
-            _f1 = True
-            _f1_txt = f"{os.path.basename(_f)} tp2={_s.get('tp2')!r}"
-            break
-    if _f1:
-        break
-check("F1 偵測器捉到真事故原文", _f1, "（冇 09-28 報告可驗）" if not _f1_txt else _f1_txt)
-check("F2 新格式唔會誤報", not claims_both({"tp2": M[0], "tp3": M[1], "exit_plan": M[2]}), M[0])
-check("F3 legacy 格式唔誤報", not claims_both({"tp2": L[0], "tp3": L[1], "exit_plan": L[2]}), L[2])
+            _live_hits += 1
+print(f"  ℹ️  本機 09-28 舊報告仍有矛盾嘅 setup: {_live_hits} 個（部署後會清零）")
 
 print()
 print("=" * 70)

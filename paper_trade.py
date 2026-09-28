@@ -174,6 +174,22 @@ def _parse_entry_from_setup(setup, current_price):
     return None
 
 
+def _setup_price(s, key):
+    """由 setup 字串抽價錢（`'$4048 (1.0 Fib ext)...'` → `4048.0`）。
+
+    2026-09-28: 呢個表達式原本喺 `seed_trades` 同 `run_backtest` 共 **4 處**
+    inline 重複。顯示格式一改（例如 `tp2` 加咗「⚠️ 停用」尾巴）就冇人知要
+    四處一齊驗 —— 抽成單一入口，令 `test_exit_plan_display.py` 可以測真身
+    而唔係複製一份解析邏輯（複製品永遠唔會 fail）。
+
+    語義**刻意**同原本 inline 完全一樣：key 唔存在 → `0.0`；存在但格式壞 →
+    照樣 raise（唔靜靜吞，維持原本嘅爆法）。
+    """
+    if key not in s:
+        return 0.0
+    return float(s[key].split("$")[1].split(" ")[0])
+
+
 def _last_close_dt(log):
     """Most recent close timestamp from history."""
     latest = None
@@ -1473,8 +1489,8 @@ def seed_trades(data, setups=None):
                 continue
 
             stop = float(s["stop_loss"].replace("$", "").replace(",", ""))
-            tp1 = float(s["tp1"].split("$")[1].split(" ")[0]) if "tp1" in s else 0
-            tp2 = float(s["tp2"].split("$")[1].split(" ")[0]) if "tp2" in s else 0
+            tp1 = _setup_price(s, "tp1")
+            tp2 = _setup_price(s, "tp2")
 
             risk = abs(entry - stop)
             if risk <= 0:
@@ -2209,8 +2225,8 @@ def run_backtest(data):
             # Match backtest adverse entry fill: BUY pays ask, SELL sells bid.
             entry = entry - SLIPPAGE_TICKS if side == "SELL" else entry + SLIPPAGE_TICKS
             stop = float(s["stop_loss"].replace("$", "").replace(",", ""))
-            tp1 = float(s["tp1"].split("$")[1].split(" ")[0]) if "tp1" in s else 0
-            tp2 = float(s["tp2"].split("$")[1].split(" ")[0]) if "tp2" in s else 0
+            tp1 = _setup_price(s, "tp1")
+            tp2 = _setup_price(s, "tp2")
         except (IndexError, ValueError, AttributeError):
             continue
 
