@@ -17,10 +17,13 @@ momentum-hold（預設開）令 TP2 永久唔 fire，所以呢啲都係**假目�
 
 Run:  python3 test_exit_plan_display.py
 """
+import contextlib
 import glob
+import io
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime, timezone, timedelta
 
@@ -82,13 +85,134 @@ _m_pt = re.search(
 check("C1 兩邊讀同一個 env 且預設一致",
       bool(_m_av) and bool(_m_pt) and _m_av.group(1) == _m_pt.group(1),
       f"av={_m_av and _m_av.group(1)} pt={_m_pt and _m_pt.group(1)}")
-_m_hc = re.findall(r"new_trail = close_px [+-] ([\d.]+) \* atr", _pt_src)
-check("C2 MOM_HOLD_TRAIL_ATR == paper_trade 硬編碼（唔可以寫 TRAIL_STOP_ATR）",
-      bool(_m_hc) and all(float(x) == av.MOM_HOLD_TRAIL_ATR for x in _m_hc),
-      f"paper_trade={_m_hc} analyze_v3={av.MOM_HOLD_TRAIL_ATR}")
-check("C3 文字用嘅倍數 == C2",
+_m_lit = re.findall(r"new_trail = close_px [+-] ([\d.]+) \* atr", _pt_src)
+check("C2a paper_trade 冇寫死 trail 距離（第 2 項 dead config）", not _m_lit, f"仲有 {_m_lit}")
+check("C2b paper_trade trail 真係用 TRAIL_STOP_ATR",
+      "close_px + TRAIL_STOP_ATR * atr" in _pt_src
+      and "close_px - TRAIL_STOP_ATR * atr" in _pt_src, "冇 TRAIL_STOP_ATR 乘法")
+_m_arm = re.findall(r"profit >= ([\d.]+) \* atr", _pt_src)
+check("C2c paper_trade 冇寫死 arm 門檻", not _m_arm, f"仲有 {_m_arm}")
+check("C2d paper_trade arm 真係用 TRAIL_PROFIT_ATR",
+      "profit >= TRAIL_PROFIT_ATR * atr" in _pt_src, "冇 TRAIL_PROFIT_ATR 比較")
+_pt_e1 = re.search(r'TRAIL_STOP_ATR = _env_float\("TRAIL_STOP_ATR", ([\d.]+), ', _pt_src)
+_av_e1 = re.search(r"TRAIL_STOP_ATR = _env_float\('TRAIL_STOP_ATR', ([\d.]+), ", _av_src)
+check("C2e 兩邊 TRAIL_STOP_ATR 同名同 default",
+      bool(_pt_e1) and bool(_av_e1) and _pt_e1.group(1) == _av_e1.group(1),
+      f"pt={_pt_e1 and _pt_e1.group(1)} av={_av_e1 and _av_e1.group(1)}")
+_pt_e2 = re.search(r'TRAIL_PROFIT_ATR = _env_float\("TRAIL_PROFIT_ATR", ([\d.]+), ', _pt_src)
+_av_e2 = re.search(r"TRAIL_PROFIT_ATR = _env_float\('TRAIL_PROFIT_ATR', ([\d.]+), ", _av_src)
+check("C2f 兩邊 TRAIL_PROFIT_ATR 同名同 default",
+      bool(_pt_e2) and bool(_av_e2) and _pt_e2.group(1) == _av_e2.group(1),
+      f"pt={_pt_e2 and _pt_e2.group(1)} av={_av_e2 and _av_e2.group(1)}")
+# 以前顯示同行為各自寫死一個 1.5 → 兩個都可以獨立漂移而冇人發覺。
+# 第 2 項修完之後顯示直接引用行為來源，所以呢條 equality 係真嘅契約。
+check("C3 MOM_HOLD_TRAIL_ATR 就係 TRAIL_STOP_ATR（顯示 = 行為）",
+      av.MOM_HOLD_TRAIL_ATR == av.TRAIL_STOP_ATR,
+      f"{av.MOM_HOLD_TRAIL_ATR!r} vs {av.TRAIL_STOP_ATR!r}")
+# ⚠️ 上面嗰條單獨係**假守衛**：default 之下 TRAIL_STOP_ATR 本身就係 1.5，所以
+# `MOM_HOLD_TRAIL_ATR = 1.5` 一樣會 pass。要另外釘住「係引用，唔係寫死」。
+check("C3a MOM_HOLD_TRAIL_ATR 由 TRAIL_STOP_ATR 賦值（唔可以寫死數字）",
+      bool(re.search(r"MOM_HOLD_TRAIL_ATR = TRAIL_STOP_ATR\b", _av_src))
+      and not re.search(r"MOM_HOLD_TRAIL_ATR = [\d.]+", _av_src), "")
+check("C3b 文字用嘅倍數 == TRAIL_STOP_ATR",
       f"{av.MOM_HOLD_TRAIL_ATR:g}" in M[1] and f"{av.MOM_HOLD_TRAIL_ATR:g}" in M[2],
       M[1] + " | " + M[2])
+
+print("== C4. 行為證明: 改 env 真係改到 trail 幾何（唔止宣告）==")
+# source grep 證明唔到「真係讀嗰個 env」。用獨立 process 跑真 sim：
+# 獨立 process 先測得到 import-time 常數，而且杜絕殘留。
+_PROBE = r'''
+import json, os, sys
+from datetime import datetime, timedelta, timezone
+sys.path.insert(0, os.environ["REPO"])
+import pandas as pd, paper_trade as pt
+T0 = datetime(2026, 9, 1, 0, 0, tzinfo=timezone.utc)
+def bar(i, o, h, l, c):
+    return {"datetime": T0 + timedelta(minutes=30 * i),
+            "open": o, "high": h, "low": l, "close": c}
+# bar1 觸 TP1 4180 → arm BE(4199.85) + trail；bar2/3 價跌，trail 逐步收緊
+bars = pd.DataFrame([bar(1, 4200, 4201, 4178, 4180),
+                     bar(2, 4190, 4192, 4160, 4165),
+                     bar(3, 4170, 4175, 4150, 4155)])
+r = pt._simulate_staged_exit(bars, entry=4200, stop=4240, tp1=4180, tp2=4100,
+                             direction="SELL", atr=10, data_source="tv")
+print(json.dumps({"trail_stop": r.get("trail_stop"), "closed": r.get("closed"),
+                  "stop_const": pt.TRAIL_STOP_ATR, "arm_const": pt.TRAIL_PROFIT_ATR}))
+'''
+
+
+def _probe(extra):
+    env = dict(os.environ)
+    env.update(extra)
+    env["REPO"] = HERE
+    env.pop("MOMENTUM_HOLD_EXIT", None)
+    p = subprocess.run([sys.executable, "-c", _PROBE],
+                       capture_output=True, text=True, env=env)
+    for line in reversed(p.stdout.splitlines()):
+        if line.strip().startswith("{"):
+            return json.loads(line.strip())
+    raise AssertionError(f"probe 冇 JSON 輸出: out={p.stdout[-300:]!r} err={p.stderr[-300:]!r}")
+
+
+_d15 = _probe({"TRAIL_STOP_ATR": "1.5"})
+_d25 = _probe({"TRAIL_STOP_ATR": "2.5"})
+# 三支 bar 之後 trail_stop 必然 = 最後一支 close + TRAIL_STOP_ATR × atr
+# （4155 + 倍數×10）；1.5→4170、2.5→4180。
+check("C4a 1.5×ATR → trail_stop = close + 1.5×ATR (=4170)",
+      _d15["trail_stop"] == 4155 + 1.5 * 10, _d15)
+# ⭐ 呢條就係「第 2 項真係修好」嘅證據：以前 2.5 同 1.5 會出同一個數。
+check("C4b TRAIL_STOP_ATR=2.5 真係改到 trail_stop（唔再係 dead config）",
+      _d25["stop_const"] == 2.5 and _d25["trail_stop"] != _d15["trail_stop"],
+      f"1.5→{_d15['trail_stop']}  2.5→{_d25['trail_stop']}")
+check("C4c trail 距離逐條對公式（2.5×ATR → close + 25 = 4180）",
+      _d25["trail_stop"] == 4155 + 2.5 * 10, _d25)
+check("C4d 預設值 = 1.5（兩邊一致）", _d15["stop_const"] == 1.5, _d15)
+_bad = _probe({"TRAIL_STOP_ATR": "abc"})
+check("C4e 壞值唔 crash，warn + 用預設（cron 唔可以因一個 typo 冇晒信號）",
+      _bad["stop_const"] == 1.5, _bad)
+_nan = _probe({"TRAIL_STOP_ATR": "nan"})
+check("C4f nan 唔可以被接受（會令止損永遠唔觸發 = 靜默反轉）",
+      _nan["stop_const"] == 1.5, _nan)
+_zero = _probe({"TRAIL_STOP_ATR": "0"})
+check("C4g 0 唔可以被接受（0×ATR trail = 即時止損，唔係『停用』）",
+      _zero["stop_const"] == 1.5, _zero)
+
+print("== C5. 兩個模組嘅 _env_float 係同一個契約（行為對比，唔係對比源碼）==")
+# ⭐ 呢個係「唔可以有兩份實作」嘅守衛：唔比對源碼字面（改寫法就繞得過），
+# 而係逐個壞值真係 call 兩個函數，要求結果一致。
+
+
+def _read_both(val, allow_zero=False):
+    _old = os.environ.get("__PROBE_KNOB")
+    if val is None:
+        os.environ.pop("__PROBE_KNOB", None)
+    else:
+        os.environ["__PROBE_KNOB"] = val
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            _a = av._env_float("__PROBE_KNOB", 1.5, "t", allow_zero)
+            _p = pt._env_float("__PROBE_KNOB", 1.5, "t", allow_zero)
+    finally:
+        if _old is None:
+            os.environ.pop("__PROBE_KNOB", None)
+        else:
+            os.environ["__PROBE_KNOB"] = _old
+    return _a, _p
+
+
+_KNOB_VALUES = [None, "", "   ", "abc", "nan", "inf", "-inf", "-1", "0",
+                "1e400", "2.5", " 2.5 ", "0.0", "-0"]
+_mism = [(v, *_read_both(v)) for v in _KNOB_VALUES if _read_both(v)[0] != _read_both(v)[1]]
+check("C5a 逐個壞值兩邊結果一致", not _mism, _mism)
+check("C5b 合法值兩邊都收", _read_both("2.5") == (2.5, 2.5), _read_both("2.5"))
+check("C5c nan/inf/負/0 兩邊都拒（靜默反轉係比 crash 更壞嘅結果）",
+      all(_read_both(v) == (1.5, 1.5) for v in ["nan", "inf", "-inf", "-1", "0"]),
+      [_read_both(v) for v in ["nan", "inf", "-inf", "-1", "0"]])
+check("C5d 空字串／純空白 → 預設（cron 傳空變數唔算設定）",
+      _read_both("") == (1.5, 1.5) and _read_both("   ") == (1.5, 1.5),
+      (_read_both(""), _read_both("   ")))
+check("C5e allow_zero=True 時兩邊都收 0（馬丁「0=停用」契約冇改壞）",
+      _read_both("0", allow_zero=True) == (0.0, 0.0), _read_both("0", allow_zero=True))
 
 print("== D. 行為契約: 報告講嘅嘢 == 真 sim 做嘅嘢 ==")
 T0 = datetime(2026, 9, 1, 0, 0, tzinfo=timezone.utc)
@@ -288,6 +412,25 @@ for _f in sorted(glob.glob(os.path.expanduser("~/.hermes/reports/xauusd_v3_2026-
         if claims_both(_s):
             _live_hits += 1
 print(f"  ℹ️  本機 09-28 舊報告仍有矛盾嘅 setup: {_live_hits} 個（部署後會清零）")
+
+print("== I. rr_tp2 唔可以係「永遠唔會實現嘅回報風險比」==")
+_rr_sites = [x.strip() for x in re.findall(r"'rr_tp2':[^\n]*", _av_src)]
+check("I1 全部 5 個 rr_tp2 生產點都帶 rr_tp2_active 旗標",
+      len(_rr_sites) == 5 and all("rr_tp2_active" in x for x in _rr_sites), _rr_sites)
+check("I2 旗標真值來源 = MOMENTUM_HOLD_EXIT（同 tp2_active 同一真值，唔可以各說各話）",
+      all("not MOMENTUM_HOLD_EXIT" in x for x in _rr_sites), _rr_sites)
+check("I3 markdown 表唔可以無條件印 rr_tp2（改用 rr_tp2_cell）",
+      "R:R TP2 | {s['rr_tp2']}:1 |" not in _av_src and "rr_tp2_cell(s)" in _av_src, "")
+# 三態行為（用真 helper，唔係測試裡面另寫一份）
+_c_on = av.rr_tp2_cell({"rr_tp2": 2.0, "rr_tp2_active": True})
+_c_off = av.rr_tp2_cell({"rr_tp2": 2.0, "rr_tp2_active": False})
+_c_miss = av.rr_tp2_cell({"rr_tp2": 2.0})
+_c_null = av.rr_tp2_cell({"rr_tp2": 2.0, "rr_tp2_active": None})
+check("I4 三態 生效: 正常印，冇警告", _c_on == "2.0:1", _c_on)
+check("I5 三態 停用: 講明 TP2 唔會 fire", "停用" in _c_off and "2.0:1" in _c_off, _c_off)
+check("I6 三態 缺 key: 未確認（當 False 就會變鏡像版假主張）",
+      "未確認" in _c_miss and "停用" not in _c_miss, _c_miss)
+check("I7 null 亦係未確認（唔可以用 truthiness 夾）", "未確認" in _c_null, _c_null)
 
 print()
 print("=" * 70)
