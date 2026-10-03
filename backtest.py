@@ -202,6 +202,18 @@ LIMIT_ORDER_MAX_BARS = 48  # 48 H1 bars = 2 days; 48 M30 bars = 1 day
 # baselines are not silently re-based; flip the default once the walk-forward
 # numbers have been re-run under it.
 DAILY_TREND_COMPLETED_ONLY = os.environ.get('BT_DAILY_COMPLETED_ONLY', '0') == '1'
+# 2026-10-03 muse review HIGH3: exit-model parity with paper_trade.py.
+# Paper defaults MOMENTUM_HOLD_EXIT=1 (TP1 arms a BE/trail tail, fixed TP2
+# retired). Backtest previously always fired fixed TP2, so the same signal
+# produced a different R on each engine. Same env name, same default (=1):
+# =0 restores the legacy fixed-TP2 model on BOTH engines.
+MOMENTUM_HOLD_EXIT = os.environ.get('MOMENTUM_HOLD_EXIT', '1') == '1'
+# Live allows up to 3 same-direction concurrent positions (paper_trade
+# SAME_DIR_MAX_CONCURRENT=3); the backtest baseline is single-position.
+# 2026-10-03 HIGH4: default 1 = baseline-stable; =3 for live-like exposure.
+BT_MAX_CONCURRENT = int(os.environ.get('BT_MAX_CONCURRENT', '1') or 1)
+if BT_MAX_CONCURRENT < 1:
+    BT_MAX_CONCURRENT = 1
 # 2026-09-12 study B: the LIVE pipeline never sees a completed current-day
 # candle. fetch_data() pulls the daily frame from the chart at an intraday
 # moment, so its last row is a PARTIAL candle aggregated from the bars so far.
@@ -244,6 +256,31 @@ def daily_mode():
 def _daily_mode_flags():
     m = daily_mode()
     return m == 'completed', m == 'partial'
+
+
+# 2026-10-03 muse review HIGH2: gap-aware stop fill (parity with
+# paper_trade._exit_fill). A bar that OPENS beyond the stop never traded the
+# stop price — filling there is optimistic. bar_open=None keeps the legacy
+# fill so non-gap baselines are untouched.
+def _stop_fill(effective_stop, bar_open, is_buy, bar_low=None, bar_high=None):
+    """Stop fill that never prints a price the bar did not trade."""
+    import math
+    legacy = effective_stop - SLIPPAGE_TICKS if is_buy else effective_stop + SLIPPAGE_TICKS
+    try:
+        op = float(bar_open)
+    except (TypeError, ValueError):
+        return legacy
+    if not math.isfinite(op):
+        return legacy
+    px = min(effective_stop, op) if is_buy else max(effective_stop, op)
+    lo, hi = bar_low, bar_high
+    try:
+        lo, hi = float(lo), float(hi)
+    except (TypeError, ValueError):
+        lo = hi = None
+    if lo is not None and hi is not None and lo <= hi:
+        px = min(max(px, lo), hi)
+    return px - SLIPPAGE_TICKS if is_buy else px + SLIPPAGE_TICKS
 
 
 class Trade:
@@ -370,6 +407,11 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
     effective_stop = stop
     if trade.trail_active and trade.trail_stop is not None:
         effective_stop = trade.trail_stop
+    # 2026-10-03 HIGH1: freeze the PRE-BAR stop for the post-TP checks below.
+    # TP1 may arm the BE tail mid-bar (momentum-hold); firing it same-bar
+    # would assume the wick came after TP1, which OHLC cannot tell. A tail
+    # armed this bar takes effect next bar — same rule as the trail update.
+    pre_bar_stop = effective_stop
     stop_in = (bar_low <= effective_stop) if is_buy else (bar_high >= effective_stop)
 
     stop_first = False
@@ -384,7 +426,8 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
 
     if stop_in and stop_first:
         # Stop hit before any TP this bar: exit ALL open portions at stop price
-        exit_price = effective_stop - SLIPPAGE_TICKS if is_buy else effective_stop + SLIPPAGE_TICKS
+        # (gap-aware: a bar that opened beyond the stop fills at the open).
+        exit_price = _stop_fill(effective_stop, bar_open, is_buy, bar_low, bar_high)
         portion = trade.position_size / 3
         remaining = trade.position_size / 3
         if is_buy:
@@ -416,11 +459,20 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
             # P2 FIX: slippage on TP exit (buy at ask → higher fill for SELL close)
             fill = tp1 + SLIPPAGE_TICKS
             trade.pnl_tp1 = (entry - fill) * trade.position_size / 3 * CONTRACT_MULTIPLIER
+        # 2026-10-03 HIGH3: momentum-hold parity with paper_trade.py — TP1
+        # arms the BE tail immediately (stop level offset so the fill lands on
+        # entry exactly). The existing trail block below then tightens it.
+        if MOMENTUM_HOLD_EXIT and not trade.trail_active:
+            trade.trail_active = True
+            trade.trail_stop = ((entry + SLIPPAGE_TICKS) if is_buy
+                                else (entry - SLIPPAGE_TICKS))
 
     # ── TP2: exit 1/3 ──
     # If the stop is also inside this candle, do not claim TP2 after a
     # possible TP1 -> reversal -> stop path.
-    if tp2_in and not stop_in:
+    # 2026-10-03 HIGH3: under momentum-hold the fixed TP2 is retired once TP1
+    # arms the BE/trail tail (paper parity); the tail exits via trail/timeout.
+    if tp2_in and not stop_in and not (MOMENTUM_HOLD_EXIT and trade.tp1_hit):
         trade.tp2_hit = True
         if is_buy:
             fill = tp2 - SLIPPAGE_TICKS
@@ -436,11 +488,14 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
     remaining = trade.position_size / 3  # last 1/3
 
     if is_buy:
-        # Check stop hit using effective stop (original or trail from PREVIOUS bar)
-        effective_stop = trade.trail_stop if trade.trail_active else stop
+        # Check stop hit using the PRE-BAR stop (original or trail from a
+        # previous bar — never a tail armed by this bar's TP1; see HIGH1 note
+        # above). Gap-aware fill (HIGH2).
+        effective_stop = pre_bar_stop
         if bar_low <= effective_stop:
             # P2 FIX: slippage on stop exit (sell at bid → even lower for BUY stop)
-            exit_price = effective_stop - SLIPPAGE_TICKS
+            # 2026-10-03 HIGH2: gap-aware (fills at the open when gapped over).
+            exit_price = _stop_fill(effective_stop, bar_open, True, bar_low, bar_high)
             # P0 FIX: stop loss closes ALL remaining portions, not just tp3
             # If tp1/tp2 haven't hit yet, they also exit at stop price (loss)
             portion = trade.position_size / 3
@@ -456,10 +511,12 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
             return True
 
     else:  # SELL
-        effective_stop = trade.trail_stop if trade.trail_active else stop
+        # Same PRE-BAR-stop rule as the BUY branch (HIGH1 note above).
+        effective_stop = pre_bar_stop
         if bar_high >= effective_stop:
             # P2 FIX: slippage on stop exit (buy at ask → even higher for SELL stop)
-            exit_price = effective_stop + SLIPPAGE_TICKS
+            # 2026-10-03 HIGH2: gap-aware (fills at the open when gapped over).
+            exit_price = _stop_fill(effective_stop, bar_open, False, bar_low, bar_high)
             # P0 FIX: stop loss closes ALL remaining portions, not just tp3
             portion = trade.position_size / 3
             if not trade.tp1_hit:
@@ -918,8 +975,11 @@ def run_backtest(df_bars, df_day, verbose=False):
         # active (filled) position gate new entries.
         if i - last_trade_bar < TRADE_COOLDOWN:
             continue
-        if open_trades:
-            continue  # don't open new trades while one is active
+        # 2026-10-03 HIGH4: concurrency cap (parity with live SAME_DIR_MAX_
+        # CONCURRENT=3). Default 1 = the published single-position baseline,
+        # unchanged; BT_MAX_CONCURRENT=3 for a live-like exposure comparison.
+        if len(open_trades) >= BT_MAX_CONCURRENT:
+            continue  # at cap: update fills/pending only, no new entries
 
         # Find swing points on rolling window
         points = find_swings_ordered(window['High'].values, window['Low'].values, lookback=3)
@@ -1141,6 +1201,15 @@ def compute_stats(trades, starting_capital=10000.0):
         'trail_activated_rate': round(
             sum(1 for t in trades if t.trail_active) / len(trades) * 100, 1
         ),
+        # 2026-10-03 HIGH3/HIGH4: effective exit-model + concurrency in meta so
+        # a report always says which engine produced it (no silent env flip).
+        'exit_model': 'momentum-hold' if MOMENTUM_HOLD_EXIT else 'fixed-tp2',
+        'momentum_hold': bool(MOMENTUM_HOLD_EXIT),
+        'max_concurrent': int(BT_MAX_CONCURRENT),
+        'concurrency_note': ('single-position baseline (live allows 3)'
+                             if BT_MAX_CONCURRENT == 1 else
+                             f'live-like cap={BT_MAX_CONCURRENT}'),
+        'daily_mode': daily_mode(),
     }
 
     # Exit reason breakdown
@@ -1255,6 +1324,8 @@ def generate_report(stats, trades, per_pattern=None, days=60):
 **日期:** {today}
 **回測期間:** {days} 天 (yfinance GC=F M30)
 **策略:** 形態突破 + 多時間框架趨勢過濾 + 3 級止盈
+**出場模型:** {stats.get('exit_model', 'fixed-tp2')}（MOMENTUM_HOLD_EXIT=paper 同名同預設）
+**併發:** {stats.get('concurrency_note', 'single-position baseline (live allows 3)')}
 
 ---
 
