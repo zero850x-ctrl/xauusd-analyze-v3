@@ -412,6 +412,11 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
     # would assume the wick came after TP1, which OHLC cannot tell. A tail
     # armed this bar takes effect next bar — same rule as the trail update.
     pre_bar_stop = effective_stop
+    # 2026-10-03 ext-review (GLM+deepseek): freeze the PRE-BAR trail state
+    # for exit-reason labelling. TP1 may arm the BE tail mid-bar; a same-bar
+    # post-TP stop exit fills at the pre-bar stop, so labelling it
+    # 'Trailing stop' would lie — the tail only acts next bar.
+    pre_bar_trail = trade.trail_active
     stop_in = (bar_low <= effective_stop) if is_buy else (bar_high >= effective_stop)
 
     stop_first = False
@@ -506,7 +511,9 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
             trade.pnl_tp3 = (exit_price - entry) * remaining * CONTRACT_MULTIPLIER
             trade.exit_price = exit_price
             trade.exit_date = exit_date
-            trade.exit_reason = 'Trailing stop' if trade.trail_active else 'Stop loss'
+            # Label from PRE-BAR trail state: TP1 may have armed the BE tail
+            # this bar, but the fill is at the pre-bar stop (see freeze above).
+            trade.exit_reason = 'Trailing stop' if pre_bar_trail else 'Stop loss'
             trade.closed = True
             return True
 
@@ -526,7 +533,8 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
             trade.pnl_tp3 = (entry - exit_price) * remaining * CONTRACT_MULTIPLIER
             trade.exit_price = exit_price
             trade.exit_date = exit_date
-            trade.exit_reason = 'Trailing stop' if trade.trail_active else 'Stop loss'
+            # Same PRE-BAR-trail rule as the BUY branch (see freeze above).
+            trade.exit_reason = 'Trailing stop' if pre_bar_trail else 'Stop loss'
             trade.closed = True
             return True
 
@@ -1206,9 +1214,13 @@ def compute_stats(trades, starting_capital=10000.0):
         'exit_model': 'momentum-hold' if MOMENTUM_HOLD_EXIT else 'fixed-tp2',
         'momentum_hold': bool(MOMENTUM_HOLD_EXIT),
         'max_concurrent': int(BT_MAX_CONCURRENT),
-        'concurrency_note': ('single-position baseline (live allows 3)'
+        # 2026-10-03 ext-review: "live allows 3" overclaims on its own — live
+        # caps SAME-direction at 3 (both sides can total 6) while backtest
+        # caps TOTAL concurrent. Say exactly that.
+        'concurrency_note': ('single-position baseline (live allows 3 same-dir)'
                              if BT_MAX_CONCURRENT == 1 else
-                             f'live-like cap={BT_MAX_CONCURRENT}'),
+                             f'live-like cap={BT_MAX_CONCURRENT} TOTAL '
+                             f'(live caps same-dir at 3)'),
         'daily_mode': daily_mode(),
     }
 
@@ -1324,8 +1336,8 @@ def generate_report(stats, trades, per_pattern=None, days=60):
 **日期:** {today}
 **回測期間:** {days} 天 (yfinance GC=F M30)
 **策略:** 形態突破 + 多時間框架趨勢過濾 + 3 級止盈
-**出場模型:** {stats.get('exit_model', 'fixed-tp2')}（MOMENTUM_HOLD_EXIT=paper 同名同預設）
-**併發:** {stats.get('concurrency_note', 'single-position baseline (live allows 3)')}
+**出場模型:** {stats.get('exit_model', 'unknown')}（MOMENTUM_HOLD_EXIT=paper 同名同預設）
+**併發:** {stats.get('concurrency_note', 'single-position baseline (live allows 3 same-dir)')}
 
 ---
 

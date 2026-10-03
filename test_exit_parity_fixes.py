@@ -180,6 +180,43 @@ def test_stats_carry_exit_model_and_concurrency():
     assert "出場模型" in rep and "併發" in rep
 
 
+# ── ext-review (GLM #2): cross-engine parity, not just same-constant ──────
+
+def test_dual_engine_samebar_tp1_then_stop():
+    """GLM review MEDIUM-2: the parity CLAIM itself must be tested.
+
+    Same SELL signal, same single bar (takes TP1 then touches the pre-TP
+    stop): paper and backtest must close the SAME bar at the SAME price
+    with the SAME R and the SAME exit reason. Catches silent re-divergence
+    of the two engines — something per-engine tests cannot see.
+    """
+    os.environ["MOMENTUM_HOLD_EXIT"] = "1"
+    seed = pd.Timestamp("2026-09-01T00:00:00Z")
+    bar = _bar(pd.Timestamp("2026-09-01T00:30:00Z"), 4295.0, 4325.0, 4275.0, 4300.0)
+    # paper side
+    sim = pt._simulate_staged_exit(_df([bar]), 4300.0, 4320.0, 4280.0, 4260.0,
+                                   "SELL", 12.0, seed_dt=seed, data_source="tv")
+    # backtest side (momentum on, matching paper default)
+    old = bt.MOMENTUM_HOLD_EXIT
+    bt.MOMENTUM_HOLD_EXIT = True
+    try:
+        t = _mk_trade("SELL", 4300.0, 4320.0, 4280.0, 4260.0)
+        closed = bt.simulate_trade_on_bar(t, 4325.0, 4275.0, 4300.0, 12.0,
+                                          bar_open=4295.0,
+                                          exit_date="2026-09-01")
+    finally:
+        bt.MOMENTUM_HOLD_EXIT = old
+    assert sim["closed"] is True and closed is True, "both must close same bar"
+    assert sim["bars_held"] == 1
+    # same fill price (old stop + SELL slippage), same R, same reason class
+    assert abs(sim["close_price"] - t.exit_price) < 1e-9, \
+        "paper %r vs backtest %r" % (sim["close_price"], t.exit_price)
+    assert abs(sim["pnl_r"] - round(t.rr_achieved, 2)) < 0.02, \
+        "paper %r vs backtest %r" % (sim["pnl_r"], t.rr_achieved)
+    assert sim["result"] == "SL", "fill at pre-TP stop, not the tail: %r" % sim["result"]
+    assert t.exit_reason == "Stop loss", "got %r" % t.exit_reason
+
+
 if __name__ == "__main__":
     n = 0
     for name, fn in sorted(list(globals().items())):
