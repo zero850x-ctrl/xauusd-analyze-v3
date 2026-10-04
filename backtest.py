@@ -214,6 +214,16 @@ MOMENTUM_HOLD_EXIT = os.environ.get('MOMENTUM_HOLD_EXIT', '1') == '1'
 BT_MAX_CONCURRENT = int(os.environ.get('BT_MAX_CONCURRENT', '1') or 1)
 if BT_MAX_CONCURRENT < 1:
     BT_MAX_CONCURRENT = 1
+
+
+def _at_concurrency_cap(open_trades):
+    """2026-10-04 GPT-6 review: the HIGH4 gate as a testable predicate.
+
+    The =3 path never fires in the default suite (default 1 ≡ legacy
+    `if open_trades`), so the cap logic itself gets a direct unit test
+    instead of relying on a full walk-forward to reach it.
+    """
+    return len(open_trades) >= BT_MAX_CONCURRENT
 # 2026-09-12 study B: the LIVE pipeline never sees a completed current-day
 # candle. fetch_data() pulls the daily frame from the chart at an intraday
 # moment, so its last row is a PARTIAL candle aggregated from the bars so far.
@@ -986,7 +996,7 @@ def run_backtest(df_bars, df_day, verbose=False):
         # 2026-10-03 HIGH4: concurrency cap (parity with live SAME_DIR_MAX_
         # CONCURRENT=3). Default 1 = the published single-position baseline,
         # unchanged; BT_MAX_CONCURRENT=3 for a live-like exposure comparison.
-        if len(open_trades) >= BT_MAX_CONCURRENT:
+        if _at_concurrency_cap(open_trades):
             continue  # at cap: update fills/pending only, no new entries
 
         # Find swing points on rolling window

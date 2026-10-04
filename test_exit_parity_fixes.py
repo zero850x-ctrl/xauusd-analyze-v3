@@ -82,6 +82,44 @@ def test_paper_tp_only_bar_stays_live():
     assert sim["tp1_hit"] is True
 
 
+def test_paper_be_touch_not_old_stop_stays_live():
+    """2026-10-04 GPT-6 MEDIUM: the no-look-ahead rule needs its own test.
+
+    SELL bar takes TP1 then touches the NEWLY ARMED BE (4299.85) but never
+    the OLD stop (4320). The BE was armed mid-bar and OHLC cannot order the
+    wick after TP1 → must stay LIVE. A fix that wrongly fires the armed BE
+    same-bar would close here (and book ≈ +0.33R instead of staying open).
+    """
+    os.environ["MOMENTUM_HOLD_EXIT"] = "1"
+    seed = pd.Timestamp("2026-09-01T00:00:00Z")
+    bars = _df([
+        _bar(pd.Timestamp("2026-09-01T00:30:00Z"), 4290.0, 4305.0, 4275.0, 4290.0),
+    ])
+    sim = pt._simulate_staged_exit(bars, 4300.0, 4320.0, 4280.0, 4260.0,
+                                   "SELL", 12.0, seed_dt=seed, data_source="tv")
+    assert sim["tp1_hit"] is True
+    assert sim["closed"] is False, \
+        "BE touched but old stop untouched → must stay LIVE, got %r" % sim
+
+
+def test_backtest_be_touch_not_old_stop_stays_live():
+    """Backtest mirror of the GPT-6 no-look-ahead test: TP1 arms the BE tail
+    (trail_active True) yet the bar must NOT close — the pre-bar stop
+    (4320) was never touched."""
+    old = bt.MOMENTUM_HOLD_EXIT
+    bt.MOMENTUM_HOLD_EXIT = True
+    try:
+        t = _mk_trade("SELL", 4300.0, 4320.0, 4280.0, 4260.0)
+        closed = bt.simulate_trade_on_bar(t, 4305.0, 4275.0, 4290.0, 12.0,
+                                          bar_open=4290.0,
+                                          exit_date="2026-09-01")
+    finally:
+        bt.MOMENTUM_HOLD_EXIT = old
+    assert t.tp1_hit is True
+    assert t.trail_active is True, "BE tail must arm on TP1"
+    assert closed is False, "BE touched but old stop untouched → must stay open"
+
+
 # ── HIGH2: backtest gap-aware stop fill ───────────────────────────────────
 
 def test_backtest_gap_stop_fills_at_open_sell():
@@ -163,6 +201,23 @@ def test_backtest_legacy_fixed_tp2_with_env_off():
 def test_concurrency_default_is_baseline():
     """Default 1 = published single-position baseline, unchanged."""
     assert bt.BT_MAX_CONCURRENT == 1, "got %r" % bt.BT_MAX_CONCURRENT
+
+
+def test_concurrency_cap_predicate():
+    """2026-10-04 GPT-6 MEDIUM: the =3 path never fires in the default
+    suite, so test the gate predicate itself (the exact call run_backtest
+    uses): cap 1 blocks with 1 open; cap 3 admits a 2nd but blocks a 4th."""
+    opens = [_mk_trade("SELL", 4300.0, 4320.0, 4280.0, 4260.0)]
+    old = bt.BT_MAX_CONCURRENT
+    try:
+        bt.BT_MAX_CONCURRENT = 1
+        assert bt._at_concurrency_cap([]) is False
+        assert bt._at_concurrency_cap(opens) is True
+        bt.BT_MAX_CONCURRENT = 3
+        assert bt._at_concurrency_cap(opens) is False, "2nd position admitted"
+        assert bt._at_concurrency_cap(opens * 3) is True, "4th blocked"
+    finally:
+        bt.BT_MAX_CONCURRENT = old
 
 
 def test_stats_carry_exit_model_and_concurrency():
