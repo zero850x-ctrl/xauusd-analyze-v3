@@ -481,10 +481,16 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
         traded_max_high = high if traded_max_high is None else max(traded_max_high, high)
         traded_min_low = low if traded_min_low is None else min(traded_min_low, low)
         eff_stop = _effective_stop(stop, trail_stop, trail_active, is_sell)
+        # 2026-10-03 ext-review (GLM+deepseek): freeze the PRE-TP trail state
+        # for exit-reason labelling. The TP1 block below may arm the BE tail
+        # mid-bar; labelling a same-bar post-TP stop exit "Trail" would lie —
+        # the fill is at the pre-TP stop, the tail only acts next bar.
+        trail_exit_prebar = trail_active and trail_stop is not None
 
         tp_levels = [(tp1_hit, tp1)]
         if not (momentum_hold and tp1_hit):
             tp_levels.append((tp2_hit, tp2))
+        tp_hit_this_bar = False
         if is_sell:
             stop_in = high >= eff_stop
             tp_dists = [abs(lvl - bar_open) for hit, lvl in tp_levels
@@ -525,6 +531,7 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
 
         if not tp1_hit and tp1 > 0 and ((is_sell and low <= tp1) or (not is_sell and high >= tp1)):
             tp1_hit = True
+            tp_hit_this_bar = True
             fill = _exit_fill(tp1, raw_open, is_sell, is_stop=False,
                               bar_low=low, bar_high=high)
             r_tp1 = ((entry - fill) / risk if is_sell else (fill - entry) / risk) / 3.0
@@ -546,6 +553,39 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
             fill = _exit_fill(tp2, raw_open, is_sell, is_stop=False,
                               bar_low=low, bar_high=high)
             r_tp2 = ((entry - fill) / risk if is_sell else (fill - entry) / risk) / 3.0
+            tp_hit_this_bar = True
+
+        # ── Same-bar post-TP stop re-check (2026-10-03 muse review HIGH1) ──
+        # Uses the PRE-TP effective stop (computed before this bar's TP1/TP2).
+        # The BE tail armed by this bar's TP1 takes effect NEXT bar (same
+        # rule as the trail update below) — firing it same-bar would assume
+        # the BE-touching wick came after TP1, which OHLC cannot tell.
+        # Mirrors backtest.py's post-TP stop check (also pre-bar stop).
+        if tp_hit_this_bar:
+            hit2 = (high >= eff_stop) if is_sell else (low <= eff_stop)
+            if hit2:
+                fill = _exit_fill(eff_stop, raw_open, is_sell, is_stop=True,
+                                  bar_low=low, bar_high=high)
+                r_exit = (entry - fill) / risk if is_sell else (fill - entry) / risk
+                portions_open = 3 - (1 if tp1_hit else 0) - (1 if tp2_hit else 0)
+                total_r = r_tp1 + r_tp2 + r_exit * portions_open / 3.0
+                # Label from PRE-TP trail state (see freeze above): the fill
+                # is at the pre-TP stop even when TP1 just armed the BE tail.
+                trail_exit = trail_exit_prebar
+                verified = _guard_close(fill)
+                return {
+                    "closed": True,
+                    "result": "Trail" if trail_exit else "SL",
+                    "pnl_r": round(total_r, 2),
+                    "bars_held": bars_held,
+                    "close_price": round(fill, 2),
+                    "tp1_hit": tp1_hit,
+                    "tp2_hit": tp2_hit,
+                    "verified": verified,
+                    "data_source": data_source,
+                    "close_bar_time": (last_bar_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+                                       if last_bar_dt is not None else None),
+                }
 
         if bars_held >= MAX_BARS_HELD:
             fill = close_px + SLIPPAGE_TICKS if is_sell else close_px - SLIPPAGE_TICKS

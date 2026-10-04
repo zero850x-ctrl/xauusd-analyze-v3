@@ -251,6 +251,11 @@ def build_status(data, gc_note=None, dedup_note=None):
              f"數據源: {source}",
              f"時間: {hkt_now_str()} HKT",
              f"現價: ${data.get('price')}"]
+    # 2026-10-03 HIGH3: effective exit-model on REPORT so a silent env flip
+    # (MOMENTUM_HOLD_EXIT=0) is visible, not a number that quietly re-based.
+    _mom = os.environ.get("MOMENTUM_HOLD_EXIT", "1") == "1"
+    lines.append(f"出場模型: {'momentum-hold' if _mom else 'fixed-tp2'}"
+                 "（paper/backtest 同開關同預設）")
     if m5m15:
         lines.append(m5m15)
     # 正統 paper
