@@ -257,6 +257,21 @@ def build_format_a(data, candidates):
     return "\n".join(lines)
 
 
+def exit_model_label(data):
+    """Status-line exit model. The producer writes `exit_model` into the JSON.
+
+    Do not read MOMENTUM_HOLD_EXIT here. The report process and the engine
+    process are not the same, and a missing field must not be printed as
+    momentum-hold (that is the mirror of the false-TP2 claim).
+    """
+    model = data.get("exit_model") if isinstance(data, dict) else None
+    if model == "momentum-hold":
+        return "momentum-hold"
+    if model == "fixed-tp2":
+        return "fixed-tp2"
+    return "未確認（記錄缺 exit_model）"
+
+
 def build_status(data, gc_note=None, dedup_note=None):
     source = data.get("data_source") or "TradingView"
     m5m15 = m5m15_line(data)
@@ -267,6 +282,9 @@ def build_status(data, gc_note=None, dedup_note=None):
              f"數據源: {source}",
              f"時間: {hkt_now_str()} HKT",
              f"現價: ${data.get('price')}"]
+    # Exit model comes from the report JSON, not this process's environment.
+    lines.append(f"出場模型: {exit_model_label(data)}"
+                 "（以報告 JSON 為準）")
     if m5m15:
         lines.append(m5m15)
     # 正統 paper

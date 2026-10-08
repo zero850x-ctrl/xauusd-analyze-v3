@@ -4862,6 +4862,8 @@ def main():
             'date': today,
             'broker_date': broker_date,
             'generated_at': utc_now.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            # Report layer reads this. It must not re-read MOMENTUM_HOLD_EXIT.
+            'exit_model': 'momentum-hold' if MOMENTUM_HOLD_EXIT else 'fixed-tp2',
             'price': current,
             'data_source': _data_source_label(),
             'intraday_source': DATA_SOURCE,

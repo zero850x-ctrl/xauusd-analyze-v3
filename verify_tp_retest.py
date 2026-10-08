@@ -46,8 +46,13 @@ KNOWN LIMITATIONS (documented, not fixed here):
     to the dollar.
   * daily trend in backtest.run_backtest uses `df_day.index.date <= bar_date`
     → the current day's FULL candle (look-ahead). See BT_DAILY_COMPLETED_ONLY.
-  * exits use backtest.simulate_trade_on_bar (H1, fixed TP2, no BE), not the
-    live paper engine (M30, momentum-hold).
+  * exits use backtest.simulate_trade_on_bar on H1, not the live paper
+    engine (M30). Since 2026-10 the backtest default is MOMENTUM_HOLD_EXIT=1,
+    the same switch as paper: TP1 arms breakeven + trail and fixed TP2 is
+    retired. This harness does not pin the variable, so a re-run follows the
+    process environment. Set MOMENTUM_HOLD_EXIT=0 to reproduce the older
+    fixed-TP2, no-breakeven numbers. The result `_meta.exit_model` records
+    which one actually ran.
 
 DATA: Binance PAXGUSDT 1h, 5 years (same CSV as verify_entry_delay.py, not
 tracked in git — see .gitignore), weekends stripped so the calendar matches
@@ -426,6 +431,12 @@ def main():
             "retest_impl": "native_pending_orders",
             "limit_order_max_bars": bt.LIMIT_ORDER_MAX_BARS,
             "daily_mode": bt.daily_mode(),
+            "exit_model": ("momentum-hold" if bt.MOMENTUM_HOLD_EXIT
+                           else "fixed-tp2"),
+            "exit_model_note": (
+                "default follows MOMENTUM_HOLD_EXIT; "
+                "set =0 to reproduce pre-2026-10 fixed-TP2 numbers"
+            ),
             "daily_trend_completed_only": bt.daily_mode() == "completed",
             "daily_trend_partial_candle": bt.daily_mode() == "partial",
             "generated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

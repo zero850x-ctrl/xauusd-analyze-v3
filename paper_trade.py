@@ -546,6 +546,11 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
         traded_max_high = high if traded_max_high is None else max(traded_max_high, high)
         traded_min_low = low if traded_min_low is None else min(traded_min_low, low)
         eff_stop = _effective_stop(stop, trail_stop, trail_active, is_sell)
+        # 2026-10-03 ext-review (GLM+deepseek): freeze the PRE-TP trail state
+        # for exit-reason labelling. The TP1 block below may arm the BE tail
+        # mid-bar; labelling a same-bar post-TP stop exit "Trail" would lie —
+        # the fill is at the pre-TP stop, the tail only acts next bar.
+        trail_exit_prebar = trail_active and trail_stop is not None
 
         tp_levels = [(tp1_hit, tp1)]
         if not (momentum_hold and tp1_hit):
@@ -611,6 +616,38 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
             fill = _exit_fill(tp2, raw_open, is_sell, is_stop=False,
                               bar_low=low, bar_high=high)
             r_tp2 = ((entry - fill) / risk if is_sell else (fill - entry) / risk) / 3.0
+
+        # ── Same-bar stop when it was not the nearer level (HIGH1) ──
+        # The first check already closed the bar when the pre-TP stop was
+        # nearer than any TP. This one covers the rest: the stop traded, but
+        # a nearer TP was refused because the stop is also inside the bar
+        # (legacy TP2) or no TP filled at all. Gating on `tp_hit_this_bar`
+        # left that trade LIVE while the backtest booked the stop.
+        # Still the PRE-TP stop. A BE tail armed by this bar's TP1 takes
+        # effect next bar — OHLC cannot order that wick after TP1.
+        if stop_in:
+            fill = _exit_fill(eff_stop, raw_open, is_sell, is_stop=True,
+                              bar_low=low, bar_high=high)
+            r_exit = (entry - fill) / risk if is_sell else (fill - entry) / risk
+            portions_open = 3 - (1 if tp1_hit else 0) - (1 if tp2_hit else 0)
+            total_r = r_tp1 + r_tp2 + r_exit * portions_open / 3.0
+            # Label from PRE-TP trail state (see freeze above): the fill
+            # is at the pre-TP stop even when TP1 just armed the BE tail.
+            trail_exit = trail_exit_prebar
+            verified = _guard_close(fill)
+            return {
+                "closed": True,
+                "result": "Trail" if trail_exit else "SL",
+                "pnl_r": round(total_r, 2),
+                "bars_held": bars_held,
+                "close_price": round(fill, 2),
+                "tp1_hit": tp1_hit,
+                "tp2_hit": tp2_hit,
+                "verified": verified,
+                "data_source": data_source,
+                "close_bar_time": (last_bar_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+                                   if last_bar_dt is not None else None),
+            }
 
         if bars_held >= MAX_BARS_HELD:
             fill = close_px + SLIPPAGE_TICKS if is_sell else close_px - SLIPPAGE_TICKS
