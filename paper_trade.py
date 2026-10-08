@@ -89,6 +89,55 @@ JSON_PATH = _json_path()  # resolved at import; main() re-resolves via _json_pat
 MIN_HOLDING_BARS = 3          # 3 × M30 = 15 min minimum hold
 COOLDOWN_MINUTES = 15         # No new trade within 15 min of last close (enforced)
 MAX_BARS_HELD = 100           # Timeout exit, aligned with backtest.py (≈2 days M30)
+
+
+def _env_float(name, default, tag, allow_zero=False):
+    """Parse-safe, DOMAIN-safe float env read: a bad knob must not import-fail.
+
+    This module is imported by every strategy path, so an unguarded float() on
+    one override would halt trading that has nothing to do with it.
+
+    2026-09-18 review: catching ValueError is NOT enough, because a bad value can
+    silently INVERT a rule instead of failing:
+
+    - `nan` parses fine and every comparison against nan is False → a threshold
+      never trips and `nan <= 0` is not "disabled", so the rule is silently
+      abolished.
+    - `inf` / `1e400` is the mirror image: `x < inf` is always True, so the rule
+      goes quiet forever and is indistinguishable from "no rule".
+    - A negative (sign typo) has no meaning here and would silently disable it.
+
+    All three warn and fall back to the default, like a bad parse.
+
+    `allow_zero` is opt-in for knobs where 0 is a DOCUMENTED "disable" value
+    (martingale stale-level). Exit-geometry knobs must stay strictly positive:
+    a 0×ATR trail is an instant stop, not "off", so it is rejected.
+    """
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        print(f"⚠️ [{tag}] {name}={raw!r} 唔係數字 — 用預設 {default}")
+        return float(default)
+    if not math.isfinite(val) or val < 0 or (val == 0 and not allow_zero):
+        desc = "唔係有限非負數" if allow_zero else "唔係有限正數"
+        print(f"⚠️ [{tag}] {name}={raw!r} {desc} — 用預設 {default}")
+        return float(default)
+    return val
+
+
+# ═══════════════════════════════════════════════════════════
+# 出場參數（2026-09-28 修 dead config）
+# ═══════════════════════════════════════════════════════════
+# 以前呢兩個門檻係**寫死**喺 _simulate_staged_exit 入面（trail 距離 1.5、
+# legacy arm 門檻 2.0），令 `TRAIL_STOP_ATR` / `TRAIL_PROFIT_ATR` 環境變數
+# 完全冇效 —— 而報告層又照住 analyze_v3 嘅 `MOM_HOLD_TRAIL_ATR` 印
+# 「每 +$X 利潤」，於是顯示同實際行為唔一致。
+# ⚠️ 變數名同 default **必須同 analyze_v3.py 一致**（test 有 anti-drift 守衛）。
+TRAIL_PROFIT_ATR = _env_float("TRAIL_PROFIT_ATR", 2.0, "出場")   # 非 momentum-hold 時嘅 arm 門檻
+TRAIL_STOP_ATR = _env_float("TRAIL_STOP_ATR", 1.5, "出場")       # 移動止損距離（ATR 倍數）
 ANTI_MARTINGALE = True         # Block volume increase after consecutive losses
 # 2026-09-08 review: 5 was dead config — MAX_DAILY_LOSS_R=3 always fires first
 # (5 losses ≥ 3R). 3 same-day consecutive losses is the earliest point at which
@@ -172,6 +221,22 @@ def _parse_entry_from_setup(setup, current_price):
         if m:
             return float(m.group(1))
     return None
+
+
+def _setup_price(s, key):
+    """由 setup 字串抽價錢（`'$4048 (1.0 Fib ext)...'` → `4048.0`）。
+
+    2026-09-28: 呢個表達式原本喺 `seed_trades` 同 `run_backtest` 共 **4 處**
+    inline 重複。顯示格式一改（例如 `tp2` 加咗「⚠️ 停用」尾巴）就冇人知要
+    四處一齊驗 —— 抽成單一入口，令 `test_exit_plan_display.py` 可以測真身
+    而唔係複製一份解析邏輯（複製品永遠唔會 fail）。
+
+    語義**刻意**同原本 inline 完全一樣：key 唔存在 → `0.0`；存在但格式壞 →
+    照樣 raise（唔靜靜吞，維持原本嘅爆法）。
+    """
+    if key not in s:
+        return 0.0
+    return float(s[key].split("$")[1].split(" ")[0])
 
 
 def _last_close_dt(log):
@@ -572,18 +637,19 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
         # look-ahead bias (using bar close to set a stop that triggers
         # within the same bar).
         profit = (entry - close_px) if is_sell else (close_px - entry)
-        # Momentum-hold: once the BE tail is armed (TP1 hit), the 1.5-ATR
-        # trail updates from the next bar without waiting for the legacy
-        # 2-ATR profit threshold or a TP2 hit (TP2 no longer fires).
-        if (tp2_hit or profit >= 2.0 * atr
+        # Momentum-hold: once the BE tail is armed (TP1 hit), the trail updates
+        # from the next bar without waiting for the legacy TRAIL_PROFIT_ATR
+        # profit threshold or a TP2 hit (TP2 no longer fires).
+        # 2026-09-28: 門檻同距離以前係寫死嘅 2.0 / 1.5 → 兩個 env 變數完全冇效。
+        if (tp2_hit or profit >= TRAIL_PROFIT_ATR * atr
                 or (momentum_hold and tp1_hit)):
             if is_sell:
-                new_trail = close_px + 1.5 * atr
+                new_trail = close_px + TRAIL_STOP_ATR * atr
                 if trail_stop is None or new_trail < trail_stop:
                     trail_stop = new_trail
                 trail_stop = min(trail_stop, stop)
             else:
-                new_trail = close_px - 1.5 * atr
+                new_trail = close_px - TRAIL_STOP_ATR * atr
                 if trail_stop is None or new_trail > trail_stop:
                     trail_stop = new_trail
                 trail_stop = max(trail_stop, stop)
@@ -703,42 +769,8 @@ MART_REQUIRE_ALIGNED = os.environ.get("MART_ALIGNED_OFF") != "1"
 #     ledger grows.
 # All of those make a false fire MORE likely, and a false fire SHRINKS size, so
 # the uncertainty is on the safe side.
-# 0 disables the rule entirely.
-def _env_float(name, default):
-    """Parse-safe, DOMAIN-safe float env read: a bad knob must not import-fail.
-
-    This module is imported by every strategy path, so an unguarded float() on a
-    martingale-only override would halt trading that has nothing to do with it.
-
-    2026-09-18 review: catching ValueError is NOT enough, which matters here
-    because this knob silently INVERTS the rule when it goes wrong:
-
-    - `nan` parses fine, and every comparison against nan is False → `hours <
-      nan` never trips and `nan <= 0` is not "disabled", so `=nan` releases the
-      level on every check ⇒ the progression is silently abolished (always base
-      size). Exactly the silent-inversion class this rule exists to kill.
-    - `inf` / `1e400` is the mirror image: `hours < inf` is always True, so the
-      rule goes quiet forever and is indistinguishable from "no drought".
-    - A negative (sign typo, e.g. -14) has no meaning as a duration and would
-      silently disable the rule.
-
-    All three now warn and fall back to the default, like a bad parse.
-    """
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return float(default)
-    try:
-        val = float(raw)
-    except ValueError:
-        print(f"⚠️ [馬丁] {name}={raw!r} 唔係數字 — 用預設 {default}")
-        return float(default)
-    if not math.isfinite(val) or val < 0:
-        print(f"⚠️ [馬丁] {name}={raw!r} 唔係有限非負數 — 用預設 {default}")
-        return float(default)
-    return val
-
-
-MART_STALE_LEVEL_HOURS = _env_float("MART_STALE_LEVEL_HOURS", 14)
+# 0 disables the rule entirely (hence allow_zero=True below).
+MART_STALE_LEVEL_HOURS = _env_float("MART_STALE_LEVEL_HOURS", 14, "馬丁", allow_zero=True)
 
 
 
@@ -1473,8 +1505,8 @@ def seed_trades(data, setups=None):
                 continue
 
             stop = float(s["stop_loss"].replace("$", "").replace(",", ""))
-            tp1 = float(s["tp1"].split("$")[1].split(" ")[0]) if "tp1" in s else 0
-            tp2 = float(s["tp2"].split("$")[1].split(" ")[0]) if "tp2" in s else 0
+            tp1 = _setup_price(s, "tp1")
+            tp2 = _setup_price(s, "tp2")
 
             risk = abs(entry - stop)
             if risk <= 0:
@@ -2209,8 +2241,8 @@ def run_backtest(data):
             # Match backtest adverse entry fill: BUY pays ask, SELL sells bid.
             entry = entry - SLIPPAGE_TICKS if side == "SELL" else entry + SLIPPAGE_TICKS
             stop = float(s["stop_loss"].replace("$", "").replace(",", ""))
-            tp1 = float(s["tp1"].split("$")[1].split(" ")[0]) if "tp1" in s else 0
-            tp2 = float(s["tp2"].split("$")[1].split(" ")[0]) if "tp2" in s else 0
+            tp1 = _setup_price(s, "tp1")
+            tp2 = _setup_price(s, "tp2")
         except (IndexError, ValueError, AttributeError):
             continue
 
