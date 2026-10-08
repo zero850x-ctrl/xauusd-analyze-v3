@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Exit-parity fixes (2026-10-03 muse review, 4 HIGH) — offline, no network.
 
-HIGH1 (paper): same bar hits TP1 then reverses into the (newly armed BE)
-  stop → remaining portions must close THIS bar, not next bar.
+HIGH1 (paper): a bar that trades the PRE-TP stop closes the remainder
+  this bar, at that old stop. A breakeven tail armed by this bar's TP1
+  takes effect next bar. The re-check runs whenever the stop traded,
+  including when a nearer TP was refused because the stop is also inside
+  the bar (legacy TP2).
 HIGH2 (backtest): a bar that OPENS beyond the stop never traded the stop
   price → fill at the open (parity with paper _exit_fill), not at the stop.
 HIGH3 (backtest): MOMENTUM_HOLD_EXIT=1 (paper default) retires fixed TP2
@@ -24,6 +27,7 @@ except Exception:
     pass
 import paper_trade as pt
 import backtest as bt
+import xauusd_report as R
 
 SLIP = pt.SLIPPAGE_TICKS
 assert abs(SLIP - bt.SLIPPAGE_TICKS) < 1e-9, "slippage must match across engines"
@@ -270,6 +274,116 @@ def test_dual_engine_samebar_tp1_then_stop():
         "paper %r vs backtest %r" % (sim["pnl_r"], t.rr_achieved)
     assert sim["result"] == "SL", "fill at pre-TP stop, not the tail: %r" % sim["result"]
     assert t.exit_reason == "Stop loss", "got %r" % t.exit_reason
+
+
+def _legacy_both(side, entry, stop, tp1, tp2, bars, bt_bar):
+    """One legacy path on both engines. Returns (paper sim, backtest trade)."""
+    old_env = os.environ.get("MOMENTUM_HOLD_EXIT")
+    old_bt = bt.MOMENTUM_HOLD_EXIT
+    os.environ["MOMENTUM_HOLD_EXIT"] = "0"
+    bt.MOMENTUM_HOLD_EXIT = False
+    try:
+        seed = pd.Timestamp("2026-09-01T00:00:00Z")
+        sim = pt._simulate_staged_exit(
+            _df(bars), entry, stop, tp1, tp2, side, 12.0,
+            seed_dt=seed, data_source="tv")
+        t = _mk_trade(side, entry, stop, tp1, tp2)
+        for high, low, close, open_ in bt_bar:
+            closed = bt.simulate_trade_on_bar(
+                t, high, low, close, 12.0, bar_open=open_,
+                exit_date="2026-09-01")
+            if closed:
+                break
+    finally:
+        bt.MOMENTUM_HOLD_EXIT = old_bt
+        if old_env is None:
+            os.environ.pop("MOMENTUM_HOLD_EXIT", None)
+        else:
+            os.environ["MOMENTUM_HOLD_EXIT"] = old_env
+    return sim, t
+
+
+def test_legacy_sell_tp2_closer_than_stop_still_closes():
+    """Legacy SELL: TP2 is closer to the open than the stop, and the stop
+    also trades. TP2 is refused. Both engines close at the old stop."""
+    bars = [
+        _bar(pd.Timestamp("2026-09-01T00:30:00Z"), 4290.0, 4300.0, 4275.0, 4285.0),
+        _bar(pd.Timestamp("2026-09-01T01:00:00Z"), 4265.0, 4325.0, 4255.0, 4310.0),
+    ]
+    bt_bars = [
+        (4300.0, 4275.0, 4285.0, 4290.0),
+        (4325.0, 4255.0, 4310.0, 4265.0),
+    ]
+    sim, t = _legacy_both("SELL", 4300.0, 4320.0, 4280.0, 4260.0, bars, bt_bars)
+    assert sim["closed"] is True and t.closed is True
+    assert sim["tp1_hit"] is True and t.tp1_hit is True
+    assert sim["tp2_hit"] is False and t.tp2_hit is False
+    assert abs(sim["close_price"] - (4320.0 + SLIP)) < 1e-9, sim
+    assert abs(t.exit_price - sim["close_price"]) < 1e-9
+    assert sim["pnl_r"] == -0.34, sim["pnl_r"]
+    assert t.exit_reason == "Stop loss"
+
+
+def test_legacy_buy_tp2_closer_than_stop_still_closes():
+    """Same hole on the BUY side."""
+    bars = [
+        _bar(pd.Timestamp("2026-09-01T00:30:00Z"), 4310.0, 4325.0, 4305.0, 4315.0),
+        _bar(pd.Timestamp("2026-09-01T01:00:00Z"), 4335.0, 4345.0, 4275.0, 4290.0),
+    ]
+    bt_bars = [
+        (4325.0, 4305.0, 4315.0, 4310.0),
+        (4345.0, 4275.0, 4290.0, 4335.0),
+    ]
+    sim, t = _legacy_both("BUY", 4300.0, 4280.0, 4320.0, 4340.0, bars, bt_bars)
+    assert sim["closed"] is True and t.closed is True
+    assert sim["tp2_hit"] is False and t.tp2_hit is False
+    assert abs(sim["close_price"] - (4280.0 - SLIP)) < 1e-9, sim
+    assert abs(t.exit_price - sim["close_price"]) < 1e-9
+    assert sim["result"] == "SL"
+    assert t.exit_reason == "Stop loss"
+
+
+def test_limit_gap_stop_fills_at_open():
+    """Pending limit whose fill bar gaps through the stop uses _stop_fill."""
+    t = _mk_trade("BUY", 4300.0, 4280.0, 4320.0, 4340.0)
+    closed = []
+    bt.process_pending_orders(
+        [(t, 0)], bar_idx=1, bar_high=4310.0, bar_low=4260.0,
+        open_trades=[], closed_trades=closed, bar_open=4270.0)
+    want = bt._stop_fill(4280.0, 4270.0, True, 4260.0, 4310.0)
+    paper = pt._exit_fill(4280.0, 4270.0, False, True, bar_low=4260.0, bar_high=4310.0)
+    assert t.closed is True and t in closed
+    assert abs(want - (4270.0 - SLIP)) < 1e-9, want
+    assert abs(t.exit_price - want) < 1e-9, t.exit_price
+    assert abs(paper - want) < 1e-9, paper
+    # no open → previous stop±slippage fill
+    t2 = _mk_trade("BUY", 4300.0, 4280.0, 4320.0, 4340.0)
+    bt.process_pending_orders(
+        [(t2, 0)], bar_idx=1, bar_high=4310.0, bar_low=4260.0,
+        open_trades=[], closed_trades=[])
+    assert abs(t2.exit_price - (4280.0 - SLIP)) < 1e-9, t2.exit_price
+
+
+def test_status_exit_model_comes_from_json():
+    """The report must not re-read MOMENTUM_HOLD_EXIT."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "xauusd_report.py"), encoding="utf-8").read()
+    assert 'os.environ.get("MOMENTUM_HOLD_EXIT"' not in src
+    assert 'os.environ.get(\'MOMENTUM_HOLD_EXIT\'' not in src
+    av_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "analyze_v3.py"), encoding="utf-8").read()
+    assert "'exit_model': 'momentum-hold' if MOMENTUM_HOLD_EXIT" in av_src
+    old = os.environ.get("MOMENTUM_HOLD_EXIT")
+    os.environ["MOMENTUM_HOLD_EXIT"] = "0"
+    try:
+        assert R.exit_model_label({"exit_model": "momentum-hold"}) == "momentum-hold"
+        assert R.exit_model_label({"exit_model": "fixed-tp2"}) == "fixed-tp2"
+        assert "未確認" in R.exit_model_label({})
+    finally:
+        if old is None:
+            os.environ.pop("MOMENTUM_HOLD_EXIT", None)
+        else:
+            os.environ["MOMENTUM_HOLD_EXIT"] = old
 
 
 if __name__ == "__main__":

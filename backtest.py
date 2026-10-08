@@ -754,7 +754,7 @@ def setups_to_trades(setups, current_price, atr, bar_idx, bar_date, daily_trend,
 
 def process_pending_orders(pending_orders, bar_idx, bar_high, bar_low,
                            open_trades, closed_trades, verbose=False,
-                           last_trade_bar=None):
+                           last_trade_bar=None, bar_open=None):
     """Fill/expire pending limit orders against the current bar's range.
 
     2026-09-08 Cursor review fix (a): when a limit order fills, the SAME bar's
@@ -794,12 +794,15 @@ def process_pending_orders(pending_orders, bar_idx, bar_high, bar_low,
         # Filled on this bar. Same-bar stop check: if the stop also traded
         # within this bar's range, stop out immediately (touch-then-break).
         if stop_touched:
-            # P0-style full close: ALL remaining portions exit at stop price
-            if pend_trade.side == 'BUY':
-                pend_trade.exit_price = pend_trade.stop_price - SLIPPAGE_TICKS
+            # P0-style full close: ALL remaining portions exit at the stop.
+            # Gap-aware, same as simulate_trade_on_bar / paper _exit_fill.
+            # bar_open=None keeps the old stop±slippage fill.
+            is_buy = pend_trade.side == 'BUY'
+            pend_trade.exit_price = _stop_fill(
+                pend_trade.stop_price, bar_open, is_buy, bar_low, bar_high)
+            if is_buy:
                 dx = pend_trade.exit_price - pend_trade.entry_price
             else:
-                pend_trade.exit_price = pend_trade.stop_price + SLIPPAGE_TICKS
                 dx = pend_trade.entry_price - pend_trade.exit_price
             if not pend_trade.tp1_hit:
                 pend_trade.pnl_tp1 = dx * pend_trade.position_size / 3 * CONTRACT_MULTIPLIER
@@ -984,7 +987,8 @@ def run_backtest(df_bars, df_day, verbose=False):
         # ── 1b. Try to fill pending limit orders with this bar's range ──
         pending_orders, last_trade_bar = process_pending_orders(
             pending_orders, i, bar_high, bar_low, open_trades,
-            closed_trades, verbose=verbose, last_trade_bar=last_trade_bar)
+            closed_trades, verbose=verbose, last_trade_bar=last_trade_bar,
+            bar_open=bar_open)
 
         # ── 2. Scan for new setups (if cooldown expired) ──
         # NOTE (2026-09-08 Cursor review): pending limit orders do NOT block the
