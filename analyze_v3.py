@@ -181,8 +181,9 @@ TRAIL_STOP_ATR = _env_float('TRAIL_STOP_ATR', 1.5, '出場')
 # paper_trade.py 擁有**行為**；呢度係**讀者**，唔係第二份實作。兩邊預設必須
 # 一致 —— test_exit_plan_display.py 會逐字對比 source literal 釘住，唔靠記憶。
 #
-# momentum-hold（預設開）: TP1 之後餘下 2/3 掛移動止損跟勢，TP2 **永久唔會
-# fire**（paper_trade.py 條件短路）。legacy (=0) 才會 TP2 止賺 1/3、尾倉 1/3。
+# momentum-hold（預設開）: TP1 之後餘下 2/3 掛移動止損跟勢，TP2 喺 TP1 之後
+# 唔會 fire（paper_trade.py 條件短路；tp1<=0 嘅退化 setup 例外）。legacy (=0)
+# 先會 TP2 止賺 1/3、尾倉 1/3，而且唔會喺 TP1 後把止損移去 breakeven。
 MOMENTUM_HOLD_EXIT = os.environ.get('MOMENTUM_HOLD_EXIT', '1') == '1'
 # 2026-09-28 第 2 項修好之前，paper_trade.py 嘅 momentum-hold 路徑**硬編碼
 # 1.5**、唔讀 TRAIL_STOP_ATR，所以呢度唯有如實寫死 1.5。修好之後兩邊都讀
@@ -222,11 +223,16 @@ def exit_fields(tp2_price, tp2_label, tp3_trail_legacy, rr1=None):
     # ⚠️ legacy 嘅 exit_plan 原本係照抄 momentum-hold 版本（「餘下 2/3 無固定TP」），
     # 但 legacy 之下 TP2 係**有效**目標 ⇒ 嗰句係錯嘅。呢度改成準確描述，
     # 令兩個模式嘅文字都同實際一致（呢個就係今次修嘅目的）。
+    # legacy 唔會喺 TP1 後把止損移去 breakeven（嗰步只存在於 momentum-hold）。
+    # trail 距離跟 TRAIL_STOP_ATR，唔可以再寫死 1.5 —— 否則一設 env，tp3
+    # （trail_stop_text）同 exit_plan 即刻互相矛盾。
     if rr1 is not None:
-        plan = (f"TP1 (+{rr1:.1f}R) 後 SL→BE; 餘下 2/3: 1/3 到 TP2, "
-                f"1/3 跟 1.5 ATR 移動止損 (前輩式放飛: 平均贏$126/輸$27)")
+        plan = (f"TP1 (+{rr1:.1f}R) 後餘下 2/3: 1/3 到 TP2, "
+                f"1/3 跟 {TRAIL_STOP_ATR:g} ATR 移動止損 "
+                f"(前輩式放飛: 平均贏$126/輸$27)")
     else:
-        plan = ("TP1 後 SL→BE; 餘下 2/3: 1/3 到 TP2, 1/3 跟 1.5 ATR 移動止損")
+        plan = (f"TP1 後餘下 2/3: 1/3 到 TP2, "
+                f"1/3 跟 {TRAIL_STOP_ATR:g} ATR 移動止損")
     return tp2, tp3, plan
 
 
@@ -247,6 +253,50 @@ def rr_tp2_cell(setup):
     if active is False:
         return f"{rr}:1 — ⚠️ 停用 (TP2 唔會 fire)"
     return f"{rr}:1 — ⚠️ 未確認 (記錄缺 rr_tp2_active)"
+
+
+def setup_share_labels(setup):
+    """Signal 表嘅 TP2／TP3 列名。份額跟 `tp2_active`，唔可以寫死 (1/3)。
+
+    True → 兩級各 1/3。False → TP2 已停用，尾倉係餘下 2/3（再寫 (1/3) 就係
+    今次事故）。缺欄位 → 未確認，兩邊都唔主張。
+    """
+    active = setup.get("tp2_active") if isinstance(setup, dict) else None
+    if active is True:
+        return "🎯 TP2 (1/3)", "🎯 TP3 (1/3)"
+    if active is False:
+        return "🎯 TP2 (停用)", "🎯 尾倉 (餘下 2/3)"
+    return "🎯 TP2 (未確認)", "🎯 TP3 (未確認)"
+
+
+def static_exit_copy(atr):
+    """法則表、日誌範本、追蹤止損列。模式跟 MOMENTUM_HOLD_EXIT。
+
+    momentum-hold 嘅 trail 由 TP1 起 arm，距離係 MOM_HOLD_TRAIL_ATR。
+    legacy 先用「利潤達 TRAIL_PROFIT_ATR 先 arm、距離 TRAIL_STOP_ATR」。
+    """
+    if MOMENTUM_HOLD_EXIT:
+        mult = f"{MOM_HOLD_TRAIL_ATR:g}"
+        return {
+            "rule_tp2": "停用（TP1 後唔會 fire；價位只供參考）",
+            "rule_tp3": f"TP1 後餘下 2/3 跟 {mult}×ATR 移動止損（無固定目標）",
+            "journal_tp2": "🎯 TP2: 停用 (momentum-hold)",
+            "journal_tp3": f"🎯 尾倉 (餘下 2/3): 跟 {mult}×ATR 移動止損",
+            "trail_rule": (
+                f"TP1 後餘下 2/3 跟 {mult}×ATR 移動止損"
+                f"（由 TP1 起 arm，唔係等 +{TRAIL_PROFIT_ATR:g}×ATR）"
+            ),
+        }
+    return {
+        "rule_tp2": "2:1 RR 或 1.0 Fib ext (取較遠，比 TP1 更遠)，止賺 1/3",
+        "rule_tp3": (
+            f"放飛 + {TRAIL_STOP_ATR:g}×ATR 移動止損"
+            f"（尾倉 1/3；利潤達 {TRAIL_PROFIT_ATR:g}×ATR 先 arm）"
+        ),
+        "journal_tp2": "🎯 TP2 (1/3): ___",
+        "journal_tp3": "🎯 TP3 (1/3): 放飛 (追蹤止損)",
+        "trail_rule": trail_stop_text(atr),
+    }
 
 
 def _log(msg):
@@ -364,6 +414,38 @@ def trail_stop_text(atr):
         f"追蹤止損: 每 +${atr * TRAIL_PROFIT_ATR:.0f} 利潤, "
         f"止損移 ${atr * TRAIL_STOP_ATR:.0f}"
     )
+
+
+def apply_trail_overrides(trail_profit, trail_stop):
+    """CLI `--trail-profit` / `--trail-stop`.
+
+    `MOM_HOLD_TRAIL_ATR = TRAIL_STOP_ATR` 係 import 時抄咗個 float。之後只改
+    `TRAIL_STOP_ATR` 會令 momentum 文字停喺舊倍數、legacy `tp3` 用新倍數。
+    呢度兩個一齊改。`argparse` 嘅 `type=float` 會接受 nan；無效值唔寫入，
+    同 `_env_float` 一樣留低原值。
+    """
+    global TRAIL_PROFIT_ATR, TRAIL_STOP_ATR, MOM_HOLD_TRAIL_ATR
+
+    def _accept(flag, val):
+        if val is None:
+            return None
+        try:
+            num = float(val)
+        except (TypeError, ValueError):
+            _log(f"⚠️ [出場] {flag}={val!r} 唔係數字 — 保持原值")
+            return None
+        if (num != num) or num in (float("inf"), float("-inf")) or num <= 0:
+            _log(f"⚠️ [出場] {flag}={val!r} 唔係有限正數 — 保持原值")
+            return None
+        return num
+
+    profit = _accept("--trail-profit", trail_profit)
+    stop = _accept("--trail-stop", trail_stop)
+    if profit is not None:
+        TRAIL_PROFIT_ATR = profit
+    if stop is not None:
+        TRAIL_STOP_ATR = stop
+        MOM_HOLD_TRAIL_ATR = TRAIL_STOP_ATR
 
 
 def _breakout_status(df, direction, support=None, resistance=None, tol=0, points=None):
@@ -4270,6 +4352,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
             zone_row = ""
             if s.get('zone_label'):
                 zone_row = f"\n| 🧲 位測試 | {s['zone_label']} |"
+            tp2_lab, tp3_lab = setup_share_labels(s)
             setup_text += f"""
 ### Signal {i}: {s['direction']} ({s['pattern']})
 
@@ -4287,8 +4370,8 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 🛑 止損 | {s['stop_loss']} |
 | 止損理由 | {s['stop_rationale']} |
 | 🎯 TP1 (1/3) | {s['tp1']} |
-| 🎯 TP2 (1/3) | {s['tp2']} |
-| 🎯 TP3 (1/3) | {s['tp3']} |
+| {tp2_lab} | {s['tp2']} |
+| {tp3_lab} | {s['tp3']} |
 | 風險金額 | ${s['risk_amount']:.0f} |
 | R:R TP1 | {s['rr_tp1']}:1 |
 | R:R TP2 | {rr_tp2_cell(s)} |
@@ -4404,7 +4487,12 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
     # Risk summary
     avg_risk = np.mean([s['risk_amount'] for s in setups]) if setups else atr_m30 * 2
     
-    trail_rule = trail_stop_text(atr_m30)
+    _exit_copy = static_exit_copy(atr_m30)
+    trail_rule = _exit_copy["trail_rule"]
+    rule_tp2 = _exit_copy["rule_tp2"]
+    rule_tp3 = _exit_copy["rule_tp3"]
+    journal_tp2 = _exit_copy["journal_tp2"]
+    journal_tp3 = _exit_copy["journal_tp3"]
 
     # Candlestick text builders
     def _candle_list_text(candles):
@@ -4568,8 +4656,8 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 | 🛑 止損 | 前頂之上 / 前底之下 + 1 ATR (必設!) |
 | 🎯 TP1 (1/3) | 1:1 RR 或 0.618 Fib ext (取較近) |
 | 🔄 0.786 深度回調 | 實驗性（港股 playbook，**未經 XAUUSD 138-sample 驗證**）; SL=回調浪極端, TP1=0.618, TP2=浪頂/底 |
-| 🎯 TP2 (1/3) | 2:1 RR 或 1.0 Fib ext (取較遠，比 TP1 更遠) |
-| 🎯 TP3 (1/3) | 放飛 + 追蹤止損 |
+| 🎯 TP2 | {rule_tp2} |
+| 🎯 TP3 | {rule_tp3} |
 | ⏰ 最佳時段 | 17:00 (broker time) — 138-sample 64.3% 勝, +$340 (n=14) |
 | 🚫 危險時段 | 07:00 + 18:00 broker — 138-sample hard-block (25% / 21.4% 勝) |
 | ⚠️ 謹慎時段 | 04-06/08 broker — 138-sample 23.8% 勝, -$558 (advisory) |
@@ -4635,8 +4723,8 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 📍 入場價: ___
 🛑 止損價: ___
 🎯 TP1 (1/3): ___
-🎯 TP2 (1/3): ___
-🎯 TP3 (1/3): 放飛 (追蹤止損)
+{journal_tp2}
+{journal_tp3}
 💰 風險: $___
 📊 R:R: ___:1
 📝 結果:
@@ -4666,12 +4754,8 @@ def main():
                         help='Trailing stop distance in ATR multiples (default: 1.5, env: TRAIL_STOP_ATR)')
     args = parser.parse_args()
 
-    # Override trail params if specified via CLI
-    global TRAIL_PROFIT_ATR, TRAIL_STOP_ATR
-    if args.trail_profit is not None:
-        TRAIL_PROFIT_ATR = args.trail_profit
-    if args.trail_stop is not None:
-        TRAIL_STOP_ATR = args.trail_stop
+    # CLI overrides stay aliased: MOM_HOLD_TRAIL_ATR tracks TRAIL_STOP_ATR.
+    apply_trail_overrides(args.trail_profit, args.trail_stop)
     
     # 1. Fetch data
     df_m30, df_h1, df_m15, df_m5, df_day = fetch_data()

@@ -72,8 +72,26 @@ check("B2 tp3 legacy 逐字", L[1] == "放飛 + TRAILTEXT (尾倉 1/3)", L[1])
 # 但 legacy 之下 TP2 有效 → 嗰句係錯。今次一併改準。
 check("B3 legacy exit_plan 準確（唔可以講『無固定TP』）",
       "1/3 到 TP2" in L[2] and "無固定TP" not in L[2], L[2])
+av.MOMENTUM_HOLD_EXIT = False
 _b2 = av.exit_fields(4213, 'X', 'T', rr1=1.0)
+av.MOMENTUM_HOLD_EXIT = True
 check("B4 legacy rr1 版有 前輩式 + R 值", "1.0R" in _b2[2] and "前輩式" in _b2[2], _b2[2])
+check("B5 legacy exit_plan 唔講 SL→BE（legacy 唔會移去 breakeven）",
+      "SL→BE" not in L[2] and "SL→BE" not in _b2[2], L[2] + " | " + _b2[2])
+check("B6 legacy 源碼用 TRAIL_STOP_ATR，冇寫死 1.5 ATR",
+      "跟 {TRAIL_STOP_ATR:g} ATR" in open(
+          os.path.join(HERE, "analyze_v3.py"), encoding="utf-8").read()
+      and "跟 1.5 ATR" not in open(
+          os.path.join(HERE, "analyze_v3.py"), encoding="utf-8").read(),
+      "")
+_saved_trail = (av.TRAIL_STOP_ATR, av.MOM_HOLD_TRAIL_ATR, av.MOMENTUM_HOLD_EXIT)
+av.TRAIL_STOP_ATR = 2.5
+av.MOM_HOLD_TRAIL_ATR = 2.5
+av.MOMENTUM_HOLD_EXIT = False
+_b7 = av.exit_fields(4048, "2:1 RR", "TRAILTEXT", rr1=1.0)
+av.TRAIL_STOP_ATR, av.MOM_HOLD_TRAIL_ATR, av.MOMENTUM_HOLD_EXIT = _saved_trail
+check("B7 TRAIL_STOP_ATR=2.5 時 legacy plan 講 2.5、唔講 1.5",
+      "2.5" in _b7[2] and "1.5" not in _b7[2] and "SL→BE" not in _b7[2], _b7[2])
 
 print("== C. Anti-drift: 顯示讀數 == paper_trade 行為來源 ==")
 _av_src = open(os.path.join(HERE, "analyze_v3.py"), encoding="utf-8").read()
@@ -117,6 +135,20 @@ check("C3a MOM_HOLD_TRAIL_ATR 由 TRAIL_STOP_ATR 賦值（唔可以寫死數字�
 check("C3b 文字用嘅倍數 == TRAIL_STOP_ATR",
       f"{av.MOM_HOLD_TRAIL_ATR:g}" in M[1] and f"{av.MOM_HOLD_TRAIL_ATR:g}" in M[2],
       M[1] + " | " + M[2])
+# --trail-stop 只改 TRAIL_STOP_ATR 會令 momentum 文字停喺 import 時嘅舊倍數。
+_cli_saved = (av.TRAIL_PROFIT_ATR, av.TRAIL_STOP_ATR, av.MOM_HOLD_TRAIL_ATR)
+av.apply_trail_overrides(None, 2.5)
+check("C3c --trail-stop 2.5 同時改 TRAIL_STOP_ATR 同 MOM_HOLD_TRAIL_ATR",
+      av.TRAIL_STOP_ATR == 2.5 and av.MOM_HOLD_TRAIL_ATR == 2.5,
+      f"stop={av.TRAIL_STOP_ATR} mom={av.MOM_HOLD_TRAIL_ATR}")
+_buf = io.StringIO()
+with contextlib.redirect_stdout(_buf):
+    av.apply_trail_overrides(None, float("nan"))
+check("C3d --trail-stop nan 唔寫入（保持 2.5）",
+      av.TRAIL_STOP_ATR == 2.5 and av.MOM_HOLD_TRAIL_ATR == 2.5
+      and "有限正數" in _buf.getvalue(),
+      _buf.getvalue())
+av.TRAIL_PROFIT_ATR, av.TRAIL_STOP_ATR, av.MOM_HOLD_TRAIL_ATR = _cli_saved
 
 print("== C4. 行為證明: 改 env 真係改到 trail 幾何（唔止宣告）==")
 # source grep 證明唔到「真係讀嗰個 env」。用獨立 process 跑真 sim：
@@ -309,6 +341,33 @@ check("E5 5 個 site 都 emit tp2_active（report 層靠佢）",
 _pt_dup = _pt_src.count('split("$")[1].split(" ")[0]')
 check("E6 paper_trade 只淨 1 處抽價（helper 本身），冇 inline 重複",
       _pt_dup == 1, f"n={_pt_dup}")
+check("E7 signal 表用 setup_share_labels，唔寫死 TP2/TP3 (1/3) 列",
+      "setup_share_labels(" in _av_src
+      and "| 🎯 TP2 (1/3) | {s['tp2']} |" not in _av_src
+      and "| 🎯 TP3 (1/3) | {s['tp3']} |" not in _av_src
+      and "static_exit_copy(" in _av_src, "")
+check("E8 momentum 列名：TP2 停用、尾倉係餘下 2/3",
+      av.setup_share_labels({"tp2_active": False})
+      == ("🎯 TP2 (停用)", "🎯 尾倉 (餘下 2/3)"))
+check("E9 legacy 列名仍然係各 1/3",
+      av.setup_share_labels({"tp2_active": True})
+      == ("🎯 TP2 (1/3)", "🎯 TP3 (1/3)"))
+check("E10 缺 tp2_active → 未確認（唔可以寫 (1/3)）",
+      av.setup_share_labels({}) == ("🎯 TP2 (未確認)", "🎯 TP3 (未確認)"))
+_mom_copy = av.static_exit_copy(10)
+check("E11 momentum 法則表唔再寫死 1/3，trail 由 TP1 起",
+      "停用" in _mom_copy["rule_tp2"] and "2/3" in _mom_copy["rule_tp3"]
+      and "(1/3)" not in _mom_copy["rule_tp2"]
+      and "由 TP1 起" in _mom_copy["trail_rule"]
+      and f"{av.MOM_HOLD_TRAIL_ATR:g}" in _mom_copy["trail_rule"],
+      _mom_copy)
+av.MOMENTUM_HOLD_EXIT = False
+_leg_copy = av.static_exit_copy(10)
+av.MOMENTUM_HOLD_EXIT = True
+check("E12 legacy 法則表先講 1/3，trail 用利潤門檻",
+      "1/3" in _leg_copy["rule_tp2"] and "1/3" in _leg_copy["rule_tp3"]
+      and "每 +" in _leg_copy["trail_rule"],
+      _leg_copy)
 
 print("== G. Report 層（Telegram 文字）唔可以主張假 TP2 ==")
 _base = {"pattern": "🚩 Bear Flag (熊旗)", "direction": "🔴 SELL", "entry_price": 4157.0,
@@ -375,14 +434,11 @@ def _orig_parse(s, key):
     return float(s[key].split("$")[1].split(" ")[0]) if key in s else 0
 
 
-_n_ok = _n_bad = 0
-_bad_ex = ""
-for _f in sorted(glob.glob(os.path.expanduser("~/.hermes/reports/xauusd_v3_*.json"))):
-    try:
-        _d = json.load(open(_f, encoding="utf-8"))
-    except Exception:
-        continue
-    for _s in (_d.get("setups") or []):
+def _h5_scan(setups, label):
+    """Compare helper vs the old inline parse. Returns (ok, bad, example)."""
+    ok = bad = 0
+    example = ""
+    for _s in setups:
         for _k in ("tp1", "tp2"):
             try:
                 _x = pt._setup_price(dict(_s), _k)
@@ -393,13 +449,35 @@ for _f in sorted(glob.glob(os.path.expanduser("~/.hermes/reports/xauusd_v3_*.jso
             except Exception as _e:  # noqa: BLE001
                 _y = f"raise:{type(_e).__name__}"
             if _x == _y:
-                _n_ok += 1
+                ok += 1
             else:
-                _n_bad += 1
-                if not _bad_ex:
-                    _bad_ex = f"{os.path.basename(_f)} {_k}: helper={_x} inline={_y}"
-check("H5 真 helper vs 舊 inline 表達式喺真 setup 上逐值一致",
-      _n_ok > 0 and _n_bad == 0, f"一致 {_n_ok}／唔同 {_n_bad} {_bad_ex}")
+                bad += 1
+                if not example:
+                    example = f"{label} {_k}: helper={_x} inline={_y}"
+    return ok, bad, example
+
+
+# 提交咗嘅 fixture 保證任何機器都有樣本。本機舊報告只係加分，冇檔唔算失敗。
+_H5_FIXTURES = [
+    {"tp1": "$4128 (1:1 RR, 止賺 1/3)", "tp2": "$4048 (1.0 Fib ext, 止賺 1/3)"},
+    {"tp1": "$4128 (1:1 RR, 止賺 1/3)", "tp2": M[0]},
+    {"tp2": "$4017 (1.0 Fib ext, 止賺 1/3)"},
+]
+_n_ok, _n_bad, _bad_ex = _h5_scan(_H5_FIXTURES, "fixture")
+_n_live = 0
+for _f in sorted(glob.glob(os.path.expanduser("~/.hermes/reports/xauusd_v3_*.json"))):
+    try:
+        _d = json.load(open(_f, encoding="utf-8"))
+    except Exception:
+        continue
+    _ok, _bad, _ex = _h5_scan(_d.get("setups") or [], os.path.basename(_f))
+    _n_ok += _ok
+    _n_bad += _bad
+    _n_live += _ok + _bad
+    if _ex and not _bad_ex:
+        _bad_ex = _ex
+check("H5 helper vs 舊 inline：fixture 必跑，本機報告可有可無",
+      _n_ok > 0 and _n_bad == 0, f"一致 {_n_ok}／唔同 {_n_bad} live={_n_live} {_bad_ex}")
 
 print("== F. 矛盾偵測器有牙 ==")
 
