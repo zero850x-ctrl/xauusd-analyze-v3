@@ -32,6 +32,15 @@ from datetime import datetime, timezone, timedelta
 
 # Match backtest.py's adverse execution model.
 SLIPPAGE_TICKS = 0.15
+
+# 2026-10-10 review: single source for the exit model, captured ONCE at import.
+# The env still works (`MOMENTUM_HOLD_EXIT=0 python3 paper_trade.py`), but the
+# value is frozen here so a change made while a position is open cannot rewrite
+# that position's outcome — every trade records the model it was seeded under
+# and `_simulate_staged_exit` prefers that pinned value over the environment.
+# The default (1) must stay equal to analyze_v3's; test_exit_plan_display C1
+# asserts both sides agree.
+MOMENTUM_HOLD_EXIT = os.environ.get("MOMENTUM_HOLD_EXIT", "1") == "1"
 import numpy as np
 import yfinance as yf
 
@@ -269,7 +278,14 @@ def _effective_stop(stop, trail_stop, trail_active, is_sell):
 
 
 def _finite_px(val):
-    """Parse a price; None if missing / non-finite (never default to 0)."""
+    """Parse a price; None if missing / non-finite (never default to 0).
+
+    2026-10-10 review: `bool` is rejected explicitly. `float(True) == 1.0`, so a
+    JSON `true` where a price belongs silently became a $1.00 price — a value
+    that passes every finite check and produces a nonsense R.
+    """
+    if isinstance(val, bool):
+        return None
     try:
         x = float(val)
     except (TypeError, ValueError):
@@ -470,7 +486,7 @@ def _counts_toward_r(record):
 
 
 def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=None, data_source="tv",
-                          init_state=None):
+                          init_state=None, exit_model=None):
     """Bar-by-bar staged exit simulation (shared by check_outcomes and --backtest).
 
     Returns dict with keys: closed, result, pnl_r, bars_held, tp1_hit, tp2_hit,
@@ -502,7 +518,18 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
     # 2/3 rides a trailing stop instead of fixed TP2, and the effective stop
     # moves to breakeven so a late reversal can never turn the trade into a
     # full loss. Set MOMENTUM_HOLD_EXIT=0 to restore fixed-TP2 behaviour.
-    momentum_hold = os.environ.get("MOMENTUM_HOLD_EXIT", "1") == "1"
+    #
+    # 2026-10-10 review: pin the model to the TRADE, not the tick. Reading the
+    # environment on every call meant flipping MOMENTUM_HOLD_EXIT retroactively
+    # rewrote the outcome of an ALREADY-OPEN position — the same trade could
+    # report -0.34R in one tick and +2R in the next with no record saying which
+    # model produced either. `exit_model` (persisted at seed, restored with
+    # `sim_state`) wins over the environment; only a brand-new trade with no
+    # pinned value reads the env.
+    if exit_model is None:
+        exit_model = st.get("exit_model")
+    momentum_hold = (bool(exit_model) if exit_model is not None
+                     else os.environ.get("MOMENTUM_HOLD_EXIT", "1") == "1")
     traded_max_high = None
     traded_min_low = None
     last_bar_dt = None
@@ -578,6 +605,7 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
                 "result": "Trail" if trail_exit else "SL",
                 "pnl_r": round(total_r, 2),
                 "bars_held": bars_held,
+                "exit_model": momentum_hold,
                 "close_price": round(fill, 2),
                 "tp1_hit": tp1_hit,
                 "tp2_hit": tp2_hit,
@@ -640,6 +668,7 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
                 "result": "Trail" if trail_exit else "SL",
                 "pnl_r": round(total_r, 2),
                 "bars_held": bars_held,
+                "exit_model": momentum_hold,
                 "close_price": round(fill, 2),
                 "tp1_hit": tp1_hit,
                 "tp2_hit": tp2_hit,
@@ -660,6 +689,7 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
                 "result": f"Timeout ({MAX_BARS_HELD} bars)",
                 "pnl_r": round(total_r, 2),
                 "bars_held": bars_held,
+                "exit_model": momentum_hold,
                 "close_price": round(fill, 2),
                 "tp1_hit": tp1_hit,
                 "tp2_hit": tp2_hit,
@@ -697,6 +727,7 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
         "result": "LIVE",
         "pnl_r": 0.0,
         "bars_held": bars_held,
+        "exit_model": momentum_hold,
         "tp1_hit": tp1_hit,
         "tp2_hit": tp2_hit,
         "trail_active": trail_active,
@@ -1631,6 +1662,17 @@ def seed_trades(data, setups=None):
             "time_quality": s.get("time_quality", "?"),
             "entry_mode": entry_mode,
             "atr": atr,  # 2026-08-07: needed for trailing-stop simulation in check_outcomes
+            # 2026-10-10 review: pin the exit model at SEED time. Without it the
+            # exit was re-derived from the environment on every tick, so changing
+            # MOMENTUM_HOLD_EXIT retroactively rewrote an already-open trade's
+            # outcome and no record said which model produced a booked R.
+            "exit_model": MOMENTUM_HOLD_EXIT,
+            # 2026-10-10 review: make the entry-fill convention EXPLICIT instead
+            # of letting the two paths diverge silently. Live seeding books the
+            # setup price (what the report told the operator to enter at);
+            # --backtest books the same price plus adverse slippage. Recorded so
+            # nobody has to reverse-engineer which one a number came from.
+            "entry_fill_model": "setup_price",
             "signal_price": float(current_price) if current_price else None,
         }
         log["trades"].append(trade)
@@ -1968,7 +2010,8 @@ def check_outcomes(data):
 
         sim = _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr,
                                     seed_dt=seed_dt, data_source=data_source,
-                                    init_state=init_state)
+                                    init_state=init_state,
+                                    exit_model=trade.get("exit_model"))
 
         if sim.get("closed"):
             verified = bool(sim.get("verified", True))
@@ -2051,6 +2094,10 @@ def check_outcomes(data):
                 # two together are what make a delayed/backfilled close
                 # distinguishable from a live one after the fact.
                 "close_bar_time": sim.get("close_bar_time"),
+                # 2026-10-10 review: which exit model BOOKED this R. Without it a
+                # booked number could not be attributed to momentum-hold or
+                # fixed-TP2 after an env change.
+                "exit_model": sim.get("exit_model", trade.get("exit_model")),
                 "closed_time": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
             })
             trade.pop("venue_warning", None)
@@ -2077,6 +2124,10 @@ def check_outcomes(data):
                 "r_tp2": sim.get("r_tp2", 0.0),
                 "bars_held": sim.get("bars_held", 0),
                 "last_bar_time": sim.get("last_bar_time"),
+                # 2026-10-10 review: carry the pinned exit model through a resume,
+                # otherwise a truncated replay would re-read the env and could
+                # close a trade under a different model than it was seeded with.
+                "exit_model": sim.get("exit_model", trade.get("exit_model")),
             }
         last_bar = bars.iloc[-1]
         current = last_bar.get('close', 0)
@@ -2193,6 +2244,28 @@ def main():
         run_martingale_cycle(data)   # 反彈確認馬丁 paper sim (獨立 state, 2026-09-03)
 
 
+def _backtest_live_parity_skip(log, s, entry, stop, side, report_price, report_date):
+    """Why --backtest must refuse this candidate, or None when it may proceed.
+
+    2026-10-10 review: the backtest loop simulated setups the live engine would
+    have rejected — stale/fixture drift, a price already past the protective
+    stop, a duplicate signal — and its numbers were read next to live ones. The
+    same three predicates seed_trades uses, in the same order, extracted here so
+    the parity claim is testable instead of being asserted in a comment.
+    """
+    is_sell = side == "SELL"
+    shape_ok, why = _entry_shape_ok(entry, stop, report_price, is_sell)
+    if not shape_ok:
+        return why
+    if report_price is not None and ((is_sell and report_price >= stop) or
+                                     (not is_sell and report_price <= stop)):
+        return "current price crossed stop"
+    sig_key = _signal_key(s.get("pattern", "?"), side, s.get("entry_mode", "breakout"))
+    if _existing_signal(log, sig_key, report_date):
+        return "duplicate signal"
+    return None
+
+
 def run_backtest(data):
     """Backtest mode: simulate cron-eligible seedable setups from analyze JSON."""
     bars, data_source = _fetch_m30(None, None)
@@ -2286,6 +2359,18 @@ def run_backtest(data):
         if abs(entry - stop) <= 0:
             continue
 
+        # ── Live seeding guards (2026-10-10 review) ──
+        # seed_trades rejects stale/crossed/drifted setups and de-dupes repeats
+        # before seeding. This loop did none of that, so it simulated signals the
+        # live engine would have refused — or seeded twice — and its numbers were
+        # presented next to live ones. Same predicates, same order as seed_trades.
+        report_price = float(current_price) if current_price else None
+        parity_skip = _backtest_live_parity_skip(
+            log, s, entry, stop, side, report_price, _report_date(data))
+        if parity_skip:
+            print(f"  ⏭️  Skip {pattern} — {parity_skip} (live parity)")
+            continue
+
         # ── Per-trade discipline check ──
         vol = s.get("recommended_volume", 0.01)
         ok, reason = discipline_check(log, side, vol, stop, entry, atr)
@@ -2295,7 +2380,7 @@ def run_backtest(data):
 
         sim = _simulate_staged_exit(
             bars, entry, stop, tp1, tp2, side, atr, seed_dt=seed_dt,
-            data_source=data_source,
+            data_source=data_source, exit_model=MOMENTUM_HOLD_EXIT,
         )
         status = sim["result"]
         pnl_r = sim["pnl_r"]
@@ -2331,7 +2416,14 @@ def run_backtest(data):
             "seeded_date": _report_date(data),
             "pnl_r": pnl_r if really_closed else 0.0,
             "verified": verified,
-            "close_time": str(seed_dt) if really_closed else "",
+            "exit_model": MOMENTUM_HOLD_EXIT,
+            "entry_fill_model": "setup_price+adverse_slippage",
+            # 2026-10-10 review: the live readers (`_consecutive_losses`,
+            # `_last_close_dt`) key off `closed_time`; this record wrote
+            # `close_time`, so a simulated close was only ever found through the
+            # `seeded_time` fallback — and `seeded_time` is the OPEN, not the
+            # close. Same key name as the live path now.
+            "closed_time": str(seed_dt) if really_closed else "",
         }
         if simulated["status"] == "LIVE":
             log.setdefault("trades", []).append(simulated)

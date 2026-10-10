@@ -72,7 +72,7 @@ for i in range(WARMUP_BARS, total_bars):
             bar_ts = bar_ts.tz_convert('UTC').tz_localize(None)
         broker_hour = (bar_ts.hour + BROKER_UTC_OFFSET_HOURS) % 24
         tq_level, _ = _time_quality_for_hour(broker_hour)
-        _inject_push_metadata(setups, daily_trend, h1_trend, current_price=current_price, time_quality_override=tq_level, points=points, atr=atr, closes=window['Close'].values)
+        _inject_push_metadata(setups, daily_trend, h1_trend, current_price=current_price, time_quality_override=tq_level, points=points, atr=atr, closes=window['Close'].values, bar_time=current_date)
     except Exception:
         continue
     new_trades = setups_to_trades(setups, current_price, atr, i, current_date, daily_trend, h1_trend)
