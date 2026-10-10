@@ -48,11 +48,19 @@ def hkt_now_str():
 
 
 def m5m15_line(data):
-    """M5/M15 一行：'M5: 🟢 | M15: 🟢' — 冇就省略。"""
+    """M5/M15 一行：'M5: 🟢 | M15: 🟢' — 冇就省略。
+
+    2026-10-10 review: each block now reads its OWN trend key. The old version
+    tried `m5_trend` first for BOTH, so an M15 block that happened to carry a
+    stale `m5_trend` printed the M5 trend under an `M15:` label — a wrong number
+    wearing the right name. Missing own key ⇒ the part is omitted (the
+    documented behaviour), never borrowed from the other timeframe.
+    """
     parts = []
-    for key, label in (("m5_analysis", "M5"), ("m15_analysis", "M15")):
+    for key, label, own in (("m5_analysis", "M5", "m5_trend"),
+                            ("m15_analysis", "M15", "m15_trend")):
         a = data.get(key) or {}
-        trend = a.get("m5_trend") or a.get("m15_trend") or ""
+        trend = a.get(own) or ""
         emoji = trend.split()[0] if trend.split() else None
         if emoji:
             parts.append(f"{label}: {emoji}")
@@ -70,33 +78,60 @@ def _clean_price(value):
     return s
 
 
+def _closed_hkt_day(ct):
+    """HKT calendar day of a `closed_time`, or None.
+
+    2026-10-10 review: a NAIVE stamp used to go through `astimezone()`, which
+    interprets it in the MACHINE's zone — so the same record landed on a
+    different day depending on where the report ran (and `astimezone` on a naive
+    value is the classic way a UTC stamp silently becomes local). Naive is read
+    as UTC here, matching every writer in the engine.
+    """
+    if not ct:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ct).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(HKT).strftime("%Y-%m-%d")
+
+
 def paper_stats(spot=None):
     """正統 paper：LIVE + CLOSED/W/L/勝率/sumR + 今日 PnL + CLOSED 明細行。
 
     `spot` = 報告現價。有現價時，LIVE 倉嘅 entry 離現價太遠（> MAX_ENTRY_DRIFT_PCT）
     就當壞數據：標 ⚠️ STALE、唔印浮盈（2026-09-14 fixture 污染事件）。
+
+    2026-10-10 review: the headline numbers are now computed over the
+    live-MIRROR population only (`push_suppressed` falsy — signals live would
+    actually have pushed), and the experimental population is reported next to
+    them instead of being silently averaged in. Seeding deliberately does not
+    respect `push_suppressed` (limit-mode signals are seeded to collect real
+    fills), so one blended win-rate was describing two different books.
     """
     d = load_json(os.path.join(REPORT_DIR, "paper_trade_log.json"), required=False)
     history = d.get("history", []) if isinstance(d, dict) else []
     live = d.get("trades", []) if isinstance(d, dict) else []
     live = [t for t in live if t.get("status") == "LIVE"]
-    closed = [t for t in history if t.get("status") == "CLOSED"]
+    closed_all = [t for t in history if t.get("status") == "CLOSED"]
+    closed = [t for t in closed_all if not t.get("push_suppressed")]
+    experimental = [t for t in closed_all if t.get("push_suppressed")]
     wins = sum(1 for t in closed if (t.get("pnl_r") or 0) > 0)
     losses = sum(1 for t in closed if (t.get("pnl_r") or 0) < 0)
     sum_r = round(sum(t.get("pnl_r") or 0 for t in closed), 2)
     n = len(closed)
     win_pct = round(100 * wins / n, 1) if n else 0.0
+    exp_n = len(experimental)
+    exp_sum_r = round(sum(t.get("pnl_r") or 0 for t in experimental), 2)
 
     # 今日 PnL（closed_time 係今日 HKT）
     today = datetime.now(HKT).strftime("%Y-%m-%d")
     today_r = 0.0
     for t in closed:
-        ct = t.get("closed_time", "")
-        try:
-            if datetime.fromisoformat(ct.replace("Z", "+00:00")).astimezone(HKT).strftime("%Y-%m-%d") == today:
-                today_r += t.get("pnl_r") or 0
-        except ValueError:
-            pass
+        if _closed_hkt_day(t.get("closed_time")) == today:
+            today_r += t.get("pnl_r") or 0
     today_r = round(today_r, 2)
 
     # 格式 C 行：✅/❌ [形態] [TP/SL] ±xR
@@ -143,6 +178,8 @@ def paper_stats(spot=None):
         "n": n, "wins": wins, "losses": losses, "win_pct": win_pct,
         "sum_r": sum_r, "today_r": today_r, "lines": lines,
         "open_live": open_live, "live_lines": live_lines, "stale_live": stale_live,
+        # 2026-10-10 review: the experimental book, kept OUT of the headline.
+        "exp_n": exp_n, "exp_sum_r": exp_sum_r,
     }
 
 
@@ -294,6 +331,12 @@ def build_status(data, gc_note=None, dedup_note=None):
     if paper["open_live"]:
         pt += f" | {paper['open_live']} LIVE"
     lines.append(pt)
+    # 2026-10-10 review: 上面嘅數只計 live-mirror（`push_suppressed` 假）。
+    # 實驗倉（限價模式：live 永遠唔會推，但照 seed 收真 fill）另外一行列明，
+    # 唔混入 headline —— 否則「would-be-live 表現」係被污染嘅數。
+    if paper.get("exp_n"):
+        lines.append(f"🧪 實驗倉（live 唔會推）: {paper['exp_n']}筆已平倉 | "
+                     f"total: {paper['exp_sum_r']}R — 研究用途，唔計入上面勝率")
     # LIVE 明細行（每倉一行）—— 2026-09-10 用戶要求：淨睇數字唔知個倉係咩
     for ll in paper["live_lines"]:
         lines.append(f"  {ll}")
