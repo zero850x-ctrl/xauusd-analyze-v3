@@ -73,7 +73,12 @@ if closed:
     c = closed[0]
     check("exit_price = stop - slippage (BUY)", abs(c.exit_price - (3990 - 0.15)) < 1e-9, f"{c.exit_price}")
     check("exit_reason = 'Stop loss (same bar as fill)'", c.exit_reason == 'Stop loss (same bar as fill)', c.exit_reason)
-    check("PnL 全倉都係虧 (pnl_tp1==pnl_tp2==pnl_tp3<0)", c.pnl_tp1 < 0 and c.pnl_tp2 < 0 and c.pnl_tp3 < 0,
+    # 2026-10-10 review: 只斷言 `<0` 會放過「三個 tranche 各平唔同價」嘅 bug。
+    # 同 bar 止蝕係**一個價全平**，所以三個 PnL 必須完全相等（值本身就係
+    # risk×size×100，同 entry 一樣），只有符號係額外資訊。
+    check("PnL 三個 tranche 必須相等（同價全平）",
+          c.pnl_tp1 == c.pnl_tp2 == c.pnl_tp3, f"{c.pnl_tp1},{c.pnl_tp2},{c.pnl_tp3}")
+    check("PnL 全倉都係虧", c.pnl_tp1 < 0 and c.pnl_tp2 < 0 and c.pnl_tp3 < 0,
           f"{c.pnl_tp1},{c.pnl_tp2},{c.pnl_tp3}")
     check("total_pnl ≈ 全倉 −(risk+slippage)×pos×100", abs(c.total_pnl - (-10.15 * 0.02 * 100)) < 0.05, f"{c.total_pnl}")
 check("stop-out 都更新 last_trade_bar", ltb == 11, f"ltb={ltb}")

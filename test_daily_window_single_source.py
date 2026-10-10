@@ -24,6 +24,27 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BACKTEST_PY = os.path.join(HERE, "backtest.py")
 DATA_CSV = os.path.join(HERE, "verify_data_paxg_5y.csv")
 
+
+def _csv_missing():
+    """True when the study CSV is absent — and LOUD about what that means.
+
+    2026-10-10 review: these tests used to `SkipTest`/`return` on a missing CSV,
+    which the runner counted as PASS. The CSV is gitignored, so in practice the
+    dynamic half of this file never ran anywhere while the suite kept printing
+    "all pass" — a green light over unverified code. Now the absence FAILS
+    unless the operator explicitly opts out with XAUUSD_ALLOW_MISSING_CSV=1
+    (the only legitimate case: a machine that genuinely cannot hold the data).
+    """
+    if os.path.exists(DATA_CSV):
+        return False
+    msg = (f"study CSV missing: {os.path.basename(DATA_CSV)} — the dynamic "
+           f"daily-window tests verified NOTHING. Regenerate it, or set "
+           f"XAUUSD_ALLOW_MISSING_CSV=1 to accept the gap explicitly.")
+    if os.environ.get("XAUUSD_ALLOW_MISSING_CSV") == "1":
+        print(f"  ⏭️  SKIPPED-data (opted out): {msg}")
+        return True
+    raise AssertionError(msg)
+
 SLICE_BUILDERS = ("daily_window_for", "partial_daily_window")
 
 
@@ -148,8 +169,8 @@ def test_partial_mode_grows_intraday_synthetic():
 
 
 def test_daily_window_for_called_more_than_once_per_date():
-    if not os.path.exists(DATA_CSV):
-        raise unittest.SkipTest("study CSV not present")
+    if _csv_missing():
+        return
     import verify_tp_retest as vt
     df_bars, df_day = vt.load_bars(csv_path=DATA_CSV, max_bars=2500)
     real = bt.daily_window_for
@@ -174,8 +195,8 @@ def test_daily_window_for_called_more_than_once_per_date():
 
 def test_partial_mode_builds_a_growing_current_day():
     """Partial mode must change the current-day row within a session."""
-    if not os.path.exists(DATA_CSV):
-        raise unittest.SkipTest("study CSV not present")
+    if _csv_missing():
+        return
 
     import verify_tp_retest as vt
     df_bars, df_day = vt.load_bars(csv_path=DATA_CSV, max_bars=600)

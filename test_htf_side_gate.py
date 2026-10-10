@@ -30,6 +30,26 @@ import pandas as pd
 DATA_CSV = os.path.join(HERE, "verify_data_paxg_5y.csv")
 
 
+def _csv_missing():
+    """True when the study CSV is absent — and LOUD about what that means.
+
+    2026-10-10 review: this test used to print "(skipped: ...)" and `return`,
+    which the runner counted as PASS. The CSV is gitignored, so the weekly-veto
+    assertions below never executed anywhere while the suite stayed green. The
+    absence now FAILS unless the operator opts out explicitly with
+    XAUUSD_ALLOW_MISSING_CSV=1 (a machine that genuinely cannot hold the data).
+    """
+    if os.path.exists(DATA_CSV):
+        return False
+    msg = (f"study CSV missing: {os.path.basename(DATA_CSV)} — the weekly-veto "
+           f"tests verified NOTHING. Regenerate it, or set "
+           f"XAUUSD_ALLOW_MISSING_CSV=1 to accept the gap explicitly.")
+    if os.environ.get("XAUUSD_ALLOW_MISSING_CSV") == "1":
+        print(f"  ⏭️  SKIPPED-data (opted out): {msg}")
+        return True
+    raise AssertionError(msg)
+
+
 def _sides(trades):
     return {
         "BUY": sum(1 for t in trades if t.side == "BUY"),
@@ -134,8 +154,7 @@ def test_weekly_gate_is_wired_into_the_run():
     is that trades actually resolve opinions, not that a particular slice
     happens to contain counter-weekly shorts (2026-03..09 contains none).
     """
-    if not os.path.exists(DATA_CSV):
-        print("  (skipped: study CSV not present — gitignored)")
+    if _csv_missing():
         return
 
     import verify_tp_retest as vt

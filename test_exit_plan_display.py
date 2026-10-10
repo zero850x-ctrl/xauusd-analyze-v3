@@ -98,11 +98,21 @@ _av_src = open(os.path.join(HERE, "analyze_v3.py"), encoding="utf-8").read()
 _pt_src = open(os.path.join(HERE, "paper_trade.py"), encoding="utf-8").read()
 _m_av = re.search(
     r"MOMENTUM_HOLD_EXIT = os\.environ\.get\('MOMENTUM_HOLD_EXIT', '(\d)'\)", _av_src)
+# 2026-10-10 review: paper_trade now captures the env ONCE into a module
+# constant (so a mid-flight change cannot rewrite an open trade). The old guard
+# pinned the inline read, which made the assertion fail on a legitimate fix —
+# check the constant's default instead, and then check the VALUES agree at
+# runtime, which is what the guard was ever about.
 _m_pt = re.search(
-    r'momentum_hold = os\.environ\.get\("MOMENTUM_HOLD_EXIT", "(\d)"\)', _pt_src)
+    r'MOMENTUM_HOLD_EXIT = os\.environ\.get\("MOMENTUM_HOLD_EXIT", "(\d)"\)', _pt_src)
 check("C1 兩邊讀同一個 env 且預設一致",
       bool(_m_av) and bool(_m_pt) and _m_av.group(1) == _m_pt.group(1),
       f"av={_m_av and _m_av.group(1)} pt={_m_pt and _m_pt.group(1)}")
+import paper_trade as _pt_mod
+import analyze_v3 as _av_mod
+check("C1b 行為：兩邊 module constant 真值相同",
+      bool(_pt_mod.MOMENTUM_HOLD_EXIT) == bool(_av_mod.MOMENTUM_HOLD_EXIT),
+      f"pt={_pt_mod.MOMENTUM_HOLD_EXIT} av={_av_mod.MOMENTUM_HOLD_EXIT}")
 _m_lit = re.findall(r"new_trail = close_px [+-] ([\d.]+) \* atr", _pt_src)
 check("C2a paper_trade 冇寫死 trail 距離（第 2 項 dead config）", not _m_lit, f"仲有 {_m_lit}")
 check("C2b paper_trade trail 真係用 TRAIL_STOP_ATR",

@@ -1,12 +1,45 @@
 #!/bin/sh
+# post-commit：每個 commit 備份一份 tracked source 上 Google Drive。
+#
+# 2026-10-10 review 修復：
+#   • `tar ... $files` 用未引號展開 → 檔案一多就 "argument list too long"，
+#     備份靜默失敗。改 `tar -T -` 由 stdin 讀清單。
+#   • `rclone` 唔存在時唔會出聲，令人以為已備份 → 開頭 `command -v rclone`
+#     檢查，缺就明講「未備份」並 non-zero。
+#   • 唔再靠 `rclone size` 印數字當驗證：比對 remote/local byte 數。
 set -eu
+
 repo_root=$(git rev-parse --show-toplevel)
 commit=$(git rev-parse --short HEAD)
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 out="/tmp/xauusd-analyze-${stamp}-${commit}.tar.gz"
+
+if ! command -v rclone >/dev/null 2>&1; then
+  echo "⚠️  post-commit: 冇 rclone，備份未做（commit 本身冇事）" >&2
+  exit 1
+fi
+
 files=$(git ls-files | grep -Ev '(^|/)(\.env|.*credential.*|.*secret.*|.*token.*|.*\.pem$|.*\.key$|reports|logs?|cache|data)/' || true)
 [ -n "$files" ] || exit 0
-tar -czf "$out" -C "$repo_root" $files
-rclone copyto "$out" "gdrive:xauusd-analyze/${stamp}-${commit}.tar.gz"
-rclone size "gdrive:xauusd-analyze/${stamp}-${commit}.tar.gz"
+
+# 清單經 stdin 交俾 tar，避開 shell argument list 上限
+printf '%s\n' "$files" | tar -czf "$out" -C "$repo_root" -T -
+
+local_bytes=$(wc -c < "$out" | tr -d ' ')
+
+if ! rclone copyto "$out" "gdrive:xauusd-analyze/${stamp}-${commit}.tar.gz"; then
+  echo "⚠️  post-commit: rclone 上傳失敗，備份唔存在（local 副本留在 $out）" >&2
+  exit 1
+fi
+
+# 真驗證：remote 讀返嘅 byte 數要同 local 一致
+remote_bytes=$(rclone size --json "gdrive:xauusd-analyze/${stamp}-${commit}.tar.gz" 2>/dev/null \
+  | sed -n 's/.*"bytes":\([0-9]*\).*/\1/p' | head -1)
+
+if [ -n "$remote_bytes" ] && [ "$remote_bytes" != "$local_bytes" ]; then
+  echo "⚠️  post-commit: remote size ${remote_bytes} ≠ local ${local_bytes} — 備份可能截斷" >&2
+  exit 1
+fi
+
+echo "✅ post-commit 備份 ${stamp}-${commit}.tar.gz (${local_bytes} bytes)"
 rm -f "$out"

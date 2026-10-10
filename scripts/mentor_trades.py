@@ -19,6 +19,25 @@ ADVISORY_HOUR_1700 = set()
 DANGER_HOURS = {7, 18}
 DANGER_ADVISORY_HOURS = ADVISORY_HOURS_0408 | DANGER_HOURS
 
+# 2026-10-10 review: 樣本門檻。細過呢個數一律唔報百分比 —— n=2 嘅「100% 勝率」
+# 同 n=2 嘅「0%」睇落都好似結論，但其實係噪音（Wilson CI 會闊到 0-84%）。
+MIN_STAT_SAMPLE = 5
+
+
+def wilson(wins, n, z=1.96):
+    """勝率嘅 Wilson 95% 信賴區間 (lo, hi)，回傳 0-1 比例。
+
+    用 Wilson 而唔係 normal approximation：細樣本／極端勝率（0% 或 100%）時
+    normal 會出負數或者大過 1。呢度冇 scipy 依賴，純 stdlib。
+    """
+    if n <= 0:
+        return (0.0, 0.0)
+    p = wins / n
+    d = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / d
+    half = (z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5)) / d
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
 RAW_TRADES = [
     # idx=1 dropped: duplicate ticket 28478941 (see idx=9, kept max lot)
     dict(idx=2,  tk=28478829, side="S", lot=0.03, op=4078.83, cp=4053.45, ot="07-14 17:29", ct="07-14 19:37", sl=None, tp=4036.47, pnl=76.14),
@@ -229,7 +248,11 @@ def main():
     losses = [t for t in trades if not t['win']]
     _log(f"=== Mentor sample ({n} unique tickets; {len(EXTENDED_RAW_TRADES)} Jul 29-30 rows) ===")
     _log(f"Total PnL: {sum(t['pnl'] for t in trades):+.2f}")
-    _log(f"Wins: {len(wins)} ({len(wins)/n*100:.1f}%)  Losses: {len(losses)}")
+    if n:
+        lo, hi = wilson(len(wins), n)
+        _log(f"Wins: {len(wins)} ({len(wins)/n*100:.1f}%, 95% CI {lo*100:.0f}-{hi*100:.0f}%)  Losses: {len(losses)}")
+    else:
+        _log("Wins: 0 (冇樣本)  Losses: 0")
     if wins:
         _log(f"Avg win: {statistics.mean(t['pnl'] for t in wins):+.2f}")
     if losses:
@@ -245,7 +268,16 @@ def main():
         sub = [t for t in trades if pred(t)]
         w = sum(1 for t in sub if t['win'])
         pnl = sum(t['pnl'] for t in sub)
-        _log(f"{label}: {len(sub)} trades, win {w/len(sub)*100:.1f}%, net {pnl:+.2f}")
+        # 2026-10-10 review: len(sub)==0 時原本 ZeroDivisionError；樣本細過
+        # MIN_STAT_SAMPLE 就唔報百分比（n=2 嘅「勝率」睇落好似有結論）。
+        if not sub:
+            _log(f"{label}: 0 trades, net {pnl:+.2f}")
+        elif len(sub) < MIN_STAT_SAMPLE:
+            _log(f"{label}: {len(sub)} trades  — n<{MIN_STAT_SAMPLE} 樣本不足，唔報勝率 (net {pnl:+.2f})")
+        else:
+            lo, hi = wilson(w, len(sub))
+            _log(f"{label}: {len(sub)} trades, win {w/len(sub)*100:.1f}% "
+                 f"(95% CI {lo*100:.0f}-{hi*100:.0f}%), net {pnl:+.2f}")
 
     _log("\n=== Open hour (broker-local assumed) ===")
     by_hour = collections.defaultdict(list)
@@ -253,11 +285,17 @@ def main():
         by_hour[t['op_broker_hour']].append(t)
     for hour in sorted(by_hour):
         sub = by_hour[hour]
-        if len(sub) < 2:
-            continue
         w = sum(1 for t in sub if t['win'])
         pnl = sum(t['pnl'] for t in sub)
-        _log(f"{hour_tag(hour)} {hour:02d}:00  {len(sub):2d} trades, win {w/len(sub)*100:5.1f}%, net {pnl:+8.2f}")
+        # 2026-10-10 review: 舊碼 `if len(sub) < 2: continue` 即係 n=2 都照報
+        # 勝率。改為：細過 MIN_STAT_SAMPLE 就明講「樣本不足」但仍然列出
+        # trade 數同 net（net 係絕對值，唔受比例放大影響，可以照睇）。
+        if len(sub) < MIN_STAT_SAMPLE:
+            _log(f"{hour_tag(hour)} {hour:02d}:00  {len(sub):2d} trades  — n<{MIN_STAT_SAMPLE} 樣本不足，唔報勝率 (net {pnl:+8.2f})")
+            continue
+        lo, hi = wilson(w, len(sub))
+        _log(f"{hour_tag(hour)} {hour:02d}:00  {len(sub):2d} trades, win {w/len(sub)*100:5.1f}% "
+             f"(95% CI {lo*100:.0f}-{hi*100:.0f}%), net {pnl:+8.2f}")
 
     _log("\n=== Same-direction overlap (exploratory) ===")
     ts = sorted(trades, key=lambda t: parse_ts(t['ot']))
