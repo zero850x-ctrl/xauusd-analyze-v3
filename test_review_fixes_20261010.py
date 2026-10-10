@@ -12,9 +12,11 @@ Covers, in the order the review raised them:
 
 Run: python3 test_review_fixes_20261010.py
 """
+import contextlib
+import io
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pandas as pd
@@ -90,19 +92,43 @@ def test_post_spike_bad_atr_fails_closed():
 
 
 def test_post_spike_missing_series_is_recorded_not_blocked():
-    """No series at all = caller/wiring gap, NOT market evidence.
+    """No series WIRED AT ALL = caller gap, NOT market evidence.
 
     Blocking here would turn a forgotten argument into a total push drought —
     the silent-gate failure mode. It must be recorded (greppable) and NOT block.
+
+    2026-10-10 外審 follow-up: "not wired" and "wired but unusable" are now
+    distinguishable via the `_UNSET` sentinel, so this test also pins the other
+    side — an explicitly passed `None` (or a None ATR) is a DATA problem and
+    must block. Before the sentinel, `atr=None` was treated as unwired while
+    `_spike_window` treated it as unusable: both directions were inconsistent.
     """
     s = _setup()
     av._inject_push_metadata([s], {"trend": "BEARISH"}, {"trend": "BEARISH"},
                              current_price=4430.0, time_quality_override="normal",
-                             points=[], atr=15.0, closes=None)
-    check("A12 冇 closes → 唔 block（唔可以變成 silent drought）",
+                             points=[])                      # atr/closes 都冇接線
+    check("A12 兩個參數都冇接線 → 唔 block（唔可以變成 silent drought）",
           s["post_spike_blocked"] is False, s)
     check("A13 但要有記錄（post_spike_indeterminate）",
-          s["post_spike_indeterminate"] == "no M30 close series provided", s)
+          s["post_spike_indeterminate"] == "caller 冇接線: atr, closes", s)
+
+    s2 = _setup()
+    av._inject_push_metadata([s2], {"trend": "BEARISH"}, {"trend": "BEARISH"},
+                             current_price=4430.0, time_quality_override="normal",
+                             points=[], atr=15.0, closes=None)
+    check("A13b 明確傳 closes=None（有接線但冇序列）→ 要 block",
+          s2["post_spike_blocked"] is True, s2)
+    check("A13c 原因係資料問題，唔係接線問題",
+          s2["post_spike_indeterminate"] == "no M30 close series", s2)
+
+    s3 = _setup()
+    av._inject_push_metadata([s3], {"trend": "BEARISH"}, {"trend": "BEARISH"},
+                             current_price=4430.0, time_quality_override="normal",
+                             points=[], atr=None, closes=list(_QUIET))
+    check("A13d 明確傳 atr=None → 要 block（外審 finding 1 嘅對稱性）",
+          s3["post_spike_blocked"] is True, s3)
+    check("A13e 原因 = ATR unusable (None)",
+          s3["post_spike_indeterminate"] == "ATR unusable (None)", s3)
 
 
 def test_post_spike_state_contract_unchanged():
@@ -132,22 +158,52 @@ def test_simulated_close_key_reaches_cooldown():
     Before the fix run_backtest wrote `close_time`; the readers key off
     `closed_time` and only ever found the row through the `seeded_time`
     fallback — i.e. they used the OPEN time as the close time.
+
+    2026-10-10 外審 follow-up: the first version of this test could not fail.
+    Its "legacy" check deleted the key and then asserted the key was absent
+    (a tautology), and its happy-path record still carried `seeded_time`, so it
+    passed under the OLD code too. It now asserts the two things that actually
+    distinguish fixed from broken: the reader uses the CLOSE stamp (not the
+    open one), and a legacy row with only `close_time` is invisible.
     """
-    today = datetime.now(pt.HKT).strftime("%Y-%m-%d")
-    seed = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # NOTE: `_consecutive_losses` only counts losses CLOSED on TODAY (HKT) — it
+    # is an anti same-day-tilt counter, not a lifetime counter. So the close
+    # stamp must be now, and the OPEN stamp must be a different day: if the
+    # reader silently falls back to `seeded_time`, the count drops to 0 and the
+    # assertion fails instead of passing.
+    now_utc = datetime.now(timezone.utc)
+    close_ts = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    open_ts = (now_utc - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
     rec = {"status": "CLOSED", "pnl_r": -1.0, "verified": True,
-           "seeded_date": today, "seeded_time": seed, "closed_time": seed}
+           "seeded_date": open_ts[:10], "seeded_time": open_ts,
+           "closed_time": close_ts}
     log = {"trades": [], "history": [rec]}
     check("C1 closed_time 行會被 _consecutive_losses 數到",
           pt._consecutive_losses(log) == 1, pt._consecutive_losses(log))
-    check("C2 _last_close_dt 讀得到", pt._last_close_dt(log) is not None)
+    _dt = pt._last_close_dt(log)
+    check("C2 _last_close_dt 用 CLOSE 時間，唔係 open 時間（唔可以靠 seeded_time 頂）",
+          _dt is not None and _dt.strftime("%Y-%m-%dT%H:%M:%SZ") == close_ts,
+          f"{_dt}")
 
-    legacy = dict(rec)
-    legacy.pop("closed_time")
-    legacy["close_time"] = seed          # the OLD key run_backtest wrote
+    # 舊 writer 形狀：只有 close_time，冇 closed_time / seeded_time。
+    # 呢個先係真正嘅對照組 —— 佢必須讀唔到，否則 C1 唔係喺驗 fix。
+    legacy = {"status": "CLOSED", "pnl_r": -1.0, "verified": True,
+              "seeded_date": open_ts[:10], "close_time": close_ts}
     log2 = {"trades": [], "history": [legacy]}
-    check("C3 舊 key（close_time）唔會經 closed_time 讀到（證明 C1 唔係假通過）",
-          all(h.get("closed_time") is None for h in log2["history"]))
+    check("C3 舊 key（close_time）唔會被讀到 → 證明 C1 真係喺驗 closed_time",
+          pt._consecutive_losses(log2) == 0 and pt._last_close_dt(log2) is None,
+          f"losses={pt._consecutive_losses(log2)} last={pt._last_close_dt(log2)}")
+
+    # 生產 writer 真係寫嘅格式（`str(pd.Timestamp)`，tz-aware UTC）—— 唔可以只
+    # 用手砌嘅 `...Z` 字串，否則 writer 格式冇被覆蓋。
+    seed_dt = pt._parse_dt(close_ts)
+    written = str(seed_dt)
+    check("C4 run_backtest 寫嘅格式（str(Timestamp)）解析得返",
+          pt._parse_dt(written) == seed_dt, f"{written!r} → {pt._parse_dt(written)}")
+    log3 = {"trades": [], "history": [{"status": "CLOSED", "pnl_r": -1.0,
+                                       "verified": True, "closed_time": written}]}
+    check("C5 該格式嘅 closed_time 一樣數到 cooldown",
+          pt._consecutive_losses(log3) == 1, pt._consecutive_losses(log3))
 
 
 # ── D. exit model pinned per trade ──
@@ -231,6 +287,54 @@ def test_backtest_parity_guards():
                                         4430.0, today) == "duplicate signal")
 
 
+# ── F. 外審 follow-up：_broker_hour 壞 stamp 要出聲；報告分流要嚴格 ──
+def test_broker_hour_bad_stamp_warns():
+    """An unparseable bar stamp must not silently revert to the wall clock.
+
+    2026-10-10 外審 finding 4: `except Exception: utc = datetime.now(...)` put
+    back the exact bug `when=` exists to remove, with no trace. The fallback is
+    kept (a replay shouldn't die on one bad row) but it has to be visible.
+    """
+    av._BAD_BAR_TIME_SEEN.clear()
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        h1 = av._broker_hour(pd.NaT)
+    err = buf.getvalue()
+    check("F1 壞 stamp 會出 warning（唔再靜靜退回 wall clock）",
+          "解析唔到 bar 時間" in err, err[:120])
+    check("F2 仍然回一個 0-23 嘅鐘點（唔會炸 replay）",
+          isinstance(h1, int) and 0 <= h1 <= 23, h1)
+    buf2 = io.StringIO()
+    with contextlib.redirect_stderr(buf2):
+        av._broker_hour(pd.NaT)
+    check("F3 同一個壞 stamp 唔會重覆洗版", buf2.getvalue() == "", buf2.getvalue()[:80])
+    check("F4 正常 stamp 唔會出 warning",
+          av._broker_hour(pd.Timestamp("2026-09-01T00:00:00Z")) ==
+          (0 + av.BROKER_UTC_OFFSET_HOURS) % 24)
+    av._BAD_BAR_TIME_SEEN.clear()
+
+
+def test_report_experimental_split_is_strict():
+    """Only a real bool True counts as experimental (外審 finding 3).
+
+    The split used truthiness, so the STRING "false"/"0" — a serialization slip
+    — read as suppressed and silently moved a genuinely PUSHED trade out of the
+    headline win-rate / sumR / todayR.
+    """
+    import xauusd_report as xr
+    check("F5 bool True → 實驗倉", xr._is_experimental({"push_suppressed": True}) is True)
+    check("F6 bool False → live-mirror",
+          xr._is_experimental({"push_suppressed": False}) is False)
+    check("F7 None → live-mirror（舊 row 冇呢個 field）",
+          xr._is_experimental({"push_suppressed": None}) is False)
+    check("F8 冇 key → live-mirror", xr._is_experimental({}) is False)
+    check('F9 字串 "false" → live-mirror（唔可以當壓制）',
+          xr._is_experimental({"push_suppressed": "false"}) is False)
+    check('F10 字串 "0" → live-mirror', xr._is_experimental({"push_suppressed": "0"}) is False)
+    check('F11 字串 "true" 都唔算（要真 bool）',
+          xr._is_experimental({"push_suppressed": "true"}) is False)
+
+
 if __name__ == "__main__":
     for fn in (test_post_spike_quiet_window_not_blocked,
                test_post_spike_spike_same_dir_blocked,
@@ -243,7 +347,9 @@ if __name__ == "__main__":
                test_simulated_close_key_reaches_cooldown,
                test_exit_model_pinned_beats_env,
                test_exit_model_resumed_from_state,
-               test_backtest_parity_guards):
+               test_backtest_parity_guards,
+               test_broker_hour_bad_stamp_warns,
+               test_report_experimental_split_is_strict):
         fn()
     print()
     if FAILED:

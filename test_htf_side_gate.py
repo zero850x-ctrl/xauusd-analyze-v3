@@ -44,6 +44,12 @@ def _csv_missing():
     msg = (f"study CSV missing: {os.path.basename(DATA_CSV)} — the weekly-veto "
            f"tests verified NOTHING. Regenerate it, or set "
            f"XAUUSD_ALLOW_MISSING_CSV=1 to accept the gap explicitly.")
+    # 2026-10-10 外審：`XAUUSD_REQUIRE_STUDY_CSV=1`（run_tests.sh 嘅
+    # RUN_TESTS_STRICT_DATA=1 會設）要真係有人讀 —— 否則 strict 模式只係靠
+    # 「冇設 ALLOW」呢個副作用成立，任何一個 parent process 設過 ALLOW 就會
+    # 靜靜失效。呢個 env 直接否決 opt-out。
+    if os.environ.get("XAUUSD_REQUIRE_STUDY_CSV") == "1":
+        raise AssertionError(msg + " [XAUUSD_REQUIRE_STUDY_CSV=1：唔准 opt-out]")
     if os.environ.get("XAUUSD_ALLOW_MISSING_CSV") == "1":
         print(f"  ⏭️  SKIPPED-data (opted out): {msg}")
         return True

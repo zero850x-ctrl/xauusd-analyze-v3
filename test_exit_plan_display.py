@@ -110,9 +110,16 @@ check("C1 兩邊讀同一個 env 且預設一致",
       f"av={_m_av and _m_av.group(1)} pt={_m_pt and _m_pt.group(1)}")
 import paper_trade as _pt_mod
 import analyze_v3 as _av_mod
-check("C1b 行為：兩邊 module constant 真值相同",
-      bool(_pt_mod.MOMENTUM_HOLD_EXIT) == bool(_av_mod.MOMENTUM_HOLD_EXIT),
-      f"pt={_pt_mod.MOMENTUM_HOLD_EXIT} av={_av_mod.MOMENTUM_HOLD_EXIT}")
+# 2026-10-10 外審 follow-up: 比 VALUE，唔好比 bool。原本 `bool(x) == bool(y)`
+# 有兩個病：(a) 如果任一邊係字串 `"0"`，`bool("0")` 係 True → 斷言恆真（乜都冇
+# 驗到）；(b) 操作員真係設 `MOMENTUM_HOLD_EXIT=0` 跑測試時，兩邊一齊 False 就
+# 會「假失敗」。所以直接比相等 + 明確要求兩邊都係 bool。
+check("C1b 行為：兩邊 module constant 係 bool 而且值相同",
+      isinstance(_pt_mod.MOMENTUM_HOLD_EXIT, bool)
+      and isinstance(_av_mod.MOMENTUM_HOLD_EXIT, bool)
+      and _pt_mod.MOMENTUM_HOLD_EXIT == _av_mod.MOMENTUM_HOLD_EXIT,
+      f"pt={_pt_mod.MOMENTUM_HOLD_EXIT!r} ({type(_pt_mod.MOMENTUM_HOLD_EXIT).__name__}) "
+      f"av={_av_mod.MOMENTUM_HOLD_EXIT!r} ({type(_av_mod.MOMENTUM_HOLD_EXIT).__name__})")
 _m_lit = re.findall(r"new_trail = close_px [+-] ([\d.]+) \* atr", _pt_src)
 check("C2a paper_trade 冇寫死 trail 距離（第 2 項 dead config）", not _m_lit, f"仲有 {_m_lit}")
 check("C2b paper_trade trail 真係用 TRAIL_STOP_ATR",
@@ -266,13 +273,17 @@ def _bar(i, o, h, l, c):
 
 
 def _run(bars, momentum):
+    # 2026-10-10 外審 follow-up: 明確傳 exit_model。呢個 function 原本靠改
+    # os.environ 去切換模型 —— 但 env 而家只喺 import 時讀一次（pin 住每張單
+    # 嘅模型，係「唔可以追溯改寫已開倉單」嗰個修正嘅一部分），所以 mid-process
+    # 改 env 已經唔應該有效。要邊個模型就明講。
     if momentum:
         os.environ.pop("MOMENTUM_HOLD_EXIT", None)
     else:
         os.environ["MOMENTUM_HOLD_EXIT"] = "0"
     return pt._simulate_staged_exit(
         bars, entry=4400, stop=4420, tp1=4380, tp2=4360,
-        direction="SELL", atr=10, data_source="tv")
+        direction="SELL", atr=10, data_source="tv", exit_model=bool(momentum))
 
 
 # bar1 觸 TP1；bar2 low 4355 穿過 TP2 4360，但 high 4390 未掂 trail

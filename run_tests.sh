@@ -75,12 +75,17 @@ else
   FILES=()
   # 2026-10-10 review: 原本只 glob `test_*.py scripts/test_*.py`，所以放喺
   # tests/ 或任何新目錄嘅 test 檔會**靜默漏跑** —— suite 照樣印「全部 pass」，
-  # 而新檔乜都冇驗過。改為全 repo 掃，並排除 .git / venv / node_modules。
+  # 而新檔乜都冇驗過。改為全 repo 掃。
+  # 2026-10-10 外審 follow-up: 排除清單係 blacklist，所以一個叫 `venv-3.11`
+  # 或者 `.tox` 嘅目錄會被掃到、可以純因環境而整紅 suite。除咗下面列出嘅名，
+  # 亦一併剔走任何含 `site-packages` 嘅路徑。
   while IFS= read -r f; do
     FILES+=("$f")
-  done < <(find . \( -name '.git' -o -name '.venv' -o -name 'venv' \
-              -o -name 'node_modules' -o -name '__pycache__' \) -prune -o \
-              -name 'test_*.py' -type f -print | sort)
+  done < <(find . \( -name '.git' -o -name '.venv' -o -name 'venv' -o -name 'venv-*' \
+              -o -name 'node_modules' -o -name '__pycache__' -o -name '.tox' \
+              -o -name 'build' -o -name 'dist' -o -name '.eggs' -o -name '*.egg-info' \) \
+              -prune -o \
+              -name 'test_*.py' -type f -print | grep -v 'site-packages' | sort)
 fi
 
 if [ "${#FILES[@]}" -eq 0 ]; then
@@ -104,10 +109,18 @@ for f in "${FILES[@]}"; do
     continue
   fi
   out="$("$PY" "$f" 2>&1)"; rc=$?
-  # 2026-10-10: SKIP banner 收集。import 失敗／其它 exit != 0 一樣照舊 FAIL。
+  # 2026-10-10: SKIP banner 收集。只喺 rc==0 時當「data vacuum 但過關」——
+  # 一個檔可以既印 SKIPPED-data 又 exit 非 0（例如其他斷言失敗），舊寫法會
+  # 兩邊都列，令人以為佢只係冇數據。
+  _skipped_here=0
   if printf '%s\n' "$out" | grep -q 'SKIPPED-data'; then
-    SKIPPED+=("$f")
-    printf '  ⏭️  %-46s SKIP（缺數據，未驗證任何嘢）\n' "$f"
+    if [ "$rc" -eq 0 ]; then
+      SKIPPED+=("$f")
+      _skipped_here=1
+      printf '  ⏭️  %-46s SKIP（缺數據，未驗證任何嘢）\n' "$f"
+    else
+      printf '  ⚠️  %-46s 有 SKIPPED-data 但同時 exit=%s（當 FAIL）\n' "$f" "$rc"
+    fi
   fi
   if [ "$rc" -eq 0 ]; then
     printf '  ✅ %-46s\n' "$f"
@@ -143,9 +156,13 @@ printf '  total=%s  pass=%s  fail=%s\n' "${#FILES[@]}" "$pass" "$fail"
 STRICT_FAIL=0
 if [ "$STRICT_DATA" -eq 1 ]; then
   if [ "${#SKIPPED[@]}" -gt 0 ]; then
+    # 正常 strict run 唔會行到呢度（test 會 raise 而唔係 skip）。行到 = 有人
+    # 喺外面設咗 XAUUSD_ALLOW_MISSING_CSV=1，strict 要壓過佢。
     echo "  🔴 RUN_TESTS_STRICT_DATA=1：以下 test 冇數據可跑（vacuum），當 fail 計："
     for f in "${SKIPPED[@]}"; do echo "       ${f}"; done
     STRICT_FAIL=1
+  elif [ "$fail" -gt 0 ]; then
+    echo "  ℹ️  strict-data：缺數據嘅 test 以 FAIL 形式出現（見上面 FAILED 清單）"
   else
     echo "  ✅ strict-data：冇 test 處於 data vacuum"
   fi
@@ -171,11 +188,12 @@ if [ "$fail" -gt 0 ]; then
   echo "  ❌ FAILED:"
   for f in "${FAILED[@]}"; do echo "       ${f}"; done
   rc=1
+elif [ "${STRICT_FAIL:-0}" -eq 1 ]; then
+  # 2026-10-10 外審：strict 失敗唔可以照印「🎉 全部 pass」—— banner 要跟最終 rc。
+  echo "  ❌ strict-data 未過（上面有 vacuum 清單）"
+  rc=1
 elif [ "${rc}" -eq 0 ]; then
   echo "  🎉 全部 pass"
 fi
-
-# strict-data 嘅判定最後才併入，唔可以被上面嘅 rc=0 蓋走
-[ "${STRICT_FAIL:-0}" -eq 1 ] && rc=1
 
 exit "${rc}"

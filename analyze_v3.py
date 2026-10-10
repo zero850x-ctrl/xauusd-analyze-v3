@@ -2597,9 +2597,12 @@ def _post_spike_state(closes, atr):
     return {"direction": "down" if move < 0 else "up", "move": round(move, 2)}
 
 
+_UNSET = object()   # 「caller 冇接線呢個參數」哨兵，唔可以同「明確傳 None」混淆
+
+
 def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
-                          time_quality_override=None, points=None, atr=None,
-                          closes=None, bar_time=None):
+                          time_quality_override=None, points=None, atr=_UNSET,
+                          closes=_UNSET, bar_time=None):
     """Attach counter-trend severity, recommended volume, time quality, and cron gate.
 
     time_quality_override: when set (e.g. walk-forward backtest), use this level
@@ -2608,6 +2611,15 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
     bar_time: the BAR being evaluated, for a replay. Without it every replayed
     bar is scored with the run hour (session_bonus + golden-hour volume became
     constants); a live run leaves it None and keeps the wall clock.
+
+    2026-10-10 外審 follow-up: `atr` / `closes` 用 `_UNSET` 哨兵，令兩種情況
+    分得開 ——
+      • 冇接線（default `_UNSET`）→ 唔 block，只記 `post_spike_indeterminate`。
+        漏一個參數唔應該變成靜默推送乾旱。
+      • 明確傳入但唔可用（None／NaN／ATR<=0／bar 不足）→ BLOCK。
+        呢個係資料問題，同「冇接線」係兩件事。
+    之前 `atr=None` 同 `closes=None` 一律當「冇接線」（唔 block），而
+    `atr=None` 又其實會被 `_spike_window` 當唔可用 —— 兩個方向都唔一致。
     """
     if time_quality_override is not None:
         tq_level = time_quality_override
@@ -2618,23 +2630,23 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
         tq_level != 'danger'
         and broker_hour in SESSION_BONUS_HOURS
     )
-    spike = _post_spike_state(closes, atr) if closes is not None else None
-    # 2026-10-10 review: an UNUSABLE window is not a quiet market. The gate used
-    # to read both as "no spike" and push anyway — fail-OPEN on the guard that
-    # exists because of the 09-04 chasing losses. Unknown now blocks.
-    #
-    # `closes is None` is deliberately NOT in that class: no series at all is a
-    # CALLER gap, not evidence about the market, and blocking every push on a
-    # forgotten argument is how a gate turns into a silent drought (the failure
-    # the signal-gate audit exists to catch). It is recorded as
-    # `post_spike_indeterminate` and left audible instead.
-    spike_unknown = None
-    spike_unwired = None
-    if spike is None:
-        if closes is None:
-            spike_unwired = "no M30 close series provided"
-        else:
-            spike_unknown = _post_spike_indeterminate(closes, atr)
+    unwired = []
+    if atr is _UNSET:
+        unwired.append("atr")
+    if closes is _UNSET:
+        unwired.append("closes")
+    if unwired:
+        spike = None
+        spike_unknown = None
+        spike_unwired = "caller 冇接線: " + ", ".join(unwired)
+    else:
+        spike = _post_spike_state(closes, atr)
+        # 2026-10-10 review: an UNUSABLE window is not a quiet market. The gate
+        # used to read both as "no spike" and push anyway — fail-OPEN on the
+        # guard that exists because of the 09-04 chasing losses. Unknown blocks.
+        spike_unknown = (_post_spike_indeterminate(closes, atr)
+                         if spike is None else None)
+        spike_unwired = None
     for s in setups:
         side = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
         is_sell = side == 'BEARISH'
@@ -3014,6 +3026,20 @@ RAPID_FIRE_WINDOW_MIN = 5    # 2+ opens within 5min — see scripts/compute_ment
 RAPID_FIRE_MAX_TRADES = 2    # Max trades allowed within RAPID_FIRE_WINDOW_MIN
 
 
+_BAD_BAR_TIME_SEEN = set()   # dedupe：同一個壞 timestamp 唔洗版
+
+
+def _note_bad_bar_time(when, exc):
+    """Warn once per distinct unparseable bar stamp (see `_broker_hour`)."""
+    key = repr(when)
+    if key in _BAD_BAR_TIME_SEEN:
+        return
+    _BAD_BAR_TIME_SEEN.add(key)
+    print(f"⚠️ _broker_hour: 解析唔到 bar 時間 {key} ({type(exc).__name__}: {exc}) "
+          f"— 呢個 bar 退回 wall clock，session_bonus／volume tier 可能失真",
+          file=sys.stderr)
+
+
 def _broker_hour(when=None):
     """Hour in broker-local time (UTC + BROKER_UTC_OFFSET_HOURS).
 
@@ -3024,16 +3050,30 @@ def _broker_hour(when=None):
     Naive stamps are read as UTC — the engine's convention for broker
     timestamps — and aware ones are converted, so a caller cannot silently get
     a third interpretation.
+
+    2026-10-10 外審 follow-up: an unparseable `when` used to fall back to the
+    wall clock with NO trace — i.e. exactly the bug this function exists to
+    remove, reinstated silently for that bar (`pd.NaT.hour` raises). The
+    fallback is kept (a replay shouldn't die on one bad row) but it now prints
+    a deduped warning, so "which bars fell back" is answerable from the log
+    instead of invisible.
     """
     if when is None:
         utc = datetime.now(timezone.utc)
     else:
         try:
             ts = pd.Timestamp(when)
+            # `pd.NaT` is the trap: Timestamp(NaT) does NOT raise, tz_localize
+            # and tz_convert pass it through, and `NaT.hour` returns **nan** —
+            # so a missing bar stamp used to yield a NaN broker hour with no
+            # exception at all (session_bonus silently False). Catch it here.
+            if pd.isna(ts):
+                raise ValueError("NaT / NaN bar timestamp")
             if ts.tzinfo is None:
                 ts = ts.tz_localize('UTC')
             utc = ts.tz_convert('UTC').to_pydatetime()
-        except Exception:
+        except Exception as e:
+            _note_bad_bar_time(when, e)
             utc = datetime.now(timezone.utc)
     return (utc.hour + BROKER_UTC_OFFSET_HOURS) % 24
 

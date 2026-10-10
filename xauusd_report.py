@@ -98,6 +98,21 @@ def _closed_hkt_day(ct):
     return dt.astimezone(HKT).strftime("%Y-%m-%d")
 
 
+def _is_experimental(t):
+    """True ONLY for a row that carries a real JSON `push_suppressed is True`.
+
+    2026-10-10 外審 follow-up: the live/experimental split used truthiness
+    (`not t.get("push_suppressed")`), so a serialization slip — the string
+    `"false"` or `"0"` — read as suppressed and silently moved a genuinely
+    PUSHED trade OUT of the headline win-rate / sumR / todayR, i.e. the numbers
+    the operator actually trades on. Only a real bool True counts as
+    experimental; False / None / absent / any non-bool stays in the live-mirror
+    population (which is also the pre-change behaviour for legacy rows that
+    never carried the field).
+    """
+    return t.get("push_suppressed") is True
+
+
 def paper_stats(spot=None):
     """正統 paper：LIVE + CLOSED/W/L/勝率/sumR + 今日 PnL + CLOSED 明細行。
 
@@ -116,8 +131,8 @@ def paper_stats(spot=None):
     live = d.get("trades", []) if isinstance(d, dict) else []
     live = [t for t in live if t.get("status") == "LIVE"]
     closed_all = [t for t in history if t.get("status") == "CLOSED"]
-    closed = [t for t in closed_all if not t.get("push_suppressed")]
-    experimental = [t for t in closed_all if t.get("push_suppressed")]
+    closed = [t for t in closed_all if not _is_experimental(t)]
+    experimental = [t for t in closed_all if _is_experimental(t)]
     wins = sum(1 for t in closed if (t.get("pnl_r") or 0) > 0)
     losses = sum(1 for t in closed if (t.get("pnl_r") or 0) < 0)
     sum_r = round(sum(t.get("pnl_r") or 0 for t in closed), 2)

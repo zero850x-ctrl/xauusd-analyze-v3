@@ -528,8 +528,13 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
     # pinned value reads the env.
     if exit_model is None:
         exit_model = st.get("exit_model")
+    # 2026-10-10 外審 follow-up: last resort is the MODULE constant (captured at
+    # import), not a fresh env read. Re-reading the env here meant the seed /
+    # backtest path (which passes the pinned value) and this legacy-sim path
+    # could disagree WITHIN one process if anything mutated os.environ after
+    # import — "single source of truth" wasn't actually single.
     momentum_hold = (bool(exit_model) if exit_model is not None
-                     else os.environ.get("MOMENTUM_HOLD_EXIT", "1") == "1")
+                     else MOMENTUM_HOLD_EXIT)
     traded_max_high = None
     traded_min_low = None
     last_bar_dt = None
@@ -2423,7 +2428,17 @@ def run_backtest(data):
             # `close_time`, so a simulated close was only ever found through the
             # `seeded_time` fallback — and `seeded_time` is the OPEN, not the
             # close. Same key name as the live path now.
-            "closed_time": str(seed_dt) if really_closed else "",
+            #
+            # 2026-10-10 外審 follow-up: write the bar that ACTUALLY decided the
+            # close (`close_bar_time` from the sim), not the seed time. Writing
+            # seed_dt put every simulated close on its OPEN day, so "today PnL"
+            # attributed a whole backtest to the days it seeded — and it made the
+            # key rename behaviourally identical to the old `seeded_time`
+            # fallback (which is why a test that only checked the key name could
+            # pass under the old code). seed_dt is only the fallback for a sim
+            # that could not name the deciding bar.
+            "closed_time": ((sim.get("close_bar_time") or str(seed_dt))
+                            if really_closed else ""),
         }
         if simulated["status"] == "LIVE":
             log.setdefault("trades", []).append(simulated)

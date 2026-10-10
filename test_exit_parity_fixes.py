@@ -277,7 +277,15 @@ def test_dual_engine_samebar_tp1_then_stop():
 
 
 def _legacy_both(side, entry, stop, tp1, tp2, bars, bt_bar):
-    """One legacy path on both engines. Returns (paper sim, backtest trade)."""
+    """One legacy path on both engines. Returns (paper sim, backtest trade).
+
+    2026-10-10 外審 follow-up: `exit_model=False` is now passed EXPLICITLY. The
+    env used to be read per call, which is exactly the bug the pinning fix
+    removes (flipping env rewrote an open trade's outcome). The env is still
+    honoured, but only once at import — `MOMENTUM_HOLD_EXIT=0 python …` keeps
+    working, while a test that mutates os.environ mid-process must now ask for
+    the model it wants.
+    """
     old_env = os.environ.get("MOMENTUM_HOLD_EXIT")
     old_bt = bt.MOMENTUM_HOLD_EXIT
     os.environ["MOMENTUM_HOLD_EXIT"] = "0"
@@ -286,7 +294,7 @@ def _legacy_both(side, entry, stop, tp1, tp2, bars, bt_bar):
         seed = pd.Timestamp("2026-09-01T00:00:00Z")
         sim = pt._simulate_staged_exit(
             _df(bars), entry, stop, tp1, tp2, side, 12.0,
-            seed_dt=seed, data_source="tv")
+            seed_dt=seed, data_source="tv", exit_model=False)
         t = _mk_trade(side, entry, stop, tp1, tp2)
         for high, low, close, open_ in bt_bar:
             closed = bt.simulate_trade_on_bar(
