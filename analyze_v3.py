@@ -2547,20 +2547,41 @@ def _spike_window(closes, atr):
     "no spike" — i.e. it failed OPEN on the exact guard the 09-04 incident
     (six consecutive chasing losses) produced. Callers that must not guess use
     `_post_spike_indeterminate()` and block instead.
+
+    Two precision rules (2026-10-11 review):
+      * ATR must be a finite positive number. `nan <= 0` is False, so the old
+        `atr <= 0` test let a NaN ATR through, and `abs(move) <= mult * nan` is
+        then also False — a flat series became a fabricated "up" spike that
+        blocked BUY and let SELL through. NaN / inf ATR is unusable.
+      * Every COMPLETED close in the window must be finite, but the final value
+        is the still-forming bar: live already expects it to be NaN sometimes
+        (it falls back to the last valid close) and the math never reads it
+        (`window[-2]` is the reference, `window[0]` the base). Requiring it
+        finite turned one NaN forming bar into a blocked tick for every push
+        and every seed. A NaN among the completed bars still means a gappy /
+        corrupt series, so that stays indeterminate (fail closed).
     """
     if closes is None:
         return None, "no M30 close series"
-    if atr is None or atr <= 0:
+    try:
+        atr_f = float(atr)
+    except (TypeError, ValueError):
+        atr_f = float("nan")
+    if atr is None or not np.isfinite(atr_f) or atr_f <= 0:
         return None, f"ATR unusable ({atr})"
     need = SPIKE_WINDOW_BARS + 2  # 4 收市 bar + last(forming) + 前 1 參考
     if len(closes) < need:
         return None, f"only {len(closes)} M30 bars (< {need})"
-    # Only the tail window matters; any non-finite value inside it would
-    # shift the window if filtered, so bail out instead of compacting.
-    tail = list(closes[-need:])
-    if any(c is None or not np.isfinite(float(c)) for c in tail):
+    # Index by position (never compact), so a bad value cannot shift the window.
+    tail = []
+    for c in list(closes[-need:]):
+        try:
+            tail.append(float(c))
+        except (TypeError, ValueError):
+            tail.append(float("nan"))
+    if not all(np.isfinite(c) for c in tail[:-1]):   # tail[-1] = forming bar
         return None, "non-finite close inside the window"
-    return [float(c) for c in tail], None
+    return tail, None
 
 
 def _post_spike_indeterminate(closes, atr):
@@ -2592,7 +2613,7 @@ def _post_spike_state(closes, atr):
     ref = window[-2]
     base = window[-2 - SPIKE_WINDOW_BARS]
     move = ref - base
-    if abs(move) <= SPIKE_ATR_MULT * atr:
+    if abs(move) <= SPIKE_ATR_MULT * float(atr):
         return None
     return {"direction": "down" if move < 0 else "up", "move": round(move, 2)}
 

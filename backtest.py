@@ -1053,6 +1053,10 @@ def run_backtest(df_bars, df_day, verbose=False):
                 setups, daily_trend, h1_trend, current_price=current_price,
                 time_quality_override=tq_level, points=points, atr=atr,
                 closes=window['Close'].values,
+                # Score the BAR being replayed. Without this, session_bonus
+                # follows the machine clock and changes which setup the
+                # `new_trades[0]` pick below opens (2026-10-11 review).
+                bar_time=bar_ts,
             )
         except Exception:
             continue

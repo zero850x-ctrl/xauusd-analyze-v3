@@ -19,6 +19,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
 import pandas as pd
 
 import analyze_v3 as av
@@ -142,6 +143,61 @@ def test_post_spike_state_contract_unchanged():
           av._post_spike_indeterminate([float("nan")] * 10, 15.0) is not None)
 
 
+def test_post_spike_nan_atr_is_unusable():
+    """`nan <= 0` is False, so a NaN ATR used to pass the guard and then make
+    `abs(move) <= mult * nan` False too: a FLAT series became a fake "up" spike
+    that blocked BUY and let SELL (this fixture) through. Must block both."""
+    for label, bad in (("nan", float("nan")), ("inf", float("inf")),
+                       ("np.nan", np.float64("nan")), ("-inf", float("-inf"))):
+        s = _inject(_QUIET, atr=bad)
+        check(f"A18 ATR={label} + SELL → block（唔可以放行）",
+              s["post_spike_blocked"] is True, s)
+        check(f"A18b ATR={label} → 原因係 ATR unusable",
+              str(s["post_spike_indeterminate"]).startswith("ATR unusable"), s)
+    b = _setup("BUY")
+    av._inject_push_metadata([b], {"trend": "BULLISH"}, {"trend": "BULLISH"},
+                             current_price=4430.0, time_quality_override="normal",
+                             points=[], atr=float("nan"), closes=list(_QUIET))
+    check("A18c ATR=nan + BUY → 一樣 block（對稱）", b["post_spike_blocked"] is True, b)
+    check("A19 flat 窗口 + NaN ATR → _post_spike_state 唔會作出 spike",
+          av._post_spike_state(_QUIET, float("nan")) is None)
+    check("A19b 同一組輸入 → indeterminate 有原因",
+          av._post_spike_indeterminate(_QUIET, float("nan")) is not None)
+
+
+def test_post_spike_forming_bar_nan_is_not_a_block():
+    """The last value is the still-forming bar, which the math never reads and
+    live already tolerates being NaN. Completed bars must still be finite."""
+    closes = list(_QUIET)
+    closes[-1] = float("nan")
+    s = _inject(closes)
+    check("A20 forming bar = NaN（平靜）→ 唔 block", s["post_spike_blocked"] is False, s)
+    check("A20b 唔記 indeterminate", s["post_spike_indeterminate"] is None, s)
+    check("A20c 結果同平靜基線完全一致（forming bar NaN 唔改變任何 gate 結果）",
+          s["cron_push_eligible"] == _inject(_QUIET)["cron_push_eligible"]
+          and s["push_suppressed"] == _inject(_QUIET)["push_suppressed"], s)
+
+    spike = list(_SPIKE_DOWN)
+    spike[-1] = float("nan")
+    s2 = _inject(spike)
+    check("A21 forming bar = NaN 但窗口真係有急跌 → 照樣因 spike block",
+          s2["post_spike_blocked"] is True and s2["post_spike_indeterminate"] is None, s2)
+
+    base_nan = list(_QUIET)
+    base_nan[-6] = float("nan")             # window[0] = the base the math reads
+    s3 = _inject(base_nan)
+    check("A22 base close = NaN（數學會讀）→ block",
+          s3["post_spike_blocked"] is True, s3)
+    check("A22b 原因", s3["post_spike_indeterminate"] == "non-finite close inside the window", s3)
+
+    mid_nan = list(_QUIET)
+    mid_nan[-4] = float("nan")              # a COMPLETED bar: gappy series → fail closed
+    s4 = _inject(mid_nan)
+    check("A23 已收市 bar 有 NaN（序列有洞）→ 仍然 block",
+          s4["post_spike_blocked"] is True and
+          s4["post_spike_indeterminate"] == "non-finite close inside the window", s4)
+
+
 # ── B. _finite_px ──
 def test_finite_px_rejects_bool():
     check("B1 float(True)==1.0 唔可以當價（bool 要拒）", pt._finite_px(True) is None)
@@ -194,16 +250,43 @@ def test_simulated_close_key_reaches_cooldown():
           pt._consecutive_losses(log2) == 0 and pt._last_close_dt(log2) is None,
           f"losses={pt._consecutive_losses(log2)} last={pt._last_close_dt(log2)}")
 
-    # 生產 writer 真係寫嘅格式（`str(pd.Timestamp)`，tz-aware UTC）—— 唔可以只
-    # 用手砌嘅 `...Z` 字串，否則 writer 格式冇被覆蓋。
+    # 空格 + offset 形式（`str(tz-aware datetime)`）仍然要讀得返 —— 舊 run_backtest
+    # 就係寫呢個形狀。2026-10-11：呢個 case 以前用「而家」做 stamp，只有 HKT
+    # 00:00–07:59 先會 fail（UTC 日 ≠ HKT 日），其餘鐘數都靜靜 pass。而家刻意
+    # 揀「今日 HKT 03:00」= 昨日 19:00 UTC，任何時間跑都係日界 case。
     seed_dt = pt._parse_dt(close_ts)
     written = str(seed_dt)
-    check("C4 run_backtest 寫嘅格式（str(Timestamp)）解析得返",
+    check("C4 空格形式（str(Timestamp)）解析得返",
           pt._parse_dt(written) == seed_dt, f"{written!r} → {pt._parse_dt(written)}")
-    log3 = {"trades": [], "history": [{"status": "CLOSED", "pnl_r": -1.0,
-                                       "verified": True, "closed_time": written}]}
-    check("C5 該格式嘅 closed_time 一樣數到 cooldown",
-          pt._consecutive_losses(log3) == 1, pt._consecutive_losses(log3))
+    hkt_0300 = datetime.now(pt.HKT).replace(hour=3, minute=0, second=0, microsecond=0)
+    boundary = hkt_0300.astimezone(timezone.utc)
+    check("C4b 前提：邊界 stamp 嘅 UTC 日 ≠ HKT 日",
+          boundary.strftime("%Y-%m-%d") != hkt_0300.strftime("%Y-%m-%d"),
+          (boundary, hkt_0300))
+    for label, stamp in (("空格形式", str(boundary)),
+                         ("Z 形式", boundary.strftime("%Y-%m-%dT%H:%M:%SZ"))):
+        log3 = {"trades": [], "history": [{"status": "CLOSED", "pnl_r": -1.0,
+                                           "verified": True, "closed_time": stamp}]}
+        check(f"C5 {label}嘅 closed_time 喺 HKT 日界一樣數到 cooldown ({stamp})",
+              pt._consecutive_losses(log3) == 1, pt._consecutive_losses(log3))
+
+
+def test_hkt_day_parses_every_stamp_form():
+    """`_hkt_day` must convert from the real instant, whatever the spelling."""
+    cases = {
+        "2026-10-10T20:00:00Z": "2026-10-11",
+        "2026-10-10 20:00:00+00:00": "2026-10-11",      # str(aware datetime)
+        "2026-10-10T20:00:00+00:00": "2026-10-11",
+        "2026-10-11T03:00:00+08:00": "2026-10-11",      # offset is honoured
+        "2026-10-10T15:59:59Z": "2026-10-10",           # last second of HKT day
+        "2026-10-10T16:00:00Z": "2026-10-11",           # first second of next
+        "2026-09-12": "2026-09-12",                     # bare date label stays
+    }
+    for stamp, want in cases.items():
+        got = pt._hkt_day(stamp)
+        check(f"C6 _hkt_day({stamp!r}) == {want}", got == want, got)
+    check("C6b 空值 → None", pt._hkt_day("") is None and pt._hkt_day(None) is None)
+    check("C6c 解析唔到 → 退回前 10 字（舊行為）", pt._hkt_day("garbage-text-here") == "garbage-te")
 
 
 # ── D. exit model pinned per trade ──
@@ -287,6 +370,185 @@ def test_backtest_parity_guards():
                                         4430.0, today) == "duplicate signal")
 
 
+def _gen_dt():
+    """A report instant yesterday 12:00 UTC: always in the past (the bar series
+    must not be in the future) and fixed hour-of-day."""
+    return (datetime.now(timezone.utc) - timedelta(days=1)).replace(
+        hour=12, minute=0, second=0, microsecond=0)
+
+
+def _bt_setup(pattern="Double Top", entry=4300.0, stop="$4340", mode="breakout"):
+    return {"pattern": pattern, "direction": "SELL", "entry_mode": mode,
+            "cron_push_eligible": True, "seedable": True, "entry_price": entry,
+            "stop_loss": stop, "tp1": "$4260 (1:1)", "tp2": "$4220 (1:2)"}
+
+
+_DISC_ENTRIES = []
+
+
+def _run_bt(setups, ledger=None, price=4300.0, sim=None):
+    """Drive the real `run_backtest` with the network / clock / sim stubbed.
+
+    Returns (simulated_calls, discipline_snapshots, stdout). The ledger and the
+    sim are injected; `_runtime_danger_blocked` and `discipline_check` are
+    stubbed because both read the WALL CLOCK, which would make this test depend
+    on when it runs. The snapshots are the isolated log as each candidate's
+    discipline check saw it.
+    """
+    import copy
+    gen = _gen_dt()
+    rows = [{"datetime": pd.Timestamp(gen + timedelta(minutes=30 * (i + 1))).tz_localize(None),
+             "open": 4300.0, "high": 4301.0, "low": 4290.0, "close": 4295.0}
+            for i in range(6)]
+    frame = pd.DataFrame(rows)
+    calls, snaps = [], []
+
+    def fake_sim(bars, entry, stop, tp1, tp2, side, atr, **kw):
+        calls.append({"entry": entry, "stop": stop, "side": side})
+        return dict(sim) if sim else {"closed": False, "result": "LIVE", "pnl_r": 0.0,
+                                      "bars_held": 1, "verified": True}
+
+    def fake_discipline(log, direction, volume, sl, entry, atr):
+        snaps.append(copy.deepcopy(log))
+        _DISC_ENTRIES.append(entry)
+        return True, "ok"
+    _DISC_ENTRIES.clear()
+
+    data = {"setups": setups, "price": price, "atr_30m": 15.0,
+            "generated_at": gen.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "date": gen.astimezone(pt.HKT).strftime("%Y-%m-%d")}
+    orig = (pt._fetch_m30, pt.load_log, pt._simulate_staged_exit,
+            pt._runtime_danger_blocked, pt.discipline_check)
+    pt._fetch_m30 = lambda *a, **k: (frame, "tv")
+    pt.load_log = lambda: copy.deepcopy(ledger if ledger is not None
+                                        else {"trades": [], "history": []})
+    pt._simulate_staged_exit = fake_sim
+    pt._runtime_danger_blocked = lambda d=None: False
+    pt.discipline_check = fake_discipline
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            pt.run_backtest(data)
+    finally:
+        (pt._fetch_m30, pt.load_log, pt._simulate_staged_exit,
+         pt._runtime_danger_blocked, pt.discipline_check) = orig
+    return calls, snaps, buf.getvalue()
+
+
+def _ledger_copy(gen, delta, status="LIVE"):
+    stamp = (gen + delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {"status": status, "pattern": "Double Top", "direction": "SELL",
+            "entry_mode": "breakout", "seeded_time": stamp,
+            "seeded_date": (gen + delta).astimezone(pt.HKT).strftime("%Y-%m-%d")}
+
+
+def test_backtest_ledger_is_read_as_of_the_report():
+    """The cron seeds this very JSON, so its copy is already in the live ledger.
+    It must not veto the backtest of the signal that created it."""
+    gen = _gen_dt()
+    after = {"trades": [_ledger_copy(gen, timedelta(minutes=1))], "history": []}
+    calls, _, out = _run_bt([_bt_setup()], ledger=after)
+    check("E5 cron 喺 report 之後 seed 嘅同一單 → 唔當 duplicate，照 backtest",
+          len(calls) == 1 and "duplicate signal" not in out, (calls, out))
+
+    before = {"trades": [_ledger_copy(gen, timedelta(hours=-1))], "history": []}
+    calls2, _, out2 = _run_bt([_bt_setup()], ledger=before)
+    check("E5b report 之前已存在嘅同一單 → 仍然 duplicate（live parity 唔變）",
+          len(calls2) == 0 and "duplicate signal" in out2, (calls2, out2))
+
+    closed_before = {"trades": [], "history": [_ledger_copy(gen, timedelta(hours=-1), "CLOSED")]}
+    calls3, _, _ = _run_bt([_bt_setup()], ledger=closed_before)
+    check("E5c 同日較早已平倉嘅同一單 → 一樣 duplicate", len(calls3) == 0, calls3)
+
+    legacy = {"trades": [{"status": "LIVE", "pattern": "Double Top", "direction": "SELL",
+                          "entry_mode": "breakout", "seeded_date": _ledger_copy(gen, timedelta())["seeded_date"]}],
+              "history": []}
+    calls4, _, _ = _run_bt([_bt_setup()], ledger=legacy)
+    check("E5d 冇 seeded_time 嘅舊紀錄 → 保守地保留（仍然 duplicate）", len(calls4) == 0, calls4)
+
+
+def test_backtest_simulated_rows_are_visible_to_dedupe():
+    """A row appended by the loop needs pattern/entry_mode or `_existing_signal`
+    can never see it, and the same signal listed twice is simulated twice."""
+    calls, snaps, out = _run_bt([_bt_setup(), _bt_setup()])
+    check("E6 同一訊號列兩次 → 第二次被 duplicate 擋住（只 simulate 一次）",
+          len(calls) == 1 and "duplicate signal" in out, (calls, out))
+    check("E6b 第二次 discipline 之前已經被擋 → 只有一個 snapshot", len(snaps) == 1, len(snaps))
+
+    calls2, snaps2, _ = _run_bt([_bt_setup("Double Top"), _bt_setup("Head and Shoulders")])
+    check("E6c 唔同 pattern → 兩單都跑", len(calls2) == 2, calls2)
+    row = snaps2[1]["trades"][0] if snaps2 and snaps2[1].get("trades") else {}
+    check("E6d 模擬 row 帶 pattern + entry_mode",
+          row.get("pattern") == "Double Top" and row.get("entry_mode") == "breakout", row)
+
+
+def test_backtest_shape_check_uses_raw_entry():
+    """Slippage is the simulated FILL, not the signal. A SELL whose stop sits
+    0.10 under its entry is rejected live; shifting the entry down by the 0.15
+    slippage first made it look valid."""
+    bad = _bt_setup(entry=4440.0, stop="$4439.90")
+    calls, _, out = _run_bt([bad], price=4439.0)
+    check("E7 錯方向 stop（SELL stop 低過 entry 0.10）→ 照 live 拒絕",
+          len(calls) == 0 and "錯誤方向" in out, (calls, out))
+    ok = _bt_setup(entry=4440.0, stop="$4480")
+    calls2, _, _ = _run_bt([ok], price=4439.0)
+    check("E7b 正常 SELL → 照跑，而且 sim 用 slipped entry",
+          len(calls2) == 1 and abs(calls2[0]["entry"] - (4440.0 - pt.SLIPPAGE_TICKS)) < 1e-9, calls2)
+
+
+def test_backtest_discipline_sees_raw_entry():
+    """The discipline SL-floor check sees the setup entry live sees."""
+    calls, _, _ = _run_bt([_bt_setup(entry=4300.0)])
+    check("E8 discipline 見到 raw entry 4300.0",
+          _DISC_ENTRIES == [4300.0], _DISC_ENTRIES)
+    check("E8b sim 用 slipped entry（raw − slippage）",
+          len(calls) == 1 and abs(calls[0]["entry"] - 4299.85) < 1e-9, calls)
+
+
+def test_backtest_writes_iso_z_stamps():
+    """No `str(aware_datetime)` in the ledger: the readers parse it, but every
+    other writer uses '…Z' and `_hkt_day` once mis-dated the space form."""
+    import re
+    z = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+    closed = {"closed": True, "result": "SL", "pnl_r": -1.0, "bars_held": 3, "verified": True}
+    calls, snaps, _ = _run_bt([_bt_setup("Double Top"), _bt_setup("Head and Shoulders")], sim=closed)
+    hist = snaps[1]["history"][-1] if len(snaps) > 1 and snaps[1].get("history") else {}
+    check("E9 seeded_time 係 ISO-Z", bool(z.match(str(hist.get("seeded_time", "")))), hist)
+    check("E9b closed_time（sim 冇 close_bar_time → fallback）係 ISO-Z",
+          bool(z.match(str(hist.get("closed_time", "")))), hist)
+    check("E9c fallback closed_time == seeded_time",
+          hist.get("closed_time") == hist.get("seeded_time"), hist)
+
+
+# ── G. backtest.py scores the replayed BAR, not the wall clock ──
+def test_backtest_injects_bar_time():
+    import ast
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest.py"),
+               encoding="utf-8").read()
+    calls = [n for n in ast.walk(ast.parse(src))
+             if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_inject_push_metadata"]
+    check("G1 backtest.py 有調用 _inject_push_metadata", len(calls) >= 1, len(calls))
+    check("G2 每個調用都傳 bar_time（否則 session_bonus 跟機器時鐘）",
+          all("bar_time" in {k.arg for k in c.keywords} for c in calls),
+          [sorted(k.arg for k in c.keywords) for c in calls])
+
+
+def test_session_bonus_follows_bar_time():
+    in_h = (min(av.SESSION_BONUS_HOURS) - av.BROKER_UTC_OFFSET_HOURS) % 24
+    out_h = (in_h + 5) % 24
+    results = {}
+    for label, hour in (("in", in_h), ("out", out_h)):
+        s = _setup()
+        av._inject_push_metadata(
+            [s], {"trend": "BEARISH"}, {"trend": "BEARISH"}, current_price=4430.0,
+            time_quality_override="normal", points=[], atr=15.0, closes=list(_QUIET),
+            bar_time=pd.Timestamp(f"2026-09-01T{hour:02d}:00:00Z"))
+        results[label] = s.get("session_bonus")
+    check("G3 bar_time 喺 session 小時 → session_bonus=True", results["in"] is True, results)
+    check("G4 bar_time 喺 session 以外 → session_bonus=False（同機器時鐘無關）",
+          results["out"] is False, results)
+
+
 # ── F. 外審 follow-up：_broker_hour 壞 stamp 要出聲；報告分流要嚴格 ──
 def test_broker_hour_bad_stamp_warns():
     """An unparseable bar stamp must not silently revert to the wall clock.
@@ -343,11 +605,21 @@ if __name__ == "__main__":
                test_post_spike_bad_atr_fails_closed,
                test_post_spike_missing_series_is_recorded_not_blocked,
                test_post_spike_state_contract_unchanged,
+               test_post_spike_nan_atr_is_unusable,
+               test_post_spike_forming_bar_nan_is_not_a_block,
                test_finite_px_rejects_bool,
                test_simulated_close_key_reaches_cooldown,
+               test_hkt_day_parses_every_stamp_form,
                test_exit_model_pinned_beats_env,
                test_exit_model_resumed_from_state,
                test_backtest_parity_guards,
+               test_backtest_ledger_is_read_as_of_the_report,
+               test_backtest_simulated_rows_are_visible_to_dedupe,
+               test_backtest_shape_check_uses_raw_entry,
+               test_backtest_discipline_sees_raw_entry,
+               test_backtest_writes_iso_z_stamps,
+               test_backtest_injects_bar_time,
+               test_session_bonus_follows_bar_time,
                test_broker_hour_bad_stamp_warns,
                test_report_experimental_split_is_strict):
         fn()

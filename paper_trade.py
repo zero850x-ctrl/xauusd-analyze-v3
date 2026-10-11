@@ -368,14 +368,35 @@ HKT = timezone(timedelta(hours=8))
 
 
 def _hkt_day(ts):
-    """Trade-day (HKT) for an ISO timestamp written as UTC ('...Z' / '+00:00')."""
+    """Trade-day (HKT) for a close/seed stamp.
+
+    Goes through `_parse_dt`, so '...Z', '...+00:00' and the space-separated
+    `str(tz-aware datetime)` form are all converted from their real instant.
+    The old `strptime` only understood the 'T' form and ignored any offset; the
+    space form fell through to `ts[:10]`, the UTC calendar date, which is the
+    wrong HKT day for 16:00-23:59 UTC (2026-10-11 review). A bare date label is
+    already a calendar day and stays as is. Naive stamps are read as UTC.
+    """
     if not ts:
         return None
-    try:
-        return (datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")
-                .replace(tzinfo=timezone.utc).astimezone(HKT).strftime("%Y-%m-%d"))
-    except ValueError:
-        return ts[:10] or None
+    text = str(ts).strip()
+    if len(text) <= 10:
+        return text or None
+    dt = _parse_dt(text)
+    if dt is None:
+        return text[:10] or None
+    return dt.astimezone(HKT).strftime("%Y-%m-%d")
+
+
+def _iso_z(dt):
+    """UTC stamp with a trailing Z — the format every live writer produces.
+
+    `str(aware_datetime)` gives '2026-10-10 20:00:00+00:00'; the readers should
+    never have to guess that variant.
+    """
+    if dt is None:
+        return ""
+    return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 def _report_date(data):
@@ -2281,6 +2302,29 @@ def _backtest_live_parity_skip(log, s, entry, stop, side, report_price, report_d
     return None
 
 
+def _ledger_as_of(log, as_of):
+    """Isolated copy of the ledger as the live engine saw it at `as_of`.
+
+    Keeps LIVE trades only (CLOSED rows are in history) and, when `as_of` is
+    known, drops every record seeded at or after it. The cron normally seeds
+    the very JSON a `--backtest` is replayed from, so that copy is in the live
+    ledger already; left in, `_existing_signal` matched it and every setup was
+    skipped as "duplicate signal (live parity)". Records whose `seeded_time`
+    cannot be read stay (conservative: they may be genuine earlier positions).
+    """
+    def _before(rec):
+        if as_of is None:
+            return True
+        seeded = _parse_dt(rec.get("seeded_time"))
+        return seeded is None or seeded < as_of
+
+    out = copy.deepcopy(log)
+    out["trades"] = [t for t in out.get("trades", [])
+                     if t.get("status") == "LIVE" and _before(t)]
+    out["history"] = [t for t in out.get("history", []) if _before(t)]
+    return out
+
+
 def run_backtest(data):
     """Backtest mode: simulate cron-eligible seedable setups from analyze JSON."""
     bars, data_source = _fetch_m30(None, None)
@@ -2322,7 +2366,8 @@ def run_backtest(data):
         print("⏳ No setups in JSON")
         return
 
-    seed_dt = _parse_dt(data.get("generated_at"))
+    generated_dt = _parse_dt(data.get("generated_at"))
+    seed_dt = generated_dt
     if seed_dt is None:
         seed_dt = _parse_dt(f"{_report_date(data)}T00:00:00Z")
 
@@ -2333,9 +2378,9 @@ def run_backtest(data):
     # ── Discipline guards (aligned with seed_trades) ──
     # Use an isolated simulated log and update it after each candidate so
     # anti-stacking, cooldown, loss and direction guards apply chronologically.
-    log = copy.deepcopy(load_log())
-    log["trades"] = [t for t in log.get("trades", []) if t.get("status") == "LIVE"]
-    log["history"] = list(log.get("history", []))
+    # The ledger is read AS OF the report: the cron has usually already seeded
+    # this very JSON, and that copy must not veto its own backtest.
+    log = _ledger_as_of(load_log(), generated_dt)
     if _runtime_danger_blocked(data):
         hour = _broker_hour(data)
         print(f"🚫 Danger hour {hour:02d}:00 broker — backtest blocked (138-sample hard-block)")
@@ -2363,15 +2408,19 @@ def run_backtest(data):
             entry = _parse_entry_from_setup(s, current_price)
             if entry is None:
                 continue
-            # Match backtest adverse entry fill: BUY pays ask, SELL sells bid.
-            entry = entry - SLIPPAGE_TICKS if side == "SELL" else entry + SLIPPAGE_TICKS
+            # seed_trades judges the RAW setup entry (shape / crossed stop /
+            # discipline SL floor). Slippage is only the simulated fill, so it
+            # is applied AFTER those checks — applying it first let a setup
+            # whose stop sits 0.10 on the wrong side of the entry pass the
+            # shape check live would have failed (2026-10-11 review).
+            entry_raw = entry
             stop = float(s["stop_loss"].replace("$", "").replace(",", ""))
             tp1 = _setup_price(s, "tp1")
             tp2 = _setup_price(s, "tp2")
         except (IndexError, ValueError, AttributeError):
             continue
 
-        if abs(entry - stop) <= 0:
+        if abs(entry_raw - stop) <= 0:
             continue
 
         # ── Live seeding guards (2026-10-10 review) ──
@@ -2381,17 +2430,20 @@ def run_backtest(data):
         # presented next to live ones. Same predicates, same order as seed_trades.
         report_price = float(current_price) if current_price else None
         parity_skip = _backtest_live_parity_skip(
-            log, s, entry, stop, side, report_price, _report_date(data))
+            log, s, entry_raw, stop, side, report_price, _report_date(data))
         if parity_skip:
             print(f"  ⏭️  Skip {pattern} — {parity_skip} (live parity)")
             continue
 
         # ── Per-trade discipline check ──
         vol = s.get("recommended_volume", 0.01)
-        ok, reason = discipline_check(log, side, vol, stop, entry, atr)
+        ok, reason = discipline_check(log, side, vol, stop, entry_raw, atr)
         if not ok:
             print(f"  {reason} ({pattern})")
             continue
+
+        # Match backtest adverse entry fill: BUY pays ask, SELL sells bid.
+        entry = entry_raw - SLIPPAGE_TICKS if side == "SELL" else entry_raw + SLIPPAGE_TICKS
 
         sim = _simulate_staged_exit(
             bars, entry, stop, tp1, tp2, side, atr, seed_dt=seed_dt,
@@ -2425,9 +2477,14 @@ def run_backtest(data):
         # placeholders so subsequent candidates cannot stack through a fake close.
         really_closed = bool(sim.get("closed") and verified)
         simulated = {
+            # `pattern` / `entry_mode` are what `_signal_key` hashes; without
+            # them `_existing_signal` can never see a row this loop appended, so
+            # the same signal listed twice was simulated twice.
+            "pattern": pattern,
+            "entry_mode": s.get("entry_mode", "breakout"),
             "direction": side,
             "status": "CLOSED" if really_closed else "LIVE",
-            "seeded_time": str(seed_dt) if seed_dt else "",
+            "seeded_time": _iso_z(seed_dt),
             "seeded_date": _report_date(data),
             "pnl_r": pnl_r if really_closed else 0.0,
             "verified": verified,
@@ -2447,7 +2504,7 @@ def run_backtest(data):
             # fallback (which is why a test that only checked the key name could
             # pass under the old code). seed_dt is only the fallback for a sim
             # that could not name the deciding bar.
-            "closed_time": ((sim.get("close_bar_time") or str(seed_dt))
+            "closed_time": ((sim.get("close_bar_time") or _iso_z(seed_dt))
                             if really_closed else ""),
         }
         if simulated["status"] == "LIVE":
