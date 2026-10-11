@@ -17,8 +17,6 @@ GOLDEN_HOURS = {17}
 ADVISORY_HOURS_0408 = {4, 5, 6, 8}
 ADVISORY_HOUR_1700 = set()
 DANGER_HOURS = {7, 18}
-DANGER_ADVISORY_HOURS = ADVISORY_HOURS_0408 | DANGER_HOURS
-
 # 2026-10-10 review: 樣本門檻。細過呢個數一律唔報百分比 —— n=2 嘅「100% 勝率」
 # 同 n=2 嘅「0%」睇落都好似結論，但其實係噪音（Wilson CI 會闊到 0-84%）。
 MIN_STAT_SAMPLE = 5

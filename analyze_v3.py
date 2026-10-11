@@ -3051,7 +3051,6 @@ ADVISORY_HOUR_1700 = set()  # vacated; 17:00 now golden
 # 07:00/18:00 mentor "edge" is rejected as outlier-driven, not added.
 SESSION_BONUS_HOURS = {3}  # broker 03:00 only (mentor +$1,354, n=14; no conflict)
 DANGER_HOURS = {7, 18}       # 07:00 (25% win, -$212 — 0.12 lot massacre); 18:00 (21.4%, -$98)
-DANGER_ADVISORY_HOURS = ADVISORY_HOURS_0408 | DANGER_HOURS  # 07, 18 added as hard-block
 MAX_DAILY_TRADES = 8         # Overtrading threshold (123 trades/week = ~17/day avg)
 RAPID_FIRE_WINDOW_MIN = 5    # 2+ opens within 5min — see scripts/compute_mentor_stats.py
 RAPID_FIRE_MAX_TRADES = 2    # Max trades allowed within RAPID_FIRE_WINDOW_MIN
