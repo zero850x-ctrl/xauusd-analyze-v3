@@ -14,7 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.mentor_trades import all_raw_trades, dedupe_trades, enrich, parse_ts
+from scripts.mentor_trades import (MIN_STAT_SAMPLE, all_raw_trades, dedupe_trades,
+                                   enrich, parse_ts, wilson)
 
 HOLD_BUCKETS = (
     ('<5min', lambda t: t['hold_min'] < 5),
@@ -43,14 +44,25 @@ def _bucket_stats(trades, buckets):
             continue
         wins = sum(1 for t in sub if t['win'])
         pnl = sum(t['pnl'] for t in sub)
+        lo, hi = wilson(wins, len(sub))
         rows.append({
             'name': name,
             'n': len(sub),
             'wins': wins,
             'win_pct': 100 * wins / len(sub),
+            # 2026-10-10 review: 冇 CI 嘅 win% 令 n=1 同 n=40 睇落一樣可信。
+            'ci_lo': 100 * lo,
+            'ci_hi': 100 * hi,
             'pnl': pnl,
         })
     return rows
+
+
+def _win_cell(row):
+    """勝率欄：樣本不足就唔報百分比，避免細 n 讀成結論。"""
+    if row['n'] < MIN_STAT_SAMPLE:
+        return f"n<{MIN_STAT_SAMPLE} 不足"
+    return f"{row['win_pct']:5.1f}% [{row['ci_lo']:.0f}-{row['ci_hi']:.0f}]"
 
 
 def same_dir_opens_within_min(trades, minutes=3):
@@ -112,21 +124,30 @@ def main():
         sys.exit(1)
 
     print(f'=== {n} trades (dropped duplicate idx={dropped}) ===')
-    print(f'Total PnL: {total_pnl:+.2f}  Wins: {wins}/{n} ({100*wins/n:.1f}%)')
+    if n:
+        lo, hi = wilson(wins, n)
+        print(f'Total PnL: {total_pnl:+.2f}  Wins: {wins}/{n} ({100*wins/n:.1f}%, '
+              f'95% CI {100*lo:.0f}-{100*hi:.0f}%)')
+    else:
+        print(f'Total PnL: {total_pnl:+.2f}  Wins: 0/0 (冇樣本)')
     print()
 
     print('=== Hold buckets (must sum to N) ===')
     for row in _bucket_stats(trades, HOLD_BUCKETS):
-        print(f"  {row['name']:8s}  n={row['n']:3d}  win={row['win_pct']:5.1f}%  pnl={row['pnl']:+8.2f}")
+        print(f"  {row['name']:8s}  n={row['n']:3d}  win={_win_cell(row):>13s}  pnl={row['pnl']:+8.2f}")
 
     print('\n=== Volume buckets (must sum to N) ===')
     for row in _bucket_stats(trades, VOLUME_BUCKETS):
-        print(f"  {row['name']:8s}  n={row['n']:3d}  win={row['win_pct']:5.1f}%  pnl={row['pnl']:+8.2f}")
+        print(f"  {row['name']:8s}  n={row['n']:3d}  win={_win_cell(row):>13s}  pnl={row['pnl']:+8.2f}")
 
     stack = same_dir_opens_within_min(trades, minutes=3)
     print(f"\n=== Same-dir open within 3min ===")
-    print(f"  pairs={stack['pairs']}  unique_trades={stack['unique_trades']}  "
-          f"wins={stack['wins']}  pnl={stack['pnl']:+.2f}")
+    if stack['unique_trades']:
+        slo, shi = wilson(stack['wins'], stack['unique_trades'])
+        print(f"  pairs={stack['pairs']}  unique_trades={stack['unique_trades']}  "
+              f"wins={stack['wins']} ({100*slo:.0f}-{100*shi:.0f}% CI)  pnl={stack['pnl']:+.2f}")
+    else:
+        print(f"  pairs={stack['pairs']}  unique_trades=0  pnl={stack['pnl']:+.2f}")
 
     print('\nOK: partitions reconcile.')
 

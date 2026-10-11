@@ -49,13 +49,17 @@ def _range_bars():
 
 
 def _run(bars, momentum):
+    # 2026-10-10 外審 follow-up: exit_model 明確傳入。原本靠 mid-process 改
+    # os.environ 切換模型 —— 但 pin-per-trade 修正之後 env 只喺 import 讀一次
+    # （就係要防「開倉途中改 env 追溯改寫結局」），所以測試要明講用邊個模型。
+    # `MOMENTUM_HOLD_EXIT=0 python scripts/test_momentum_regression.py` 一樣有效。
     if momentum:
         os.environ.pop("MOMENTUM_HOLD_EXIT", None)
     else:
         os.environ["MOMENTUM_HOLD_EXIT"] = "0"
     return pt._simulate_staged_exit(
         bars, entry=4400, stop=4420, tp1=4380, tp2=4360,
-        direction="SELL", atr=10, data_source="tv",
+        direction="SELL", atr=10, data_source="tv", exit_model=bool(momentum),
     )
 
 

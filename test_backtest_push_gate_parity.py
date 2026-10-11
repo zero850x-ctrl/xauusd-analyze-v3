@@ -182,6 +182,24 @@ check(f"C1 helper == 記錄（fixture {_fix_days} + live {max(0, _days - _fix_da
 check("C2 fixture 契約唔係真空（>= 2 個 committed JSON）", _fix_days >= 2,
       f"fixture_days={_fix_days} files={len(_fix)}")
 
+# C3: 2026-10-10 review — fixture 檔名唔可以冒充生產日期。
+# 舊名 `2026-07-15.json` 同 `~/.hermes/reports/xauusd_v3_2026-07-15.json` 撞名，
+# 但內容唔同（fixture 1 setup/1 push；真報告 4 setups/0 push）—— 任何對照
+# 「某日份報告」嘅人都有機會攞錯。真數據覆蓋由 `_live` glob 提供，fixture 只
+# 需要釘住舊／混合形狀，所以一律叫 `synthetic_*`。
+_impersonators = []
+for _f in _fix:
+    _base = os.path.basename(_f)
+    if _base.startswith("synthetic_"):
+        continue
+    if os.path.exists(os.path.expanduser(f"~/.hermes/reports/xauusd_v3_{_base}")):
+        _impersonators.append(_base)
+check("C3 fixture 檔名冇冒充生產報告（唔可以同真 report 撞名）",
+      not _impersonators, f"撞名={_impersonators}")
+check("C4 fixture 一律 synthetic_* 命名（真數據請用真 report）",
+      all(os.path.basename(f).startswith("synthetic_") for f in _fix),
+      f"files={[os.path.basename(f) for f in _fix]}")
+
 print("== D. 行為：setups_to_trades 真嘅用呢個閘 ==")
 try:
     import backtest as bt

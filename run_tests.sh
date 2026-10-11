@@ -23,6 +23,7 @@
 #   PYTHON=/opt/homebrew/bin/python3 bash run_tests.sh
 #   RUN_TESTS_NO_SANDBOX=1 bash run_tests.sh   # 唔注入 sandbox env（debug 用）
 #   RUN_TESTS_STATE_DIR=/tmp/x bash run_tests.sh   # 改 live state 目錄（self-test 用）
+#   RUN_TESTS_STRICT_DATA=1 bash run_tests.sh  # 有缺數據嘅 test 直接 FAIL（容唔到下）
 set -u
 
 cd "$(dirname "$0")" || exit 1
@@ -34,6 +35,18 @@ CRON_OUT="${RUN_TESTS_CRON_OUT:-$HOME/.hermes/cron/output/904a8f1758b6}"
 # self-test hooks（正常唔需要設）：俾 child test 見到呢兩個 override
 [ -n "${RUN_TESTS_STATE_DIR:-}" ] && export RUN_TESTS_STATE_DIR
 [ -n "${RUN_TESTS_CRON_OUT:-}" ] && export RUN_TESTS_CRON_OUT
+# 2026-10-10: 逃生門語言改對稱。缺數據嘅 test 預設 **打醒精神 print SKIP 但計 pass**
+# （缺 gitignored CSV 係機器環境問題，唔係 code 迴歸）；`RUN_TESTS_STRICT_DATA=1`
+# 先 FAIL，俾 CI 或 merge 前一刻確定冇「綠色 Vacuum」。
+STRICT_DATA=0
+if [ "${RUN_TESTS_STRICT_DATA:-0}" = "1" ]; then
+  STRICT_DATA=1
+  export XAUUSD_REQUIRE_STUDY_CSV=1
+else
+  # 明確計 pass：呢個環境唔想做假 green
+  export XAUUSD_ALLOW_MISSING_CSV=1
+fi
+SKIPPED=()
 STATE_FILES=(push_history.json paper_trade_log.json paper_martingale.json)
 
 RUN_START="$(date +%s)"
@@ -60,7 +73,19 @@ if [ "$#" -gt 0 ]; then
   FILES=("$@")
 else
   FILES=()
-  for f in test_*.py scripts/test_*.py; do [ -f "$f" ] && FILES+=("$f"); done
+  # 2026-10-10 review: 原本只 glob `test_*.py scripts/test_*.py`，所以放喺
+  # tests/ 或任何新目錄嘅 test 檔會**靜默漏跑** —— suite 照樣印「全部 pass」，
+  # 而新檔乜都冇驗過。改為全 repo 掃。
+  # 2026-10-10 外審 follow-up: 排除清單係 blacklist，所以一個叫 `venv-3.11`
+  # 或者 `.tox` 嘅目錄會被掃到、可以純因環境而整紅 suite。除咗下面列出嘅名，
+  # 亦一併剔走任何含 `site-packages` 嘅路徑。
+  while IFS= read -r f; do
+    FILES+=("$f")
+  done < <(find . \( -name '.git' -o -name '.venv' -o -name 'venv' -o -name 'venv-*' \
+              -o -name 'node_modules' -o -name '__pycache__' -o -name '.tox' \
+              -o -name 'build' -o -name 'dist' -o -name '.eggs' -o -name '*.egg-info' \) \
+              -prune -o \
+              -name 'test_*.py' -type f -print | grep -v 'site-packages' | sort)
 fi
 
 if [ "${#FILES[@]}" -eq 0 ]; then
@@ -84,6 +109,19 @@ for f in "${FILES[@]}"; do
     continue
   fi
   out="$("$PY" "$f" 2>&1)"; rc=$?
+  # 2026-10-10: SKIP banner 收集。只喺 rc==0 時當「data vacuum 但過關」——
+  # 一個檔可以既印 SKIPPED-data 又 exit 非 0（例如其他斷言失敗），舊寫法會
+  # 兩邊都列，令人以為佢只係冇數據。
+  _skipped_here=0
+  if printf '%s\n' "$out" | grep -q 'SKIPPED-data'; then
+    if [ "$rc" -eq 0 ]; then
+      SKIPPED+=("$f")
+      _skipped_here=1
+      printf '  ⏭️  %-46s SKIP（缺數據，未驗證任何嘢）\n' "$f"
+    else
+      printf '  ⚠️  %-46s 有 SKIPPED-data 但同時 exit=%s（當 FAIL）\n' "$f" "$rc"
+    fi
+  fi
   if [ "$rc" -eq 0 ]; then
     printf '  ✅ %-46s\n' "$f"
     pass=$((pass+1))
@@ -115,6 +153,24 @@ pgrep -f "paper_trade.py" >/dev/null 2>&1 && tick_seen=1
 
 echo "────────────────────────────────────────────────────────"
 printf '  total=%s  pass=%s  fail=%s\n' "${#FILES[@]}" "$pass" "$fail"
+STRICT_FAIL=0
+if [ "$STRICT_DATA" -eq 1 ]; then
+  if [ "${#SKIPPED[@]}" -gt 0 ]; then
+    # 正常 strict run 唔會行到呢度（test 會 raise 而唔係 skip）。行到 = 有人
+    # 喺外面設咗 XAUUSD_ALLOW_MISSING_CSV=1，strict 要壓過佢。
+    echo "  🔴 RUN_TESTS_STRICT_DATA=1：以下 test 冇數據可跑（vacuum），當 fail 計："
+    for f in "${SKIPPED[@]}"; do echo "       ${f}"; done
+    STRICT_FAIL=1
+  elif [ "$fail" -gt 0 ]; then
+    echo "  ℹ️  strict-data：缺數據嘅 test 以 FAIL 形式出現（見上面 FAILED 清單）"
+  else
+    echo "  ✅ strict-data：冇 test 處於 data vacuum"
+  fi
+elif [ "${#SKIPPED[@]}" -gt 0 ]; then
+  echo "  ⚠️  data vacuum（以下 test 跑過但冇驗證任何嘢，已計 pass）："
+  for f in "${SKIPPED[@]}"; do echo "       ${f}"; done
+  echo "      補救：重生 CSV，或 RUN_TESTS_STRICT_DATA=1 確認缺口先 merge"
+fi
 [ -n "${SANDBOX_DIR}" ] && rm -rf "${SANDBOX_DIR}"
 
 rc=0
@@ -131,6 +187,10 @@ fi
 if [ "$fail" -gt 0 ]; then
   echo "  ❌ FAILED:"
   for f in "${FAILED[@]}"; do echo "       ${f}"; done
+  rc=1
+elif [ "${STRICT_FAIL:-0}" -eq 1 ]; then
+  # 2026-10-10 外審：strict 失敗唔可以照印「🎉 全部 pass」—— banner 要跟最終 rc。
+  echo "  ❌ strict-data 未過（上面有 vacuum 清單）"
   rc=1
 elif [ "${rc}" -eq 0 ]; then
   echo "  🎉 全部 pass"

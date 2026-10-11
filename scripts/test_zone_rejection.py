@@ -28,8 +28,12 @@ assert _PINNED_HOUR not in a.DANGER_HOURS
 
 
 def _pin(hour):
-    """令 `_broker_hour()` 回一個固定值（唔靠跑測試時嘅真實時鐘）。"""
-    a._broker_hour = lambda: hour
+    """令 `_broker_hour()` 回一個固定值（唔靠跑測試時嘅真實時鐘）。
+
+    2026-10-10: `_broker_hour` 加咗 `when=None`（replay 要用 bar 時間，唔可以
+    用 wall clock）。stub 收返個參數，行為照舊 —— 呢個 test 只在乎小時值。
+    """
+    a._broker_hour = lambda when=None: hour
 
 
 _pin(_PINNED_HOUR)

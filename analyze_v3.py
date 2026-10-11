@@ -2538,6 +2538,41 @@ def _setup_seedable(setup, current_price=None):
     return False
 
 
+def _spike_window(closes, atr):
+    """Shared precondition check for the post-spike window.
+
+    Returns `(window, None)` when the window is usable, otherwise
+    `(None, reason)`. The REASON is the whole point: an unusable window and a
+    quiet market both used to surface as `None`, and the gate treated both as
+    "no spike" — i.e. it failed OPEN on the exact guard the 09-04 incident
+    (six consecutive chasing losses) produced. Callers that must not guess use
+    `_post_spike_indeterminate()` and block instead.
+    """
+    if closes is None:
+        return None, "no M30 close series"
+    if atr is None or atr <= 0:
+        return None, f"ATR unusable ({atr})"
+    need = SPIKE_WINDOW_BARS + 2  # 4 收市 bar + last(forming) + 前 1 參考
+    if len(closes) < need:
+        return None, f"only {len(closes)} M30 bars (< {need})"
+    # Only the tail window matters; any non-finite value inside it would
+    # shift the window if filtered, so bail out instead of compacting.
+    tail = list(closes[-need:])
+    if any(c is None or not np.isfinite(float(c)) for c in tail):
+        return None, "non-finite close inside the window"
+    return [float(c) for c in tail], None
+
+
+def _post_spike_indeterminate(closes, atr):
+    """Why the post-spike window could NOT be evaluated (None when it could).
+
+    Kept separate from `_post_spike_state` so the gate can fail CLOSED without
+    changing that function's long-standing contract (`None` == "no spike"),
+    which the existing unit tests assert.
+    """
+    return _spike_window(closes, atr)[1]
+
+
 def _post_spike_state(closes, atr):
     """Post-sharp-move mean-reversion window (see SPIKE_* constants).
 
@@ -2550,50 +2585,73 @@ def _post_spike_state(closes, atr):
     closes: M30 close 序列 (numpy array 或 list, 最後一個可能係 forming bar)
     atr:    M30 ATR 值 (float)
     """
-    if closes is None or atr is None or atr <= 0:
+    window, reason = _spike_window(closes, atr)
+    if reason is not None or window is None:
         return None
-    need = SPIKE_WINDOW_BARS + 2  # 4 收市 bar + last(forming) + 前 1 參考
-    if len(closes) < need:
-        return None
-    # Only the tail window matters; any non-finite value inside it would
-    # shift the window if filtered, so bail out instead of compacting.
-    tail = list(closes[-need:])
-    if any(c is None or not np.isfinite(float(c)) for c in tail):
-        return None
-    closes = [float(c) for c in tail]
     # closes[-1] = forming bar (未收市, tvDatafeed 最後一行), closes[-2] = 最後已收市
-    ref = closes[-2]
-    base = closes[-2 - SPIKE_WINDOW_BARS]
+    ref = window[-2]
+    base = window[-2 - SPIKE_WINDOW_BARS]
     move = ref - base
     if abs(move) <= SPIKE_ATR_MULT * atr:
         return None
     return {"direction": "down" if move < 0 else "up", "move": round(move, 2)}
 
 
+_UNSET = object()   # 「caller 冇接線呢個參數」哨兵，唔可以同「明確傳 None」混淆
+
+
 def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
-                          time_quality_override=None, points=None, atr=None,
-                          closes=None):
+                          time_quality_override=None, points=None, atr=_UNSET,
+                          closes=_UNSET, bar_time=None):
     """Attach counter-trend severity, recommended volume, time quality, and cron gate.
 
     time_quality_override: when set (e.g. walk-forward backtest), use this level
     instead of wall-clock _time_quality_score() so historical bars aren't gated
     by the hour the script happens to run.
+    bar_time: the BAR being evaluated, for a replay. Without it every replayed
+    bar is scored with the run hour (session_bonus + golden-hour volume became
+    constants); a live run leaves it None and keeps the wall clock.
+
+    2026-10-10 外審 follow-up: `atr` / `closes` 用 `_UNSET` 哨兵，令兩種情況
+    分得開 ——
+      • 冇接線（default `_UNSET`）→ 唔 block，只記 `post_spike_indeterminate`。
+        漏一個參數唔應該變成靜默推送乾旱。
+      • 明確傳入但唔可用（None／NaN／ATR<=0／bar 不足）→ BLOCK。
+        呢個係資料問題，同「冇接線」係兩件事。
+    之前 `atr=None` 同 `closes=None` 一律當「冇接線」（唔 block），而
+    `atr=None` 又其實會被 `_spike_window` 當唔可用 —— 兩個方向都唔一致。
     """
     if time_quality_override is not None:
         tq_level = time_quality_override
     else:
         tq_level, _ = _time_quality_score()
-    broker_hour = _broker_hour()
+    broker_hour = _broker_hour(bar_time)
     session_bonus = (
         tq_level != 'danger'
         and broker_hour in SESSION_BONUS_HOURS
     )
-    spike = _post_spike_state(closes, atr) if closes is not None else None
+    unwired = []
+    if atr is _UNSET:
+        unwired.append("atr")
+    if closes is _UNSET:
+        unwired.append("closes")
+    if unwired:
+        spike = None
+        spike_unknown = None
+        spike_unwired = "caller 冇接線: " + ", ".join(unwired)
+    else:
+        spike = _post_spike_state(closes, atr)
+        # 2026-10-10 review: an UNUSABLE window is not a quiet market. The gate
+        # used to read both as "no spike" and push anyway — fail-OPEN on the
+        # guard that exists because of the 09-04 chasing losses. Unknown blocks.
+        spike_unknown = (_post_spike_indeterminate(closes, atr)
+                         if spike is None else None)
+        spike_unwired = None
     for s in setups:
         side = 'BEARISH' if 'SELL' in s.get('direction', '') else 'BULLISH'
         is_sell = side == 'BEARISH'
         severity = counter_trend_severity(side, daily_trend, h1_trend)
-        vol, _ = _volume_risk_tier(severity)
+        vol, _ = _volume_risk_tier(severity, tq_level=tq_level)
         s['counter_trend_severity'] = severity
         s['recommended_volume'] = vol
         s['time_quality'] = tq_level
@@ -2652,9 +2710,22 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
                 f"{abs(spike['move']):.0f} 點 — 追{'沽' if is_sell else '買'}風險窗口內, 唔推送"
                 if same_dir else ""
             )
+            s['post_spike_indeterminate'] = None
+        elif spike_unknown is not None:
+            # 2026-10-10 review: 舊碼喺呢個情況當「冇 spike」照推 = fail-OPEN。
+            # 呢個閘係 09-04 追勢六連敗 (−$2,200+) 之後加嘅；睇唔到就當有風險。
+            s['post_spike_blocked'] = True
+            s['post_spike_note'] = (
+                f"⚠️ 急升/急跌窗口無法判斷（{spike_unknown}）— 保守起見唔推送"
+            )
+            s['post_spike_indeterminate'] = spike_unknown
         else:
             s['post_spike_blocked'] = False
             s['post_spike_note'] = ""
+            # Audible either way: a wiring gap ("no series provided") is recorded
+            # next to a real "window unusable" reason, so a silent no-gate state
+            # is greppable in the JSON instead of invisible.
+            s['post_spike_indeterminate'] = spike_unwired
 
         if s.get('entry_price') is None:
             ep = _parse_entry_price_from_setup(s, current_price)
@@ -2725,6 +2796,16 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
         if s.get('zone_touches', 0) >= 2 and rp > 1:
             rp -= 1
         s['rank_priority'] = rp
+
+    # 2026-10-10 外審 follow-up: fail-closed 唔可以有靜默乾旱。真 spike 擋單係
+    # 預期行為（有 log 亦入 gate_summary），但「數據用唔到而擋晒所有單」係事故
+    # —— 只寫落 JSON 而冇人讀，就係上次靜默乾旱嘅翻版。所以喺 operator 真係睇
+    # 得到嘅 stdout 出 warning（cron output 亦會capture）。
+    _indet_blocked = [s for s in setups
+                      if s.get('post_spike_blocked') and s.get('post_spike_indeterminate')]
+    if _indet_blocked and spike is None:
+        _log(f"⚠️  post-spike gate 擋咗 {len(_indet_blocked)} 個 setup，但唔係因為偵測到"
+             f"真 spike — 而係 M30 窗／ATR 用唔到。原因：{_indet_blocked[0]['post_spike_indeterminate']}")
 
     setups.sort(key=lambda s: (s.get('rank_priority', s.get('priority', 99)), -s.get('rr_tp1', 0)))
     return spike
@@ -2955,9 +3036,55 @@ RAPID_FIRE_WINDOW_MIN = 5    # 2+ opens within 5min — see scripts/compute_ment
 RAPID_FIRE_MAX_TRADES = 2    # Max trades allowed within RAPID_FIRE_WINDOW_MIN
 
 
-def _broker_hour():
-    """Current hour in broker-local time (UTC + BROKER_UTC_OFFSET_HOURS)."""
-    utc = datetime.now(timezone.utc)
+_BAD_BAR_TIME_SEEN = set()   # dedupe：同一個壞 timestamp 唔洗版
+
+
+def _note_bad_bar_time(when, exc):
+    """Warn once per distinct unparseable bar stamp (see `_broker_hour`)."""
+    key = repr(when)
+    if key in _BAD_BAR_TIME_SEEN:
+        return
+    _BAD_BAR_TIME_SEEN.add(key)
+    print(f"⚠️ _broker_hour: 解析唔到 bar 時間 {key} ({type(exc).__name__}: {exc}) "
+          f"— 呢個 bar 退回 wall clock，session_bonus／volume tier 可能失真",
+          file=sys.stderr)
+
+
+def _broker_hour(when=None):
+    """Hour in broker-local time (UTC + BROKER_UTC_OFFSET_HOURS).
+
+    `when` (2026-10-10 review): a walk-forward replay must score the BAR it is
+    replaying, not the moment the script happens to run. Reading the wall clock
+    made `session_bonus` a constant across the whole replay (whatever hour the
+    operator started it), so the session term carried no information at all.
+    Naive stamps are read as UTC — the engine's convention for broker
+    timestamps — and aware ones are converted, so a caller cannot silently get
+    a third interpretation.
+
+    2026-10-10 外審 follow-up: an unparseable `when` used to fall back to the
+    wall clock with NO trace — i.e. exactly the bug this function exists to
+    remove, reinstated silently for that bar (`pd.NaT.hour` raises). The
+    fallback is kept (a replay shouldn't die on one bad row) but it now prints
+    a deduped warning, so "which bars fell back" is answerable from the log
+    instead of invisible.
+    """
+    if when is None:
+        utc = datetime.now(timezone.utc)
+    else:
+        try:
+            ts = pd.Timestamp(when)
+            # `pd.NaT` is the trap: Timestamp(NaT) does NOT raise, tz_localize
+            # and tz_convert pass it through, and `NaT.hour` returns **nan** —
+            # so a missing bar stamp used to yield a NaN broker hour with no
+            # exception at all (session_bonus silently False). Catch it here.
+            if pd.isna(ts):
+                raise ValueError("NaT / NaN bar timestamp")
+            if ts.tzinfo is None:
+                ts = ts.tz_localize('UTC')
+            utc = ts.tz_convert('UTC').to_pydatetime()
+        except Exception as e:
+            _note_bad_bar_time(when, e)
+            utc = datetime.now(timezone.utc)
     return (utc.hour + BROKER_UTC_OFFSET_HOURS) % 24
 
 
@@ -3008,8 +3135,13 @@ def _scalp_risk_warning():
     )
 
 
-def _volume_risk_tier(severity='ALIGNED', vol=0.02):
+def _volume_risk_tier(severity='ALIGNED', vol=0.02, tq_level=None):
     """Recommend position size with volume-aware risk tiers.
+
+    tq_level (2026-10-10 review): pass the SAME session level the caller already
+    resolved. Left None it re-reads the wall clock, so a replay scored the
+    golden-hour 0.03 tier from whatever hour the script ran at — the exact
+    divergence `time_quality_override` exists to remove.
 
     Updated 2026-07-31 (138-trade combined; see scripts/compute_mentor_stats.py):
     - 0.01: 50.0% win, +$59 (22 trades)
@@ -3034,7 +3166,7 @@ def _volume_risk_tier(severity='ALIGNED', vol=0.02):
     elif severity == 'MILD':
         return 0.01, '⚠️ 逆勢半倉 0.01 (歷史: 逆勢虧損率 65%)'
     else:
-        tq, _ = _time_quality_score()
+        tq = tq_level if tq_level is not None else _time_quality_score()[0]
         if tq == 'golden':
             return 0.03, '🌅 順勢 + 黃金時段, 0.03 倉 (138-sample 17:00 n=14, 64.3% 勝; 0.16+ 避免)'
         return 0.02, '順勢 0.02 倉'
@@ -4601,7 +4733,7 @@ def generate_report(df_m30, df_h1, df_day, patterns, points, setups, daily_trend
 
     report = f"""# 🔥 XAUUSD 圖表形態深度分析 v3
 
-**日期:** {today} (UTC)  
+**日期:** {today} (HKT)  
 **框架:** M30 (主要) / H1 / 日線  
 **當前價格:** **${current:.2f}**  
 **數據源:** {_data_source_label()}  
@@ -4888,6 +5020,9 @@ def main():
                 'window_bars': SPIKE_WINDOW_BARS,
                 'atr_mult': SPIKE_ATR_MULT,
                 'blocked_setups': sum(1 for s in setups if s.get('post_spike_blocked')),
+                'indeterminate': next(
+                    (s.get('post_spike_indeterminate') for s in setups
+                     if s.get('post_spike_indeterminate')), None),
             },
             'spot_futures_basis': SPOT_FUTURES_BASIS,
             'basis_cron_blocked': BASIS_CRON_BLOCKED,
