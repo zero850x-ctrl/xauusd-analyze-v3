@@ -154,7 +154,8 @@ def test_backtest_no_gap_fill_unchanged():
     assert closed is True
     assert abs(t.exit_price - (4320.0 + bt.SLIPPAGE_TICKS)) < 1e-9, \
         "got %r, want legacy stop fill" % t.exit_price
-    # bar_open=None legacy path (e.g. end-of-data close) also unchanged
+    # bar_open=None legacy path also unchanged (no production caller passes it
+    # any more — the end-of-data mark no longer runs through this function)
     t2 = _mk_trade("BUY", 4300.0, 4280.0, 4320.0, 4340.0)
     closed2 = bt.simulate_trade_on_bar(t2, 4290.0, 4270.0, 4285.0, 12.0,
                                        bar_open=None, exit_date="2026-09-01")

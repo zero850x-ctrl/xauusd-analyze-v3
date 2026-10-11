@@ -604,6 +604,61 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
     return False
 
 
+def _mark_open_trades_at_data_end(open_trades, last_close, exit_date):
+    """Mark every still-open trade at the last close (`'End of data'`).
+
+    This is an ACCOUNTING mark, not an exit-engine pass: it does not evaluate
+    stops / TPs / the BE tail / timeout, does not increment `bars_held`, and
+    does not touch MFE/MAE. Pending limit orders are not positions and are
+    never passed in here.
+
+    2026-10-11 (issue #56 Phase 1): this used to call
+    `simulate_trade_on_bar` first, fed a phantom doji (high = low = close =
+    the last close) on top of the last REAL bar the main loop had already
+    processed. Consequences: `bars_held` counted the last bar twice
+    (a trade could be labelled 'Timeout (N bars)' one bar early); and under
+    momentum-hold a TP1 hit on the last real bar arms a BE tail that only acts
+    NEXT bar, but the phantom bar supplied that "next bar" and booked a breakeven
+    / trailing exit the market never traded at. The BE-tail case is a real
+    terminal PnL change (breakeven scratch → mark at the close), which is the
+    point of the fix.
+
+    NOT every open trade has seen the last bar's range: market entries and limit
+    fills on the last bar join `open_trades` after the per-bar update, and a bar
+    whose ATR is NaN / <= 0 `continue`s before trade management. Those trades
+    are marked at the close with `bars_held == 0` / no stop check, which is
+    deliberate — evaluating a pre-entry wick would be wrong.
+
+    Portions already realised (`tp1_hit` / `tp2_hit`) keep their PnL. Returns the
+    trades it marked or that were already closed (callers append them to the
+    closed list).
+    """
+    out = []
+    for trade in open_trades:
+        if not trade.closed:
+            portion = trade.position_size / 3
+            if trade.side == 'BUY':
+                fill = last_close - SLIPPAGE_TICKS
+                if not trade.tp1_hit:
+                    trade.pnl_tp1 = (fill - trade.entry_price) * portion * CONTRACT_MULTIPLIER
+                if not trade.tp2_hit:
+                    trade.pnl_tp2 = (fill - trade.entry_price) * portion * CONTRACT_MULTIPLIER
+                trade.pnl_tp3 = (fill - trade.entry_price) * portion * CONTRACT_MULTIPLIER
+            else:
+                fill = last_close + SLIPPAGE_TICKS
+                if not trade.tp1_hit:
+                    trade.pnl_tp1 = (trade.entry_price - fill) * portion * CONTRACT_MULTIPLIER
+                if not trade.tp2_hit:
+                    trade.pnl_tp2 = (trade.entry_price - fill) * portion * CONTRACT_MULTIPLIER
+                trade.pnl_tp3 = (trade.entry_price - fill) * portion * CONTRACT_MULTIPLIER
+            trade.exit_price = fill
+            trade.exit_date = exit_date
+            trade.exit_reason = 'End of data'
+            trade.closed = True
+        out.append(trade)
+    return out
+
+
 # ═══════════════════════════════════════════════════════════
 # SIGNAL EXTRACTION — convert setups dict → trade params
 # ═══════════════════════════════════════════════════════════
@@ -1087,33 +1142,10 @@ def run_backtest(df_bars, df_day, verbose=False):
                           f"tp1={best.tp1_price:.0f} tp2={best.tp2_price:.0f} "
                           f"pos={best.position_size} aligned={best.daily_aligned}")
 
-    # Close any remaining open trades at last bar
+    # Data ended with trades still open: mark them at the last close.
     last_close = float(df_bars['Close'].iloc[-1])
-    last_atr = float(df_bars['ATR'].iloc[-1]) if not pd.isna(df_bars['ATR'].iloc[-1]) else 5.0
-    for trade in open_trades:
-        simulate_trade_on_bar(trade, last_close, last_close, last_close, last_atr, exit_date=df_bars.index[-1])
-        if not trade.closed:
-            # Force close — P0 FIX: close ALL remaining portions, not just tp3
-            portion = trade.position_size / 3
-            if trade.side == 'BUY':
-                fill = last_close - SLIPPAGE_TICKS
-                if not trade.tp1_hit:
-                    trade.pnl_tp1 = (fill - trade.entry_price) * portion * CONTRACT_MULTIPLIER
-                if not trade.tp2_hit:
-                    trade.pnl_tp2 = (fill - trade.entry_price) * portion * CONTRACT_MULTIPLIER
-                trade.pnl_tp3 = (fill - trade.entry_price) * (trade.position_size / 3) * CONTRACT_MULTIPLIER
-            else:
-                fill = last_close + SLIPPAGE_TICKS
-                if not trade.tp1_hit:
-                    trade.pnl_tp1 = (trade.entry_price - fill) * portion * CONTRACT_MULTIPLIER
-                if not trade.tp2_hit:
-                    trade.pnl_tp2 = (trade.entry_price - fill) * portion * CONTRACT_MULTIPLIER
-                trade.pnl_tp3 = (trade.entry_price - fill) * (trade.position_size / 3) * CONTRACT_MULTIPLIER
-            trade.exit_price = fill
-            trade.exit_date = df_bars.index[-1]
-            trade.exit_reason = 'End of data'
-            trade.closed = True
-        closed_trades.append(trade)
+    closed_trades.extend(
+        _mark_open_trades_at_data_end(open_trades, last_close, df_bars.index[-1]))
 
     return closed_trades
 
