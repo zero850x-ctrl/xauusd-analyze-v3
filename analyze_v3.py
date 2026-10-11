@@ -2797,6 +2797,16 @@ def _inject_push_metadata(setups, daily_trend, h1_trend, current_price=None,
             rp -= 1
         s['rank_priority'] = rp
 
+    # 2026-10-10 外審 follow-up: fail-closed 唔可以有靜默乾旱。真 spike 擋單係
+    # 預期行為（有 log 亦入 gate_summary），但「數據用唔到而擋晒所有單」係事故
+    # —— 只寫落 JSON 而冇人讀，就係上次靜默乾旱嘅翻版。所以喺 operator 真係睇
+    # 得到嘅 stdout 出 warning（cron output 亦會capture）。
+    _indet_blocked = [s for s in setups
+                      if s.get('post_spike_blocked') and s.get('post_spike_indeterminate')]
+    if _indet_blocked and spike is None:
+        _log(f"⚠️  post-spike gate 擋咗 {len(_indet_blocked)} 個 setup，但唔係因為偵測到"
+             f"真 spike — 而係 M30 窗／ATR 用唔到。原因：{_indet_blocked[0]['post_spike_indeterminate']}")
+
     setups.sort(key=lambda s: (s.get('rank_priority', s.get('priority', 99)), -s.get('rr_tp1', 0)))
     return spike
 

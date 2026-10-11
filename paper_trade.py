@@ -283,8 +283,12 @@ def _finite_px(val):
     2026-10-10 review: `bool` is rejected explicitly. `float(True) == 1.0`, so a
     JSON `true` where a price belongs silently became a $1.00 price — a value
     that passes every finite check and produces a nonsense R.
+    2026-10-10 外審 follow-up: `np.bool_` too. `isinstance(np.bool_(True), bool)`
+    is **False** (numpy's bool_ is not a subclass of Python bool), so a boolean
+    that travelled through a pandas/numpy object walked straight past the guard
+    above and still became $1.00.
     """
-    if isinstance(val, bool):
+    if isinstance(val, (bool, np.bool_)) or val is np.True_ or val is np.False_:
         return None
     try:
         x = float(val)
@@ -533,6 +537,12 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
     # backtest path (which passes the pinned value) and this legacy-sim path
     # could disagree WITHIN one process if anything mutated os.environ after
     # import — "single source of truth" wasn't actually single.
+    # 2026-10-10 外審 follow-up（已知缺口，記錄唔隱藏）：呢個 pin 只覆蓋 PR 之後
+    # seed 嘅單。**升級前已經開住**嘅 legacy open position 冇 `exit_model` 欄，
+    # 所以佢會一路用「本 process 啟動時」嘅模型直到平倉為止 —— 即係話如果
+    # 上一次 run 開倉、今次 run 之前改咗 `MOMENTUM_HOLD_EXIT`，嗰張 legacy 單仍然
+    # 會喺新模型下結算。要完全封死就要喺第一次讀到時 backfill（會改動 ledger，
+    # 需要用戶拍板），現階段只保證：同一 process 內、同一張單嘅結局唔會中途改變。
     momentum_hold = (bool(exit_model) if exit_model is not None
                      else MOMENTUM_HOLD_EXIT)
     traded_max_high = None
