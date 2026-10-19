@@ -283,6 +283,17 @@ def test_ledger_as_of_reads_close_time_alias():
     check('close_time 別名一樣擋得住', out['history'] == [], str(out['history']))
 
 
+def test_ledger_as_of_excludes_seeded_only_history():
+    print('\n⑦ 只有 seeded_time、冇平倉時間 → 唔納入 history（避免開倉時間前視）')
+    from datetime import datetime, timezone
+    as_of = datetime(2026, 6, 10, tzinfo=timezone.utc)
+    log = {'trades': [], 'history': [
+        {'seeded_time': '2026-06-01T00:00:00Z'},
+    ]}
+    out = PT._ledger_as_of(log, as_of)
+    check('seeded-only 唔入 history', out['history'] == [], str(out['history']))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ⑧ 0.786：止損已穿仲報 seedable
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,7 +334,7 @@ def test_push_recorded_only_after_successful_send():
     real_a, real_s = R.build_format_a, R.build_status
     with tempfile.TemporaryDirectory() as d:
         R.HISTORY_LOG = os.path.join(d, 'push_history.json')
-        R.record_push = lambda data, cands: saved.append(len(cands))
+        R.record_push = lambda data, cands: (saved.append(len(cands)) or True)
         R.build_format_a = lambda data, c: 'FA'
         R.build_status = lambda *a, **k: 'ST'
         jp = os.path.join(d, 'rep.json')
@@ -355,12 +366,47 @@ def test_push_recorded_only_after_successful_send():
             except SystemExit:
                 pass
             check('成功 → 記錄一次', saved == [1], f'recorded={saved}')
+
+            # rc=0 但硬閘 skip → 唔記錄
+            saved.clear()
+            _sp.run = lambda *a, **k: types.SimpleNamespace(
+                returncode=0, stdout='WA_PUSH_SKIPPED gate', stderr='')
+            sys.argv = ['x', '--json', jp, '--skip-paper']
+            try:
+                R.main()
+            except SystemExit:
+                pass
+            check('WA_PUSH_SKIPPED → 唔記錄', saved == [], f'recorded={saved}')
+
+            saved.clear()
+            _sp.run = lambda *a, **k: types.SimpleNamespace(
+                returncode=0, stdout='WA_PUSH_SENT\n', stderr='')
+            sys.argv = ['x', '--json', jp, '--skip-paper']
+            try:
+                R.main()
+            except SystemExit:
+                pass
+            check('WA_PUSH_SENT → 記錄一次', saved == [1], f'recorded={saved}')
         finally:
             sys.argv = argv
             _sp.run = real_run
             R.record_push = real_record
             R.build_format_a, R.build_status = real_a, real_s
             R.HISTORY_LOG = orig
+
+
+def test_wa_push_delivered_contract():
+    print('\n⑤ _wa_push_delivered 合約')
+    import types
+    check('SKIPPED 唔算送出',
+          R._wa_push_delivered(types.SimpleNamespace(
+              returncode=0, stdout='WA_PUSH_SKIPPED', stderr='')) is False)
+    check('SENT 算送出',
+          R._wa_push_delivered(types.SimpleNamespace(
+              returncode=0, stdout='WA_PUSH_SENT', stderr='')) is True)
+    check('rc!=0 唔算送出',
+          R._wa_push_delivered(types.SimpleNamespace(
+              returncode=1, stdout='', stderr='')) is False)
 
 
 if __name__ == '__main__':
@@ -377,8 +423,10 @@ if __name__ == '__main__':
         test_sharpe_label_honest,
         test_ledger_as_of_filters_by_close_time,
         test_ledger_as_of_reads_close_time_alias,
+        test_ledger_as_of_excludes_seeded_only_history,
         test_fib0786_stop_breached_not_seedable,
         test_push_recorded_only_after_successful_send,
+        test_wa_push_delivered_contract,
     ]:
         try:
             fn()

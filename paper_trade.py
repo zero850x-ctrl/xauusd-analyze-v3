@@ -2331,7 +2331,10 @@ def _ledger_as_of(log, as_of):
     原本按開倉時間過濾，會把「開倉早過 as_of、但平倉遲過 as_of」嘅單連最終結果一齊
     帶入 —— replay 會見到一單其實當時仲未平嘅倉已經有結局，即係前視。而 replay 嘅
     冷靜期／同日去重正係讀 history，所以直接影響回測嘅入場決定。
-    平倉時間讀唔到就**唔納入**（唔可以聲稱佢當時已平）。
+    平倉時間讀唔到就**唔納入**（唔可以聲稱佢當時已平）。唔用 `seeded_time`
+    代替平倉時間 —— 否則「開倉早過 as_of、平倉遲過 as_of」仍會漏入（前視）。
+    注意：`_last_close_dt`（冷靜期）仍會 `closed_time or seeded_time` 作 best-effort；
+    `_existing_signal`（同日去重）只看 LIVE / `seeded_date`，唔讀平倉時間 —— 語義唔同。
     """
     def _seed_before(rec):
         if as_of is None:
@@ -2342,14 +2345,8 @@ def _ledger_as_of(log, as_of):
     def _closed_before(rec):
         if as_of is None:
             return True
-        # 主帳本平倉記錄用 `closed_time`（2026-10-19 實測：真帳本 9 筆 history
-        # 全部有）；馬丁狀態嗰邊用 `close_time`。兩個名都讀，再 fallback 去
-        # `seeded_time` —— 同真正嘅 consumer `_existing_signal` 完全一致
-        # （`:257` 寫 `_parse_dt(h.get('closed_time') or h.get('seeded_time'))`）。
-        # 冇 fallback 就會同 E5c 嘅 parity 契約相反：一條冇平倉時間嘅紀錄會被
-        # 當成「當時未平」而放行，令同一日已平嘅同一單重覆 backtest。
-        closed = _parse_dt(rec.get("closed_time") or rec.get("close_time")
-                           or rec.get("seeded_time"))
+        # 主帳本用 `closed_time`；馬丁狀態用 `close_time`（2026-10-19 實測真帳本全有）。
+        closed = _parse_dt(rec.get("closed_time") or rec.get("close_time"))
         if closed is None:
             return False
         return closed < as_of

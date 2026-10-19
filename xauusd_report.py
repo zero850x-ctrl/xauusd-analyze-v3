@@ -8,6 +8,11 @@
 - STATUS 組裝：價格 / M5 / M15 / paper / 馬丁
 - 格式 A 時寫 /tmp/wa_push.txt（推送由 wa_conditional_push.sh 硬閘執行）
 
+`wa_conditional_push.sh` 合約（去重記錄用）：
+- 真正送出：stdout 含 `WA_PUSH_SENT`（建議 exit 0）
+- 硬閘拒絕／冇發：stdout 含 `WA_PUSH_SKIPPED`（exit 0 亦唔記錄）
+- 未帶標記嘅舊腳本：exit 0 仍當已送出（`WA_PUSH_TRUST_RC=0` 關閉）
+
 用法:
   python3 xauusd_report.py [--json PATH] [--no-dedup] [--skip-paper]
 
@@ -17,6 +22,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 
 REPORT_DIR = os.path.expanduser("~/.hermes/reports")
@@ -218,8 +224,8 @@ def dedup_check(data, candidates, enabled=True):
     if not enabled:
         return candidates, []
     today = datetime.now(HKT).strftime("%Y-%m-%d")
-    hist = load_json(HISTORY_LOG, required=False)
-    pushed = hist.get(today, []) if isinstance(hist, dict) else []
+    hist = _load_push_history()
+    pushed = hist.get(today, [])
     if not pushed:
         return candidates, []
     keep, dup = [], []
@@ -268,7 +274,34 @@ def _load_push_history():
         print(f"⚠️ push_history 讀取失敗 → 隔離為 {moved or '(隔離失敗，原檔保留)'}: "
               f"{type(e).__name__}: {e}")
         return {}
-    return hist if isinstance(hist, dict) else {}
+    if not isinstance(hist, dict):
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        quarantine = f"{HISTORY_LOG}.corrupt-{stamp}"
+        moved = None
+        try:
+            os.replace(HISTORY_LOG, quarantine)
+            moved = quarantine
+        except Exception:
+            pass
+        print(f"⚠️ push_history 唔係 dict → 隔離為 {moved or '(隔離失敗，原檔保留)'}")
+        return {}
+    return hist
+
+
+def _wa_push_delivered(run_result):
+    """True iff Hermes script reports an actual WhatsApp send (see module docstring)."""
+    blob = (run_result.stdout or '') + (run_result.stderr or '')
+    if 'WA_PUSH_SKIPPED' in blob:
+        return False
+    if 'WA_PUSH_SENT' in blob:
+        return True
+    if run_result.returncode != 0:
+        return False
+    if os.environ.get('WA_PUSH_TRUST_RC', '1') != '0':
+        return True
+    print('⚠️ 推送 rc=0 但缺少 WA_PUSH_SENT → 唔記錄'
+          '（請更新 wa_conditional_push.sh，或設 WA_PUSH_TRUST_RC=1）')
+    return False
 
 
 def record_push(data, candidates):
@@ -286,11 +319,25 @@ def record_push(data, candidates):
             "time": datetime.now(HKT).strftime("%H:%M"),
         })
     hist[today] = today_list
+    parent = os.path.dirname(HISTORY_LOG) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".push_history.", suffix=".tmp", dir=parent)
     try:
-        with open(HISTORY_LOG, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(hist, f, ensure_ascii=False, indent=1)
-    except OSError:
-        pass
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, HISTORY_LOG)
+        return True
+    except OSError as e:
+        print(f"⚠️ push_history 寫入失敗: {e}")
+        return False
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def build_format_a(data, candidates):
@@ -461,23 +508,30 @@ def main():
         # 原本 record_push() 喺送出之前寫，而送出失敗係 `except: pass` ——
         # 即係發送失敗嘅 setup 已經被當成「推過」，永遠唔會再推，而且冇任何訊號。
         # 語義應該係：記錄 ⟺ 真正送出咗。失敗就唔記錄，下個 tick 重試。
-        sent = False
+        delivered = False
         if not args.no_send:
             import subprocess
             try:
                 r = subprocess.run(
                     ["bash", os.path.expanduser("~/.hermes/scripts/wa_conditional_push.sh"), body],
                     capture_output=True, text=True, timeout=60)
-                sent = (r.returncode == 0)
-                if not sent:
-                    print(f"⚠️ 推送失敗 (rc={r.returncode}) → 唔記錄，下個 tick 重試: "
-                          f"{(r.stderr or r.stdout or '').strip()[:200]}")
+                delivered = _wa_push_delivered(r)
+                if not delivered:
+                    snippet = (r.stderr or r.stdout or '').strip()[:200]
+                    if r.returncode != 0:
+                        print(f"⚠️ 推送失敗 (rc={r.returncode}) → 唔記錄，下個 tick 重試: {snippet}")
+                    else:
+                        print(f"⚠️ 推送未送出（硬閘／無 WA_PUSH_SENT）→ 唔記錄: {snippet}")
+            except subprocess.TimeoutExpired:
+                print("⚠️ 推送逾時 (60s) → 唔記錄；若訊息可能已送出，下個 tick 可能重複推送")
             except Exception as e:
                 print(f"⚠️ 推送例外 → 唔記錄，下個 tick 重試: {type(e).__name__}: {e}")
         else:
-            sent = True  # dry-run：維持舊行為（照記錄），唔改 --no-send 語義
-        if sent:
-            record_push(data, candidates)
+            delivered = True  # dry-run：維持舊行為（照記錄），唔改 --no-send 語義
+        if delivered:
+            wrote = record_push(data, candidates)
+            if wrote is False:
+                print("⚠️ 去重歷史寫入失敗 → 下個 tick 可能重複推送")
     else:
         out.append("⏳ 無符合推送條件的高質量信號")
         if candidates == [] and not gc_note and not dups:
