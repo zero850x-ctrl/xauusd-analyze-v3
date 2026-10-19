@@ -5110,14 +5110,20 @@ def main():
                 'level': tq_level,
                 'advice': tq_advice,
                 'broker_utc_offset_hours': BROKER_UTC_OFFSET_HOURS,
-                # 2026-10-19: 明示呢個 offset 係「未改嘅預設」定「人手指定」。
-                # 預設 -3 同 mentor 交易回歸擬合出嘅 UTC+1 唔一致（差 4 小時），
-                # 讀報告嘅人要即刻睇得到自己身處邊個框架，唔使去翻代碼。
+                # 2026-10-19 review 修正：原本寫 `broker_offset_fitted: 1`，
+                # 讀起上嚟似「呢個 offset 係擬合值」—— 但實際 in use 嘅係預設 -3，
+                # metadata 反而誤導。改為分開講清楚：用緊幾多、擬合值幾多、兩者夾唔夾。
+                'broker_offset_hours_in_use': BROKER_UTC_OFFSET_HOURS,
                 'broker_offset_source': (
                     'env:BROKER_UTC_OFFSET_HOURS'
                     if os.environ.get('BROKER_UTC_OFFSET_HOURS') else 'default'
                 ),
-                'broker_offset_fitted': 1,   # scripts/fit_broker_offset.py 2026-10-19
+                # scripts/fit_broker_offset.py 2026-10-19：mentor 交易回歸擬合值
+                # （276 個約束，命中率 97.8%/98.9%；次名只有 49.6%）
+                'broker_offset_fitted_value': 1,
+                'broker_offset_matches_fitted': (
+                    BROKER_UTC_OFFSET_HOURS == 1
+                ),
             },
             'patterns': patterns,
             'candlestick_m30': candle_m30,

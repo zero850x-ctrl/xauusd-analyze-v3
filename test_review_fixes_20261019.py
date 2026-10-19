@@ -84,6 +84,21 @@ def test_diverging_not_wedge():
     out = A.detect_wedges(pts, df=_df(2020))
     check('發散 → 冇楔形', out == [], f'got={[w["type"] for w in out]}')
 
+    # 2026-10-19 review：上面嗰個 test 喺舊代碼都會 pass（兩個 slope 一正一負，
+    # 兩版都入唔到 wedge 分支）→ 唔具鑑別力。真正要守嘅係「新條件會唔會製造
+    # 假陽性」：橫行收窄（slope 一正一負、但收窄）唔應該被當成下降楔形。
+    pts2 = _wedge_points([1900, 1901, 1900, 1899, 1898, 1897],
+                         [1800, 1820, 1840, 1855, 1865, 1872])
+    out2 = A.detect_wedges(pts2, df=_df(1897))
+    check('橫行收窄（slope 反號）→ 冇楔形', out2 == [],
+          f'got={[w["type"] for w in out2]}')
+
+    # 向下收窄但**發散**（阻力跌得慢過支撐跌）→ 唔係楔形，係擴散
+    pts3 = _wedge_points([2000, 1995, 1992, 1990, 1989, 1988],
+                         [1900, 1880, 1860, 1835, 1805, 1770])
+    out3 = A.detect_wedges(pts3, df=_df(1988))
+    check('向下擴散 → 冇楔形', out3 == [], f'got={[w["type"] for w in out3]}')
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ② json.dump(default=str) 令 numpy bool 變成 truthy 字串 "False"
@@ -235,8 +250,11 @@ def test_sharpe_label_honest():
               for i, p in enumerate([10, -5, 12, -4, 8, 9, -3, 11], start=1)]
     try:
         st = BT.compute_stats(trades, starting_capital=10000)
-    except Exception as e:                      # 簽名唔同就跳過（唔想假綠）
-        print(f'  ⚠️ 跳過：compute_stats 呼叫失敗 {type(e).__name__}: {e}')
+    except Exception as e:
+        # 2026-10-19 review：原本喺呢度 print「跳過」再 return = 計 pass，
+        # 即係簽名一改呢個 test 就永遠綠而唔測任何嘢。改為硬 FAIL。
+        check('compute_stats 可以呼叫', False,
+              f'{type(e).__name__}: {e} — 簽名改咗，test 要更新')
         return
     check('有 sharpe_ratio_note 講明唔係 annualized',
           'NOT annualized' in str(st.get('sharpe_ratio_note', '')))
@@ -245,6 +263,12 @@ def test_sharpe_label_honest():
           st.get('sharpe_annualized') is None
           or abs(st['sharpe_annualized'] - st['sharpe_ratio']) > 1e-9,
           f"scaled={st.get('sharpe_ratio')} ann={st.get('sharpe_annualized')}")
+    # 2026-10-19 review：上面嗰個斷言准許 None → 年化完全失效都會綠。
+    # 呢個 sample 有 8 筆、跨 7 個月、pnl 有變異 → 一定要算出有限數。
+    ann = st.get('sharpe_annualized')
+    check('有效樣本嘅 sharpe_annualized 係有限數',
+          isinstance(ann, (int, float)) and ann == ann and abs(ann) != float('inf'),
+          f'ann={ann!r}')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -310,7 +334,9 @@ def test_fib0786_stop_breached_not_seedable():
             current_price=1997.0, atr=10.0,
             daily_trend=down, h1_trend=down)
     except TypeError as e:
-        print(f'  ⚠️ 跳過：signature 唔同 → {e}')
+        # 2026-10-19 review：原本 print 後 return = 假綠。改為硬 FAIL。
+        check('_build_fib_0786_setup 可以呼叫', False,
+              f'{e} — signature 改咗，test 要更新')
         return
     check('穿 stop 之後 seedable=False', s.get('seedable') is False,
           str(s.get('seedable')))
