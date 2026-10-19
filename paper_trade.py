@@ -1044,8 +1044,23 @@ def load_martingale_state():
             elif not isinstance(st.get("shadow"), list):
                 st["shadow"] = []
             return st
-        except Exception:
-            pass
+        except Exception as e:
+            # 2026-10-19 fix: 讀壞檔唔可以靜默當「全新狀態」—— 跟住 save 會直接
+            # 覆蓋真檔，53 筆交易 / level / equity 無聲消失。改為：
+            #   1. 隔離（改名保留，可人手救返），2. 大聲報去 stderr，3. 才用新狀態。
+            # 唔 raise 係因為呢度係 cron 路徑：一個壞檔唔應該令整個 tick 死。
+            stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+            quarantine = f"{MARTINGALE_PATH}.corrupt-{stamp}"
+            moved = None
+            try:
+                os.replace(MARTINGALE_PATH, quarantine)
+                moved = quarantine
+            except Exception:
+                pass
+            sys.stderr.write(
+                f"[martingale] ⚠️ 狀態檔讀取失敗 → 隔離為 "
+                f"{moved or '(隔離失敗，原檔保留)'}：{type(e).__name__}: {e}\n")
+            sys.stderr.flush()
     return _martingale_fresh_state()
 
 
@@ -2311,17 +2326,38 @@ def _ledger_as_of(log, as_of):
     ledger already; left in, `_existing_signal` matched it and every setup was
     skipped as "duplicate signal (live parity)". Records whose `seeded_time`
     cannot be read stay (conservative: they may be genuine earlier positions).
+
+    2026-10-19 fix: history（CLOSED 行）改為按**平倉時間**過濾，唔再按 `seeded_time`。
+    原本按開倉時間過濾，會把「開倉早過 as_of、但平倉遲過 as_of」嘅單連最終結果一齊
+    帶入 —— replay 會見到一單其實當時仲未平嘅倉已經有結局，即係前視。而 replay 嘅
+    冷靜期／同日去重正係讀 history，所以直接影響回測嘅入場決定。
+    平倉時間讀唔到就**唔納入**（唔可以聲稱佢當時已平）。
     """
-    def _before(rec):
+    def _seed_before(rec):
         if as_of is None:
             return True
         seeded = _parse_dt(rec.get("seeded_time"))
         return seeded is None or seeded < as_of
 
+    def _closed_before(rec):
+        if as_of is None:
+            return True
+        # 主帳本平倉記錄用 `closed_time`（2026-10-19 實測：真帳本 9 筆 history
+        # 全部有）；馬丁狀態嗰邊用 `close_time`。兩個名都讀，再 fallback 去
+        # `seeded_time` —— 同真正嘅 consumer `_existing_signal` 完全一致
+        # （`:257` 寫 `_parse_dt(h.get('closed_time') or h.get('seeded_time'))`）。
+        # 冇 fallback 就會同 E5c 嘅 parity 契約相反：一條冇平倉時間嘅紀錄會被
+        # 當成「當時未平」而放行，令同一日已平嘅同一單重覆 backtest。
+        closed = _parse_dt(rec.get("closed_time") or rec.get("close_time")
+                           or rec.get("seeded_time"))
+        if closed is None:
+            return False
+        return closed < as_of
+
     out = copy.deepcopy(log)
     out["trades"] = [t for t in out.get("trades", [])
-                     if t.get("status") == "LIVE" and _before(t)]
-    out["history"] = [t for t in out.get("history", []) if _before(t)]
+                     if t.get("status") == "LIVE" and _seed_before(t)]
+    out["history"] = [t for t in out.get("history", []) if _closed_before(t)]
     return out
 
 

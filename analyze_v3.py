@@ -1358,7 +1358,14 @@ def detect_wedges(points, df=None, tolerance_pct=0.008):
         tol_dollars = max(avg_price * tolerance_pct, 15)
 
         rising_wedge = high_slope > 0 and low_slope > 0 and high_slope < low_slope
-        falling_wedge = high_slope < 0 and low_slope < 0 and high_slope > low_slope
+        # 2026-10-19 fix: 攞正 `>` → `<`。
+        # 兩個楔形都係「收窄」，即支撐線相對阻力線收得緊：
+        #   rising  → 阻力升得慢過支撐 → high_slope < low_slope
+        #   falling → 阻力跌得快過支撐 → high_slope < low_slope
+        # 原本寫 `high_slope > low_slope`（發散），令正確嘅下降楔形永遠唔成立；
+        # 而發散嘅組合又過唔到下面 `converging` → 結果係下降楔形「從來冇偵測過」。
+        # 實證：2026-08~10 全部報告 + 帳本，「上升楔形」1 次、「下降楔形」0 次。
+        falling_wedge = high_slope < 0 and low_slope < 0 and high_slope < low_slope
 
         spread_start = high_prices[0] - low_prices[0]
         spread_end = high_prices[-1] - low_prices[-1]
@@ -3019,6 +3026,29 @@ def _counter_trend_note(side, daily_trend, h1_trend, prefix=''):
 BROKER_UTC_OFFSET_HOURS = int(os.environ.get('BROKER_UTC_OFFSET_HOURS', '-3'))
 HKT_LOCAL = timezone(timedelta(hours=8))  # trade-day timezone (cron window)
 
+
+def _json_default(o):
+    """numpy / pandas 標量 → 原生 Python 型別（唔好變字串）。
+
+    2026-10-19 fix：原本 `json.dump(..., default=str)` 會將 numpy bool 寫成
+    **字串** "False"／"True"，而字串 "False" 係 truthy —— 任何 downstream
+    `if setup.get('flag'):` 都會當真。實證：39 份生產報告之中有 18 份出現
+    `"broken_now": "False"`（字串），即呢個轉換真係喺生產中發生。
+    `.item()` 保留原生型別（np.bool_→bool、np.int64→int、np.float64→float）。
+    真正唔識嘅物件才 fallback 去 str，同舊行為一致。
+    """
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    item = getattr(o, 'item', None)
+    if callable(item):
+        try:
+            return item()
+        except Exception:
+            pass
+    if isinstance(o, (set, tuple)):
+        return list(o)
+    return str(o)
+
 # 2026-09-04 post-spike chase gate (mentor 9/1-9/4, 132 trades):
 #   - 9/4: 金價 13:00-13:37 急插 4470→4375 (≈9.5 ATR) 後 2 小時內追沽 6 筆全滅
 #     (−$2,200+), 全部被 V 型反彈夾爆 (13:32 SELL@4395→−$365, 13:37→−$461,
@@ -3041,8 +3071,20 @@ ADVISORY_HOURS_0408 = {4, 5, 6, 8}
 # 17:00 promoted to GOLDEN (64.3% win, +$339 net, 14 trades — 138-sample)
 ADVISORY_HOUR_1700 = set()  # vacated; 17:00 now golden
 # 2026-09-01 mentor 129-trade sample (8/24-9/1): strong hours in BROKER time.
-# NOTE (2026-09-02 review): mentor chart times are MT5 SERVER time = GMT+3 =
-# BROKER_UTC_OFFSET_HOURS; so mentor "07:00/18:00 strong" maps directly onto
+# ⚠️ 2026-10-19 修正（本註解原本寫「MT5 SERVER time = GMT+3」——**錯**）：
+#    用 138 筆 mentor 交易（entry + close 兩個獨立價位，共 276 個約束）對
+#    OANDA 現貨 M30/H1 bar 做 offset 回歸，擬合結果係 **UTC+1**（命中率
+#    M30 97.8% / H1 98.9%；次名只有 49.6%，+3 只有 37.7%）。
+#    所以 mentor 圖上嘅鐘係 UTC+1，唔係 GMT+3，而 BROKER_UTC_OFFSET_HOURS
+#    嘅**預設 -3 亦係錯**（兩者差 4 小時）。
+#    重跑：`python scripts/fit_broker_offset.py`
+#    ⚠️ 故意**未改預設值**：預設值係已發表 hour 統計（GOLDEN/ADVISORY/DANGER）
+#    校準時所用嘅框架，靜默改會即刻 re-base 所有歷史數字（見 trading-system-review
+#    skill「parity toggle 唔可以靜默 re-base baseline」）。要切換用 env：
+#        BROKER_UTC_OFFSET_HOURS=1
+#    730d 回放 A/B（-3 vs +1）顯示差異係雜訊級、而且兩個 daily 模式方向相反
+#    （legacy +161、partial −59）——即係改嘅理由係「時鐘證明錯」，唔係「會賺多啲」。
+# NOTE (2026-09-02 review): mentor "07:00/18:00 strong" maps onto
 # broker hours {7,18} — which CONFLICT with the 138-sample DANGER_HOURS {7,18}
 # (25%/21.4% win). The 9/1 crash-day trades dominate the mentor hour PnL, so
 # those hours are NOT reliable as bonus hours. Only broker 03:00/06:00 are
@@ -3378,7 +3420,21 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
             else current_price <= entry_level
         )
     )
-    seedable = severity != 'SEVERE' and touched
+    # 2026-10-19 fix: 止損已被穿越就唔算 seedable。
+    # `paper_trade.seed_trades` 有「current price crossed stop」守衛會兜住，所以
+    # 唔會直接開死單；但 analyzer 照報 seedable=True /「📍 已觸及 (可入場)」嘅後果係：
+    #   (a) 報告同 JSON 講「可入場」但實際一定會被跳過；
+    #   (b) seeder 白做一次嘗試、skipped 計數虛高；
+    #   (c) 任何信任 `seedable` 嘅新讀者會開一張一入就死嘅單。
+    # 收窄到同 seeder 完全同一語義。
+    stop_breached = (
+        current_price is not None
+        and (
+            current_price >= stop_level if side == 'BEARISH'
+            else current_price <= stop_level
+        )
+    )
+    seedable = severity != 'SEVERE' and touched and not stop_breached
     triggered = seedable
 
     if side == 'BEARISH':
@@ -5054,6 +5110,14 @@ def main():
                 'level': tq_level,
                 'advice': tq_advice,
                 'broker_utc_offset_hours': BROKER_UTC_OFFSET_HOURS,
+                # 2026-10-19: 明示呢個 offset 係「未改嘅預設」定「人手指定」。
+                # 預設 -3 同 mentor 交易回歸擬合出嘅 UTC+1 唔一致（差 4 小時），
+                # 讀報告嘅人要即刻睇得到自己身處邊個框架，唔使去翻代碼。
+                'broker_offset_source': (
+                    'env:BROKER_UTC_OFFSET_HOURS'
+                    if os.environ.get('BROKER_UTC_OFFSET_HOURS') else 'default'
+                ),
+                'broker_offset_fitted': 1,   # scripts/fit_broker_offset.py 2026-10-19
             },
             'patterns': patterns,
             'candlestick_m30': candle_m30,
@@ -5068,7 +5132,9 @@ def main():
         }
         json_path = output_path.replace('.md', '.json')
         with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(json_out, f, indent=2, default=str)
+            # default=_json_default（唔再係 str）：保留 bool/int/float 原生型別，
+            # 避免 numpy bool 變成 truthy 嘅字串 "False"。
+            json.dump(json_out, f, indent=2, default=_json_default)
         _log(f"   JSON: {json_path}")
 
 if __name__ == '__main__':

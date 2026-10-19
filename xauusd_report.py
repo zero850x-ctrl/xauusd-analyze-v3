@@ -243,12 +243,38 @@ def dedup_check(data, candidates, enabled=True):
     return keep, dup
 
 
+def _load_push_history():
+    """讀 push_history.json。
+
+    2026-10-19 fix：原本 `load_json(required=False)` 將「檔案唔存在」同
+    「檔案存在但解析唔到」當成同一件事（都回 {}）。壞檔回 {} 之後，今次
+    record_push 會用一個空 dict 覆寫真檔 → 成個去重歷史無聲清空。
+    改為：唔存在 = 真係空（正常）；解析失敗 = 隔離保留 + 大聲報錯。
+    """
+    if not os.path.exists(HISTORY_LOG):
+        return {}
+    try:
+        with open(HISTORY_LOG) as f:
+            hist = json.load(f)
+    except Exception as e:
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        quarantine = f"{HISTORY_LOG}.corrupt-{stamp}"
+        moved = None
+        try:
+            os.replace(HISTORY_LOG, quarantine)
+            moved = quarantine
+        except Exception:
+            pass
+        print(f"⚠️ push_history 讀取失敗 → 隔離為 {moved or '(隔離失敗，原檔保留)'}: "
+              f"{type(e).__name__}: {e}")
+        return {}
+    return hist if isinstance(hist, dict) else {}
+
+
 def record_push(data, candidates):
     """格式 A 推送過嘅 setup 記入 push_history.json。"""
     today = datetime.now(HKT).strftime("%Y-%m-%d")
-    hist = load_json(HISTORY_LOG, required=False)
-    if not isinstance(hist, dict):
-        hist = {}
+    hist = _load_push_history()
     today_list = hist.get(today, [])
     for s in candidates:
         raw_dir = str(s.get("direction") or "")
@@ -422,23 +448,36 @@ def main():
         out.append(build_format_a(data, candidates))
         out.append("")
         out.append(build_status(data, gc_note, dedup_note))
-        record_push(data, candidates)
         # 寫 /tmp/wa_push.txt — wa_conditional_push.sh 會 check push_candidates 先 send
         body = "\n".join(out)
         try:
             with open("/tmp/wa_push.txt", "w") as f:
                 f.write(body)
-        except OSError:
-            pass
+        except OSError as e:
+            print(f"⚠️ /tmp/wa_push.txt 寫入失敗: {e}")
         # 格式 A → 自動 call 硬閘（code 層推送，唔經 LLM 判斷）
+        #
+        # 2026-10-19 fix: 去重記錄由「發送前」搬到「發送成功後」。
+        # 原本 record_push() 喺送出之前寫，而送出失敗係 `except: pass` ——
+        # 即係發送失敗嘅 setup 已經被當成「推過」，永遠唔會再推，而且冇任何訊號。
+        # 語義應該係：記錄 ⟺ 真正送出咗。失敗就唔記錄，下個 tick 重試。
+        sent = False
         if not args.no_send:
             import subprocess
             try:
-                subprocess.run(
+                r = subprocess.run(
                     ["bash", os.path.expanduser("~/.hermes/scripts/wa_conditional_push.sh"), body],
                     capture_output=True, text=True, timeout=60)
-            except Exception:
-                pass
+                sent = (r.returncode == 0)
+                if not sent:
+                    print(f"⚠️ 推送失敗 (rc={r.returncode}) → 唔記錄，下個 tick 重試: "
+                          f"{(r.stderr or r.stdout or '').strip()[:200]}")
+            except Exception as e:
+                print(f"⚠️ 推送例外 → 唔記錄，下個 tick 重試: {type(e).__name__}: {e}")
+        else:
+            sent = True  # dry-run：維持舊行為（照記錄），唔改 --no-send 語義
+        if sent:
+            record_push(data, candidates)
     else:
         out.append("⏳ 無符合推送條件的高質量信號")
         if candidates == [] and not gc_note and not dups:
