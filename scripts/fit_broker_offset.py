@@ -16,8 +16,9 @@
 
 ⚠️ 陷阱（踩過）：tvDatafeed 回傳嘅 bar stamp 係 **naive 而且係本機 local
 （HKT = UTC+8）**，唔係 UTC。所以本工具保持 naive 去對 naive，最後
-`true_offset = fit + local_utc_offset_hours`（本機 UTC 偏移，HKT = 8）。
-如果當佢係 UTC，擬合值會偏 8 小時。
+`true_offset = fit + local_utc_offset_hours(SAMPLE_MIDDATE)`（本機 UTC 偏移，
+HKT = 8）。如果當佢係 UTC，擬合值會偏 8 小時。偏移要按 **sample 日期**嘅
+時區規則計 —— 有 DST 嘅時區用「今日」嘅偏移會靜靜差 1 小時。
 
 Run: python scripts/fit_broker_offset.py [--bars 5000]
 """
@@ -38,10 +39,28 @@ TOL = 1.5          # mentor broker 同 OANDA 現貨之間嘅小價差容忍（�
 FIT_RANGE = range(-20, 21)
 
 
-def local_utc_offset_hours():
-    """本機 UTC 偏移（小時）。呢個就係 naive stamp 嘅換算量。"""
-    off = datetime.now(timezone.utc).astimezone().utcoffset()
+def local_utc_offset_hours(at=None):
+    """本機 UTC 偏移（小時）。呢個就係 naive stamp 嘅換算量。
+
+    2026-10-19 review fix：原本用「今日」嘅偏移去換算 mentor（歷史）日期嘅
+    naive stamp。喺有 DST 嘅時區，夏天同冬天偏移差 1 小時 → 擬合出嘅
+    true_offset 會偏 1 小時，而呢個誤差**完全靜默**。
+    `at` 傳入要換算嗰批 stamp 嘅日期，就會用**當時**嘅規則（UTC+8 嘅 HKT
+    無 DST 所以過往結果不變，但換機器／換時區就唔會靜靜錯）。
+    """
+    dt = at if at is not None else datetime.now()
+    off = dt.astimezone().utcoffset()
     return (off.total_seconds() / 3600.0) if off is not None else 0.0
+
+
+def zone_has_dst():
+    """本機時區有冇 DST（1 月同 7 月嘅偏移唔同）。"""
+    return local_utc_offset_hours(datetime(2026, 1, 15)) != \
+        local_utc_offset_hours(datetime(2026, 7, 15))
+
+
+# mentor sample 全部落喺 2026-07 ~ 2026-10，用呢個日期嘅時區規則去換算。
+SAMPLE_MIDDATE = datetime(2026, 9, 15)
 
 
 def parse_mentor(s):
@@ -96,8 +115,13 @@ def main():
         rows.append((fit, res['M30'], res['H1']))
 
     rows.sort(key=lambda r: -(r[1] + r[2]))
-    loc = local_utc_offset_hours()
-    print(f'\n本機 UTC 偏移 = {loc:+.0f}h（naive stamp 換算量）')
+    loc = local_utc_offset_hours(SAMPLE_MIDDATE)
+    print(f'\n本機 UTC 偏移 = {loc:+.0f}h（naive stamp 換算量，'
+          f'按 sample 日期 {SAMPLE_MIDDATE.date()} 嘅時區規則）')
+    if zone_has_dst():
+        now_off = local_utc_offset_hours()
+        print(f'⚠️ 本機時區有 DST：今日偏移 {now_off:+.0f}h ≠ sample 日期偏移 '
+              f'{loc:+.0f}h。已用 sample 日期嗰個；換機器／換季節跑，結果會差 1 小時。')
     print(f"{'fit':>5}{'true_offset':>13}{'M30':>9}{'H1':>9}")
     for fit, m30, h1 in rows[:5]:
         print(f'{fit:>5}{fit + loc:>+13.0f}{m30*100:>8.1f}%{h1*100:>8.1f}%')

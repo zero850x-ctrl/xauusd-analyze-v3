@@ -1049,7 +1049,9 @@ def load_martingale_state():
             # 覆蓋真檔，53 筆交易 / level / equity 無聲消失。改為：
             #   1. 隔離（改名保留，可人手救返），2. 大聲報去 stderr，3. 才用新狀態。
             # 唔 raise 係因為呢度係 cron 路徑：一個壞檔唔應該令整個 tick 死。
-            stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+            # 2026-10-19 review fix：stamp 只到秒，同一秒兩次壞檔（或檔名已存在）
+            # 時 os.replace 會靜默覆蓋上一個隔離檔 → 頭一份證據消失。加 %f 微秒。
+            stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
             quarantine = f"{MARTINGALE_PATH}.corrupt-{stamp}"
             moved = None
             try:

@@ -249,6 +249,22 @@ def dedup_check(data, candidates, enabled=True):
     return keep, dup
 
 
+def _quarantine_corrupt(path):
+    """壞檔改名保留（可人手救返）。回傳新路徑；失敗回 None。
+
+    2026-10-19 review fix：原本 stamp 只到秒（`%Y%m%dT%H%M%SZ`），同一秒內
+    兩次壞檔（或檔名已存在）`os.replace` 會**靜默覆蓋**上一個隔離檔 →
+    頭一份證據消失。加 `%f` 微秒，並集中一處（原本兩個分支各抄一份）。
+    """
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+    quarantine = f"{path}.corrupt-{stamp}"
+    try:
+        os.replace(path, quarantine)
+        return quarantine
+    except Exception:
+        return None
+
+
 def _load_push_history():
     """讀 push_history.json。
 
@@ -256,6 +272,11 @@ def _load_push_history():
     「檔案存在但解析唔到」當成同一件事（都回 {}）。壞檔回 {} 之後，今次
     record_push 會用一個空 dict 覆寫真檔 → 成個去重歷史無聲清空。
     改為：唔存在 = 真係空（正常）；解析失敗 = 隔離保留 + 大聲報錯。
+
+    2026-10-19 review fix 2：只驗到頂層係 dict 唔夠 —— 若某一日嘅值唔係
+    list（例如人手改壞成 `"2026-10-19": {}`），`dedup_check` 會對佢做
+    `in` 判斷（永遠 False → 漏去重），`record_push` 會 `dict.append` 直接
+    AttributeError。改為逐日驗證：唔係 list 嘅日子丟棄 + 大聲報。
     """
     if not os.path.exists(HISTORY_LOG):
         return {}
@@ -263,45 +284,51 @@ def _load_push_history():
         with open(HISTORY_LOG) as f:
             hist = json.load(f)
     except Exception as e:
-        stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-        quarantine = f"{HISTORY_LOG}.corrupt-{stamp}"
-        moved = None
-        try:
-            os.replace(HISTORY_LOG, quarantine)
-            moved = quarantine
-        except Exception:
-            pass
+        moved = _quarantine_corrupt(HISTORY_LOG)
         print(f"⚠️ push_history 讀取失敗 → 隔離為 {moved or '(隔離失敗，原檔保留)'}: "
               f"{type(e).__name__}: {e}")
         return {}
     if not isinstance(hist, dict):
-        stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-        quarantine = f"{HISTORY_LOG}.corrupt-{stamp}"
-        moved = None
-        try:
-            os.replace(HISTORY_LOG, quarantine)
-            moved = quarantine
-        except Exception:
-            pass
+        moved = _quarantine_corrupt(HISTORY_LOG)
         print(f"⚠️ push_history 唔係 dict → 隔離為 {moved or '(隔離失敗，原檔保留)'}")
         return {}
+    bad_days = sorted(k for k, v in hist.items() if not isinstance(v, list))
+    if bad_days:
+        print(f"⚠️ push_history 有 {len(bad_days)} 日嘅值唔係 list（"
+              f"{', '.join(bad_days[:3])}{'…' if len(bad_days) > 3 else ''}）"
+              " → 丟棄該日記錄，其餘保留（下次寫入會清走）")
+        hist = {k: v for k, v in hist.items() if isinstance(v, list)}
     return hist
 
 
 def _wa_push_delivered(run_result):
-    """True iff Hermes script reports an actual WhatsApp send (see module docstring)."""
+    """True iff Hermes script reports an actual WhatsApp send (see module docstring).
+
+    2026-10-19 review fix（2 個 model 共識）：
+      · 原本 `WA_PUSH_SKIPPED` 判斷排喺 `WA_PUSH_SENT` 前面 —— 腳本一旦分幾段
+        推送（先 SENT 後 SKIPPED），會當成未送出 → 下個 tick 重推已送出嘅部分。
+        改為**以最後一個標記為準**（最後出現嘅標記就係最終結果）。
+      · 原本 `WA_PUSH_TRUST_RC` 預設 '1'：rc=0 但**冇任何標記**（舊腳本、
+        或腳本靜靜死掉但 rc=0）都會當已送出 → 寫入去重歷史 → 之後真正推送
+        被永久擋掉（漏 alert）。改為預設**唔信任** rc：必須見到
+        `WA_PUSH_SENT` 才記錄；要舊行為就明設 `WA_PUSH_TRUST_RC=1`。
+        （live 嘅 wa_conditional_push.sh 已於同日補上標記，所以預設收緊安全。）
+    """
     blob = (run_result.stdout or '') + (run_result.stderr or '')
-    if 'WA_PUSH_SKIPPED' in blob:
-        return False
-    if 'WA_PUSH_SENT' in blob:
-        return True
+    last_marker = None
+    for marker in ('WA_PUSH_SENT', 'WA_PUSH_SKIPPED'):
+        at = blob.rfind(marker)
+        if at >= 0 and (last_marker is None or at > last_marker[0]):
+            last_marker = (at, marker)
+    if last_marker is not None:
+        return last_marker[1] == 'WA_PUSH_SENT'
     if run_result.returncode != 0:
         return False
-    if os.environ.get('WA_PUSH_TRUST_RC', '1') != '0':
-        return True
-    print('⚠️ 推送 rc=0 但缺少 WA_PUSH_SENT → 唔記錄'
-          '（請更新 wa_conditional_push.sh，或設 WA_PUSH_TRUST_RC=1）')
-    return False
+    if os.environ.get('WA_PUSH_TRUST_RC', '0') != '1':
+        print('⚠️ 推送 rc=0 但冇 WA_PUSH_SENT／WA_PUSH_SKIPPED 標記 → 唔記錄'
+              '（wa_conditional_push.sh 應印標記；要信任 rc 就設 WA_PUSH_TRUST_RC=1）')
+        return False
+    return True
 
 
 def record_push(data, candidates):

@@ -3,14 +3,19 @@
 
 每個 test 都對應一個「親手核實過」嘅 finding。冇呢批 test，
 下面每個 fix 都可以靜靜地被改返轉頭而冇人知。
-Run: python -m pytest test_review_fixes_20261019.py -v
-  或: python test_review_fixes_20261019.py
+Run: python3 test_review_fixes_20261019.py
+
+⚠️ 唔支援 pytest：`check()` 只 print + 收集落 `FAILS`，靠 `__main__` 嘅
+`sys.exit(1)` 轉 exit code。喺 pytest 下所有 test 都會綠-by-construction
+（2026-10-19 co-review 捉到；repo 其他 test 檔同一慣例，runner 係
+`run_tests.sh` 直接執行檔案）。
 """
 import json
 import os
 import sys
 import tempfile
 import types
+import time
 
 import numpy as np
 import pandas as pd
@@ -382,7 +387,9 @@ def test_push_recorded_only_after_successful_send():
                 pass
             check('失敗 → 唔記錄', saved == [], f'recorded={saved}')
 
-            # 發送成功（rc == 0）
+            # rc=0 但**冇任何標記**（舊腳本／腳本靜靜死掉）→ 唔記錄
+            # 2026-10-19 co-review：WA_PUSH_TRUST_RC 預設由 '1' 收緊為 '0'。
+            # 真正成功路徑由下面 WA_PUSH_SENT 嗰個 case 覆蓋。
             saved.clear()
             _sp.run = lambda *a, **k: types.SimpleNamespace(
                 returncode=0, stdout='', stderr='')
@@ -391,7 +398,7 @@ def test_push_recorded_only_after_successful_send():
                 R.main()
             except SystemExit:
                 pass
-            check('成功 → 記錄一次', saved == [1], f'recorded={saved}')
+            check('rc=0 冇標記 → 唔記錄', saved == [], f'recorded={saved}')
 
             # rc=0 但硬閘 skip → 唔記錄
             saved.clear()
@@ -435,6 +442,139 @@ def test_wa_push_delivered_contract():
               returncode=1, stdout='', stderr='')) is False)
 
 
+def _rr(stdout='', stderr='', rc=0):
+    """假裝 subprocess.run 嘅結果。"""
+    return types.SimpleNamespace(stdout=stdout, stderr=stderr, returncode=rc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ⑩ 多段推送：以最後一個標記為準（原本 SKIPPED 永遠優先）
+# ─────────────────────────────────────────────────────────────────────────────
+def test_wa_marker_last_one_wins():
+    print('\n⑩ 多段推送：以最後一個標記為準')
+    old = os.environ.pop('WA_PUSH_TRUST_RC', None)
+    try:
+        check('SENT 之後 SKIPPED → 未送出',
+              R._wa_push_delivered(_rr('WA_PUSH_SENT\nWA_PUSH_SKIPPED\n')) is False,
+              '仍用「SKIPPED 優先」→ 會重推已送出嘅部分')
+        check('SKIPPED 之後 SENT → 已送出',
+              R._wa_push_delivered(_rr('WA_PUSH_SKIPPED\nWA_PUSH_SENT\n')) is True,
+              '仍用「SKIPPED 優先」→ 真正送出卻唔記錄')
+    finally:
+        if old is not None:
+            os.environ['WA_PUSH_TRUST_RC'] = old
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ⑪ rc=0 但冇標記：預設唔可以當已送出
+# ─────────────────────────────────────────────────────────────────────────────
+def test_wa_trust_rc_default_is_off():
+    print('\n⑪ rc=0 但冇標記 → 預設唔記錄')
+    old = os.environ.pop('WA_PUSH_TRUST_RC', None)
+    try:
+        check('rc=0 + 冇標記 → 未送出（預設）',
+              R._wa_push_delivered(_rr('', '', 0)) is False,
+              '預設仍信任 rc=0 → 舊腳本／靜靜死掉都會寫入去重，之後真推送被擋')
+        os.environ['WA_PUSH_TRUST_RC'] = '1'
+        check('rc=0 + 冇標記 + TRUST_RC=1 → 已送出（顯式 opt-in）',
+              R._wa_push_delivered(_rr('', '', 0)) is True,
+              '顯式向後兼容開關失效')
+    finally:
+        os.environ.pop('WA_PUSH_TRUST_RC', None)
+        if old is not None:
+            os.environ['WA_PUSH_TRUST_RC'] = old
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ⑫ 隔離檔名加微秒：同一秒兩次壞檔唔可以互相覆蓋
+# ─────────────────────────────────────────────────────────────────────────────
+def test_quarantine_stamp_no_collision():
+    print('\n⑫ 同一秒兩次隔離 → 兩個檔都要留低')
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, 'push_history.json')
+    old = R.HISTORY_LOG
+    R.HISTORY_LOG = p
+    try:
+        for _ in range(2):
+            with open(p, 'w') as f:
+                f.write('{bad json')
+            R._load_push_history()
+        left = sorted(x for x in os.listdir(d) if '.corrupt-' in x)
+        check('兩次隔離留低兩個檔（冇覆蓋）', len(left) == 2,
+              f'只有 {len(left)} 個：{left}')
+    finally:
+        R.HISTORY_LOG = old
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ⑬ push_history 某一日唔係 list → 丟棄該日，其餘保留，唔准炸
+# ─────────────────────────────────────────────────────────────────────────────
+def test_push_history_bad_day_dropped():
+    print('\n⑬ push_history 有日子唔係 list')
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, 'push_history.json')
+    with open(p, 'w') as f:
+        json.dump({'2026-10-18': [{'direction': 'LONG', 'pattern': 'X'}],
+                   '2026-10-19': {'oops': 1},
+                   '2026-10-20': 'nope'}, f)
+    old = R.HISTORY_LOG
+    R.HISTORY_LOG = p
+    try:
+        hist = R._load_push_history()
+        check('好嘅日子保留', '2026-10-18' in hist, f'got={sorted(hist)}')
+        check('壞嘅日子丟棄', '2026-10-19' not in hist and '2026-10-20' not in hist,
+              f'got={sorted(hist)}')
+        ok = True
+        try:
+            R.record_push({}, [{'direction': 'SELL', 'pattern': 'Y'}])
+        except Exception as e:
+            ok = False
+            print(f'    record_push 炸：{type(e).__name__}: {e}')
+        check('record_push 唔會炸', ok, 'record_push 對壞日子做 append')
+    finally:
+        R.HISTORY_LOG = old
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ⑭ fit_broker_offset：偏移要按 sample 日期（DST 安全）
+# ─────────────────────────────────────────────────────────────────────────────
+def test_broker_offset_dst_aware():
+    print('\n⑭ fit_broker_offset 用 sample 日期嘅時區規則')
+    sys.modules.setdefault(
+        'tvDatafeed', types.SimpleNamespace(TvDatafeed=object, Interval=object))
+    scripts = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scripts')
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    try:
+        import fit_broker_offset as FB
+    except Exception as e:
+        check('可以 import fit_broker_offset', False, f'{type(e).__name__}: {e}')
+        return
+    from datetime import datetime as _dt
+    check('有 SAMPLE_MIDDATE（唔再用「今日」）', hasattr(FB, 'SAMPLE_MIDDATE'),
+          '缺 SAMPLE_MIDDATE → 仍用今日偏移')
+    old = os.environ.get('TZ')
+    try:
+        os.environ['TZ'] = 'America/New_York'
+        time.tzset()
+        winter = FB.local_utc_offset_hours(_dt(2026, 1, 15))
+        summer = FB.local_utc_offset_hours(_dt(2026, 7, 15))
+        check('同一函數按日期回唔同偏移', winter != summer,
+              f'winter={winter} summer={summer} → 仍寫死一個偏移')
+        check('zone_has_dst 認得 DST 時區', FB.zone_has_dst() is True,
+              'zone_has_dst 唔準')
+        if hasattr(FB, 'SAMPLE_MIDDATE'):
+            check('9 月 sample 日期用夏令偏移',
+                  FB.local_utc_offset_hours(FB.SAMPLE_MIDDATE) == summer,
+                  'sample 日期偏移唔等於夏令偏移')
+    finally:
+        if old is None:
+            os.environ.pop('TZ', None)
+        else:
+            os.environ['TZ'] = old
+        time.tzset()
+
+
 if __name__ == '__main__':
     for fn in [
         test_falling_wedge_detected,
@@ -453,6 +593,11 @@ if __name__ == '__main__':
         test_fib0786_stop_breached_not_seedable,
         test_push_recorded_only_after_successful_send,
         test_wa_push_delivered_contract,
+        test_wa_marker_last_one_wins,
+        test_wa_trust_rc_default_is_off,
+        test_quarantine_stamp_no_collision,
+        test_push_history_bad_day_dropped,
+        test_broker_offset_dst_aware,
     ]:
         try:
             fn()
