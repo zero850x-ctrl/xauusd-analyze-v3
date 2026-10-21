@@ -8,6 +8,11 @@
 - STATUS 組裝：價格 / M5 / M15 / paper / 馬丁
 - 格式 A 時寫 /tmp/wa_push.txt（推送由 wa_conditional_push.sh 硬閘執行）
 
+`wa_conditional_push.sh` 合約（去重記錄用）：
+- 真正送出：stdout 含 `WA_PUSH_SENT`（建議 exit 0）
+- 硬閘拒絕／冇發：stdout 含 `WA_PUSH_SKIPPED`（exit 0 亦唔記錄）
+- 未帶標記嘅舊腳本：exit 0 仍當已送出（`WA_PUSH_TRUST_RC=0` 關閉）
+
 用法:
   python3 xauusd_report.py [--json PATH] [--no-dedup] [--skip-paper]
 
@@ -17,6 +22,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 
 REPORT_DIR = os.path.expanduser("~/.hermes/reports")
@@ -218,8 +224,8 @@ def dedup_check(data, candidates, enabled=True):
     if not enabled:
         return candidates, []
     today = datetime.now(HKT).strftime("%Y-%m-%d")
-    hist = load_json(HISTORY_LOG, required=False)
-    pushed = hist.get(today, []) if isinstance(hist, dict) else []
+    hist = _load_push_history()
+    pushed = hist.get(today, [])
     if not pushed:
         return candidates, []
     keep, dup = [], []
@@ -243,12 +249,92 @@ def dedup_check(data, candidates, enabled=True):
     return keep, dup
 
 
+def _quarantine_corrupt(path):
+    """壞檔改名保留（可人手救返）。回傳新路徑；失敗回 None。
+
+    2026-10-19 review fix：原本 stamp 只到秒（`%Y%m%dT%H%M%SZ`），同一秒內
+    兩次壞檔（或檔名已存在）`os.replace` 會**靜默覆蓋**上一個隔離檔 →
+    頭一份證據消失。加 `%f` 微秒，並集中一處（原本兩個分支各抄一份）。
+    """
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+    quarantine = f"{path}.corrupt-{stamp}"
+    try:
+        os.replace(path, quarantine)
+        return quarantine
+    except Exception:
+        return None
+
+
+def _load_push_history():
+    """讀 push_history.json。
+
+    2026-10-19 fix：原本 `load_json(required=False)` 將「檔案唔存在」同
+    「檔案存在但解析唔到」當成同一件事（都回 {}）。壞檔回 {} 之後，今次
+    record_push 會用一個空 dict 覆寫真檔 → 成個去重歷史無聲清空。
+    改為：唔存在 = 真係空（正常）；解析失敗 = 隔離保留 + 大聲報錯。
+
+    2026-10-19 review fix 2：只驗到頂層係 dict 唔夠 —— 若某一日嘅值唔係
+    list（例如人手改壞成 `"2026-10-19": {}`），`dedup_check` 會對佢做
+    `in` 判斷（永遠 False → 漏去重），`record_push` 會 `dict.append` 直接
+    AttributeError。改為逐日驗證：唔係 list 嘅日子丟棄 + 大聲報。
+    """
+    if not os.path.exists(HISTORY_LOG):
+        return {}
+    try:
+        with open(HISTORY_LOG) as f:
+            hist = json.load(f)
+    except Exception as e:
+        moved = _quarantine_corrupt(HISTORY_LOG)
+        print(f"⚠️ push_history 讀取失敗 → 隔離為 {moved or '(隔離失敗，原檔保留)'}: "
+              f"{type(e).__name__}: {e}")
+        return {}
+    if not isinstance(hist, dict):
+        moved = _quarantine_corrupt(HISTORY_LOG)
+        print(f"⚠️ push_history 唔係 dict → 隔離為 {moved or '(隔離失敗，原檔保留)'}")
+        return {}
+    bad_days = sorted(k for k, v in hist.items() if not isinstance(v, list))
+    if bad_days:
+        print(f"⚠️ push_history 有 {len(bad_days)} 日嘅值唔係 list（"
+              f"{', '.join(bad_days[:3])}{'…' if len(bad_days) > 3 else ''}）"
+              " → 丟棄該日記錄，其餘保留（下次寫入會清走）")
+        hist = {k: v for k, v in hist.items() if isinstance(v, list)}
+    return hist
+
+
+def _wa_push_delivered(run_result):
+    """True iff Hermes script reports an actual WhatsApp send (see module docstring).
+
+    2026-10-19 review fix（2 個 model 共識）：
+      · 原本 `WA_PUSH_SKIPPED` 判斷排喺 `WA_PUSH_SENT` 前面 —— 腳本一旦分幾段
+        推送（先 SENT 後 SKIPPED），會當成未送出 → 下個 tick 重推已送出嘅部分。
+        改為**以最後一個標記為準**（最後出現嘅標記就係最終結果）。
+      · 原本 `WA_PUSH_TRUST_RC` 預設 '1'：rc=0 但**冇任何標記**（舊腳本、
+        或腳本靜靜死掉但 rc=0）都會當已送出 → 寫入去重歷史 → 之後真正推送
+        被永久擋掉（漏 alert）。改為預設**唔信任** rc：必須見到
+        `WA_PUSH_SENT` 才記錄；要舊行為就明設 `WA_PUSH_TRUST_RC=1`。
+        （live 嘅 wa_conditional_push.sh 已於同日補上標記，所以預設收緊安全。）
+    """
+    blob = (run_result.stdout or '') + (run_result.stderr or '')
+    last_marker = None
+    for marker in ('WA_PUSH_SENT', 'WA_PUSH_SKIPPED'):
+        at = blob.rfind(marker)
+        if at >= 0 and (last_marker is None or at > last_marker[0]):
+            last_marker = (at, marker)
+    if last_marker is not None:
+        return last_marker[1] == 'WA_PUSH_SENT'
+    if run_result.returncode != 0:
+        return False
+    if os.environ.get('WA_PUSH_TRUST_RC', '0') != '1':
+        print('⚠️ 推送 rc=0 但冇 WA_PUSH_SENT／WA_PUSH_SKIPPED 標記 → 唔記錄'
+              '（wa_conditional_push.sh 應印標記；要信任 rc 就設 WA_PUSH_TRUST_RC=1）')
+        return False
+    return True
+
+
 def record_push(data, candidates):
     """格式 A 推送過嘅 setup 記入 push_history.json。"""
     today = datetime.now(HKT).strftime("%Y-%m-%d")
-    hist = load_json(HISTORY_LOG, required=False)
-    if not isinstance(hist, dict):
-        hist = {}
+    hist = _load_push_history()
     today_list = hist.get(today, [])
     for s in candidates:
         raw_dir = str(s.get("direction") or "")
@@ -260,11 +346,25 @@ def record_push(data, candidates):
             "time": datetime.now(HKT).strftime("%H:%M"),
         })
     hist[today] = today_list
+    parent = os.path.dirname(HISTORY_LOG) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".push_history.", suffix=".tmp", dir=parent)
     try:
-        with open(HISTORY_LOG, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(hist, f, ensure_ascii=False, indent=1)
-    except OSError:
-        pass
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, HISTORY_LOG)
+        return True
+    except OSError as e:
+        print(f"⚠️ push_history 寫入失敗: {e}")
+        return False
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def build_format_a(data, candidates):
@@ -422,23 +522,49 @@ def main():
         out.append(build_format_a(data, candidates))
         out.append("")
         out.append(build_status(data, gc_note, dedup_note))
-        record_push(data, candidates)
         # 寫 /tmp/wa_push.txt — wa_conditional_push.sh 會 check push_candidates 先 send
         body = "\n".join(out)
         try:
             with open("/tmp/wa_push.txt", "w") as f:
                 f.write(body)
-        except OSError:
-            pass
+        except OSError as e:
+            print(f"⚠️ /tmp/wa_push.txt 寫入失敗: {e}")
         # 格式 A → 自動 call 硬閘（code 層推送，唔經 LLM 判斷）
+        #
+        # 2026-10-19 fix: 去重記錄由「發送前」搬到「發送成功後」。
+        # 原本 record_push() 喺送出之前寫，而送出失敗係 `except: pass` ——
+        # 即係發送失敗嘅 setup 已經被當成「推過」，永遠唔會再推，而且冇任何訊號。
+        # 語義應該係：記錄 ⟺ 真正送出咗。失敗就唔記錄，下個 tick 重試。
+        delivered = False
         if not args.no_send:
             import subprocess
             try:
-                subprocess.run(
+                r = subprocess.run(
                     ["bash", os.path.expanduser("~/.hermes/scripts/wa_conditional_push.sh"), body],
                     capture_output=True, text=True, timeout=60)
-            except Exception:
-                pass
+                delivered = _wa_push_delivered(r)
+                if not delivered:
+                    snippet = (r.stderr or r.stdout or '').strip()[:200]
+                    if r.returncode != 0:
+                        print(f"⚠️ 推送失敗 (rc={r.returncode}) → 唔記錄，下個 tick 重試: {snippet}")
+                    else:
+                        print(f"⚠️ 推送未送出（硬閘／無 WA_PUSH_SENT）→ 唔記錄: {snippet}")
+            except subprocess.TimeoutExpired:
+                print("⚠️ 推送逾時 (60s) → 唔記錄；若訊息可能已送出，下個 tick 可能重複推送")
+            except Exception as e:
+                print(f"⚠️ 推送例外 → 唔記錄，下個 tick 重試: {type(e).__name__}: {e}")
+        else:
+            # 2026-10-20 fix（3 個 model co-review 共識，必須 merge 前修）：
+            # 乾跑（--no-send）唔可以寫真去重歷史。原本 `delivered = True` 會照行
+            # `record_push` → 用 `--no-send` 做 debug／驗 gate 會把當日 setup 寫入
+            # push_history.json，之後**真正**推送被 `dedup_check` 當重複擋死 =
+            # 靜默漏 alert，而且同「記錄 ⟺ 真正送出咗」直接矛盾。
+            # 乾跑只報告「本來會推乜」，唔 call 推送、唔改任何狀態。
+            print("ℹ️ --no-send 乾跑：唔 call 推送、唔寫去重歷史（狀態不變）")
+        if delivered:
+            wrote = record_push(data, candidates)
+            if wrote is False:
+                print("⚠️ 去重歷史寫入失敗 → 下個 tick 可能重複推送")
     else:
         out.append("⏳ 無符合推送條件的高質量信號")
         if candidates == [] and not gc_note and not dups:

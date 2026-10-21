@@ -437,9 +437,17 @@ def _run_bt(setups, ledger=None, price=4300.0, sim=None):
 
 def _ledger_copy(gen, delta, status="LIVE"):
     stamp = (gen + delta).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return {"status": status, "pattern": "Double Top", "direction": "SELL",
-            "entry_mode": "breakout", "seeded_time": stamp,
-            "seeded_date": (gen + delta).astimezone(pt.HKT).strftime("%Y-%m-%d")}
+    rec = {"status": status, "pattern": "Double Top", "direction": "SELL",
+           "entry_mode": "breakout", "seeded_time": stamp,
+           "seeded_date": (gen + delta).astimezone(pt.HKT).strftime("%Y-%m-%d")}
+    if status == "CLOSED":
+        # 2026-10-19: 真帳本嘅 CLOSED 記錄一定有 `closed_time`（實測 9/9），
+        # fixture 之前漏咗呢個欄。`_ledger_as_of` 改為按平倉時間過濾之後，
+        # 一條冇平倉時間嘅 CLOSED 記錄會（正確地）被判為「當時未平」而剔除 ——
+        # 繼續用舊 fixture 就唔再係測 parity 契約，而係測「缺欄記錄會被剔除」。
+        # 補上 `closed_time` 令 fixture 反映真實資料形狀。
+        rec["closed_time"] = stamp
+    return rec
 
 
 def test_backtest_ledger_is_read_as_of_the_report():
