@@ -575,6 +575,52 @@ def test_broker_offset_dst_aware():
         time.tzset()
 
 
+def test_no_send_does_not_write_push_history():
+    """B：--no-send 乾跑會唔會污染真去重歷史（3-model co-review 共識）。
+
+    唔 mock `record_push` —— 用真嗰個寫落 tempdir，咁「有冇寫檔」就係親眼
+    見到嘅事實，而唔係信一個 stub。
+    """
+    print('\n⑯ --no-send 乾跑唔可以寫真去重歷史')
+    import subprocess as _sp
+    orig = R.HISTORY_LOG
+    real_run = _sp.run
+    real_a, real_s = R.build_format_a, R.build_status
+    with tempfile.TemporaryDirectory() as d:
+        hp = os.path.join(d, 'push_history.json')
+        R.HISTORY_LOG = hp
+        R.build_format_a = lambda data, c: 'FA'
+        R.build_status = lambda *a, **k: 'ST'
+        jp = os.path.join(d, 'rep.json')
+        with open(jp, 'w') as f:
+            json.dump({'data_source': 'TradingView (OANDA:XAUUSD)',
+                       'push_candidates': [{'pattern': 'Double Top',
+                                            'direction': 'SELL',
+                                            'entry_mode': 'breakout'}],
+                       'setups': []}, f)
+        argv = sys.argv
+
+        def _boom(*a, **k):
+            raise AssertionError('乾跑竟然 call 咗推送腳本')
+        try:
+            _sp.run = _boom
+            sys.argv = ['x', '--json', jp, '--skip-paper', '--no-send']
+            try:
+                R.main()
+            except SystemExit:
+                pass
+            except AssertionError as e:
+                check('乾跑唔 call 推送', False, str(e))
+            check('乾跑唔建立 push_history', not os.path.exists(hp),
+                  '檔案被建立 → 之後真推送會被 dedup 擋死')
+            check('乾跑唔改 HISTORY_LOG 變數', R.HISTORY_LOG == hp)
+        finally:
+            sys.argv = argv
+            _sp.run = real_run
+            R.build_format_a, R.build_status = real_a, real_s
+            R.HISTORY_LOG = orig
+
+
 if __name__ == '__main__':
     for fn in [
         test_falling_wedge_detected,
@@ -598,6 +644,7 @@ if __name__ == '__main__':
         test_quarantine_stamp_no_collision,
         test_push_history_bad_day_dropped,
         test_broker_offset_dst_aware,
+        test_no_send_does_not_write_push_history,
     ]:
         try:
             fn()

@@ -554,7 +554,13 @@ def main():
             except Exception as e:
                 print(f"⚠️ 推送例外 → 唔記錄，下個 tick 重試: {type(e).__name__}: {e}")
         else:
-            delivered = True  # dry-run：維持舊行為（照記錄），唔改 --no-send 語義
+            # 2026-10-20 fix（3 個 model co-review 共識，必須 merge 前修）：
+            # 乾跑（--no-send）唔可以寫真去重歷史。原本 `delivered = True` 會照行
+            # `record_push` → 用 `--no-send` 做 debug／驗 gate 會把當日 setup 寫入
+            # push_history.json，之後**真正**推送被 `dedup_check` 當重複擋死 =
+            # 靜默漏 alert，而且同「記錄 ⟺ 真正送出咗」直接矛盾。
+            # 乾跑只報告「本來會推乜」，唔 call 推送、唔改任何狀態。
+            print("ℹ️ --no-send 乾跑：唔 call 推送、唔寫去重歷史（狀態不變）")
         if delivered:
             wrote = record_push(data, candidates)
             if wrote is False:
