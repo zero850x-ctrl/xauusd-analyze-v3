@@ -846,6 +846,24 @@ def process_pending_orders(pending_orders, bar_idx, bar_high, bar_low,
                 still_pending.append((pend_trade, placed_bar))
             continue
 
+        # 2026-10-19 fix: 併行上限亦要管到限價成交。
+        # 掃描路徑有 `_at_concurrency_cap` 檢查（見 run_backtest 嘅「2. Scan for
+        # new setups」），但呢條成交路徑冇 —— 持倉已到上限時，一個剛好觸價嘅掛單
+        # 照樣成交並 append 落 open_trades，令併行數超過 cap。規則統一為
+        # 「到上限就唔開新倉」：掛單繼續等（受同一 LIMIT_ORDER_MAX_BARS 到期約束）。
+        if _at_concurrency_cap(open_trades):
+            if bar_idx - placed_bar >= LIMIT_ORDER_MAX_BARS:
+                if verbose:
+                    print(f"  [EXP]   {pend_trade.side} {pend_trade.pattern_type} "
+                          f"limit entry={pend_trade.entry_price:.0f} unfilled at "
+                          f"concurrency cap after {LIMIT_ORDER_MAX_BARS} bars")
+            else:
+                still_pending.append((pend_trade, placed_bar))
+                if verbose:
+                    print(f"  [HOLD]  {pend_trade.side} {pend_trade.pattern_type} "
+                          f"touched but at cap={BT_MAX_CONCURRENT} — stays pending")
+            continue
+
         # Filled on this bar. Same-bar stop check: if the stop also traded
         # within this bar's range, stop out immediately (touch-then-break).
         if stop_touched:
@@ -1189,19 +1207,31 @@ def compute_stats(trades, starting_capital=10000.0):
     gross_loss = abs(sum(losses)) if losses else 0
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
 
-    # Sharpe ratio (P2 FIX: annualized — per_trade * sqrt(bars_per_year))
-    # Assumes ~252 trading days/year; for intraday, bars_per_year varies by TF
-    if len(pnls) > 1:
-        pnl_std = np.std(pnls)
-        if pnl_std > 0:
-            per_trade_sharpe = np.mean(pnls) / pnl_std
-            # Annualize: M30 → ~12 bars/day × 252 = 3024; H1 → ~6 × 252 = 1512; Daily → 252
-            # Use sqrt(n) as conservative proxy (sample-size adjusted)
-            sharpe = per_trade_sharpe * np.sqrt(len(pnls))
-        else:
-            sharpe = 0
+    # Sharpe ratio
+    # 2026-10-19 fix: 原本註解寫「annualized — per_trade * sqrt(bars_per_year)」，
+    # 但下面實際係 `per_trade_sharpe * sqrt(len(pnls))` = 乘「交易筆數」嘅平方根
+    # —— 唔係年化，而且會隨樣本變長而無條件上升（同一策略跑 2 年會自動高過跑 1 年）。
+    # 為保持歷史可比性，`sharpe_ratio` 數值**唔改**，只把標籤改返做實情；另外新增
+    # 一個真正按時間年化嘅 `sharpe_annualized`（樣本跨度由交易日期取，取唔到就 None）。
+    pnl_std = float(np.std(pnls)) if len(pnls) > 1 else 0.0
+    if len(pnls) > 1 and pnl_std > 0:
+        # Sample-size scaled (NOT annualized): kept for baseline comparability.
+        sharpe = (np.mean(pnls) / pnl_std) * np.sqrt(len(pnls))
     else:
         sharpe = 0
+
+    sharpe_annualized = None
+    if len(pnls) > 1:
+        try:
+            dates = sorted(str(t.entry_date) for t in trades if t.entry_date)
+            if len(dates) >= 2:
+                span_days = (pd.Timestamp(dates[-1]) - pd.Timestamp(dates[0])).days
+                if span_days > 0 and pnl_std > 0:
+                    trades_per_year = len(pnls) * 365.0 / span_days
+                    sharpe_annualized = float(
+                        (np.mean(pnls) / pnl_std) * np.sqrt(trades_per_year))
+        except Exception:
+            sharpe_annualized = None
 
     # Average hold time
     avg_bars = np.mean([t.bars_held for t in trades])
@@ -1242,7 +1272,13 @@ def compute_stats(trades, starting_capital=10000.0):
         'return_pct': round((equity[-1] / starting_capital - 1) * 100, 2),
         'max_drawdown': round(max_dd, 2),
         'max_drawdown_pct': round(max_dd_pct, 1),
+        # 2026-10-19: 標籤更正 —— 呢個係「per-trade Sharpe × sqrt(交易筆數)」，
+        # 唔係年化。真正按時間年化嘅數喺 sharpe_annualized。兩者一齊報，
+        # 唔可以再攞 sharpe_ratio 去跨樣本長度比較。
         'sharpe_ratio': round(sharpe, 2),
+        'sharpe_ratio_note': 'sample-size scaled (per_trade * sqrt(n_trades)), NOT annualized',
+        'sharpe_annualized': (round(sharpe_annualized, 2)
+                              if sharpe_annualized is not None else None),
         'avg_bars_held': round(avg_bars, 1),
         'max_win_streak': max_streak_win,
         'max_loss_streak': max_streak_loss,

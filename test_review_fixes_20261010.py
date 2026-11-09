@@ -437,9 +437,17 @@ def _run_bt(setups, ledger=None, price=4300.0, sim=None):
 
 def _ledger_copy(gen, delta, status="LIVE"):
     stamp = (gen + delta).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return {"status": status, "pattern": "Double Top", "direction": "SELL",
-            "entry_mode": "breakout", "seeded_time": stamp,
-            "seeded_date": (gen + delta).astimezone(pt.HKT).strftime("%Y-%m-%d")}
+    rec = {"status": status, "pattern": "Double Top", "direction": "SELL",
+           "entry_mode": "breakout", "seeded_time": stamp,
+           "seeded_date": (gen + delta).astimezone(pt.HKT).strftime("%Y-%m-%d")}
+    if status == "CLOSED":
+        # 2026-10-19: 真帳本嘅 CLOSED 記錄一定有 `closed_time`（實測 9/9），
+        # fixture 之前漏咗呢個欄。`_ledger_as_of` 改為按平倉時間過濾之後，
+        # 一條冇平倉時間嘅 CLOSED 記錄會（正確地）被判為「當時未平」而剔除 ——
+        # 繼續用舊 fixture 就唔再係測 parity 契約，而係測「缺欄記錄會被剔除」。
+        # 補上 `closed_time` 令 fixture 反映真實資料形狀。
+        rec["closed_time"] = stamp
+    return rec
 
 
 def test_backtest_ledger_is_read_as_of_the_report():
@@ -465,6 +473,15 @@ def test_backtest_ledger_is_read_as_of_the_report():
               "history": []}
     calls4, _, _ = _run_bt([_bt_setup()], ledger=legacy)
     check("E5d 冇 seeded_time 嘅舊紀錄 → 保守地保留（仍然 duplicate）", len(calls4) == 0, calls4)
+
+    # report 之前開、report 之後先平：report 嗰刻佢係 LIVE，live 會當 duplicate 擋。
+    closes_after = (gen + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for label, opened in (("同日", timedelta(hours=-1)), ("隔日", timedelta(hours=-26))):
+        straddle = dict(_ledger_copy(gen, opened, "CLOSED"), closed_time=closes_after,
+                        pnl_r=-1.0, verified=True)
+        calls5, _, out5 = _run_bt([_bt_setup()], ledger={"trades": [], "history": [straddle]})
+        check(f"E5e {label}：report 嗰刻仲持倉、之後先平嘅同一單 → 仍然 duplicate",
+              len(calls5) == 0 and "duplicate signal" in out5, (calls5, out5))
 
 
 def test_backtest_simulated_rows_are_visible_to_dedupe():

@@ -1044,8 +1044,25 @@ def load_martingale_state():
             elif not isinstance(st.get("shadow"), list):
                 st["shadow"] = []
             return st
-        except Exception:
-            pass
+        except Exception as e:
+            # 2026-10-19 fix: 讀壞檔唔可以靜默當「全新狀態」—— 跟住 save 會直接
+            # 覆蓋真檔，53 筆交易 / level / equity 無聲消失。改為：
+            #   1. 隔離（改名保留，可人手救返），2. 大聲報去 stderr，3. 才用新狀態。
+            # 唔 raise 係因為呢度係 cron 路徑：一個壞檔唔應該令整個 tick 死。
+            # 2026-10-19 review fix：stamp 只到秒，同一秒兩次壞檔（或檔名已存在）
+            # 時 os.replace 會靜默覆蓋上一個隔離檔 → 頭一份證據消失。加 %f 微秒。
+            stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+            quarantine = f"{MARTINGALE_PATH}.corrupt-{stamp}"
+            moved = None
+            try:
+                os.replace(MARTINGALE_PATH, quarantine)
+                moved = quarantine
+            except Exception:
+                pass
+            sys.stderr.write(
+                f"[martingale] ⚠️ 狀態檔讀取失敗 → 隔離為 "
+                f"{moved or '(隔離失敗，原檔保留)'}：{type(e).__name__}: {e}\n")
+            sys.stderr.flush()
     return _martingale_fresh_state()
 
 
@@ -2302,6 +2319,16 @@ def _backtest_live_parity_skip(log, s, entry, stop, side, report_price, report_d
     return None
 
 
+# Written onto a trade by check_outcomes after it was seeded (close outcome and
+# per-tick path state). Their values describe what happened after the seed, so
+# a row put back as LIVE "as of" an earlier instant must not carry them.
+_AFTER_SEED_FIELDS = frozenset({
+    "result", "close_price", "pnl_r", "closed_time", "close_time",
+    "close_bar_time", "close_data_source", "bars_held", "tp1_hit", "tp2_hit",
+    "trail_active", "trail_stop", "sim_state", "floating_pnl", "last_unverified",
+})
+
+
 def _ledger_as_of(log, as_of):
     """Isolated copy of the ledger as the live engine saw it at `as_of`.
 
@@ -2311,17 +2338,49 @@ def _ledger_as_of(log, as_of):
     ledger already; left in, `_existing_signal` matched it and every setup was
     skipped as "duplicate signal (live parity)". Records whose `seeded_time`
     cannot be read stay (conservative: they may be genuine earlier positions).
+
+    2026-10-19 fix: history 按**平倉時間**分三桶（唔再按 `seeded_time`）：
+      · 平倉早過 as_of → 留喺 history（當時已平）；
+      · 開倉早過 as_of、平倉喺 as_of 或之後 → 當時仲係持倉：剝走 as_of 之後先寫
+        嘅欄位（`_AFTER_SEED_FIELDS`），以 `status=LIVE` 放返 trades —— 去重同
+        anti-stacking 見到佢，但睇唔到佢嘅結局（前視）；
+      · 開倉喺 as_of 或之後 → 剔除。
+    平倉時間讀唔到嘅 history 行唔入任何一桶：唔可以聲稱佢當時已平，亦唔可以
+    當佢係持倉（冇平倉時間嘅舊紀錄會變成永久幽靈倉）。
     """
-    def _before(rec):
+    def _seed_before(rec):
         if as_of is None:
             return True
         seeded = _parse_dt(rec.get("seeded_time"))
         return seeded is None or seeded < as_of
 
+    def _closed_at(rec):
+        # 主帳本用 `closed_time`；馬丁狀態用 `close_time`。
+        return _parse_dt(rec.get("closed_time") or rec.get("close_time"))
+
+    def _closed_before(rec):
+        if as_of is None:
+            return True
+        closed = _closed_at(rec)
+        return closed is not None and closed < as_of
+
+    def _open_at_as_of(rec):
+        if as_of is None:
+            return False
+        closed = _closed_at(rec)
+        return closed is not None and closed >= as_of and _seed_before(rec)
+
+    def _as_live(rec):
+        live = {k: v for k, v in rec.items() if k not in _AFTER_SEED_FIELDS}
+        live["status"] = "LIVE"
+        return live
+
     out = copy.deepcopy(log)
-    out["trades"] = [t for t in out.get("trades", [])
-                     if t.get("status") == "LIVE" and _before(t)]
-    out["history"] = [t for t in out.get("history", []) if _before(t)]
+    history = out.get("history", [])
+    out["trades"] = ([t for t in out.get("trades", [])
+                      if t.get("status") == "LIVE" and _seed_before(t)]
+                     + [_as_live(t) for t in history if _open_at_as_of(t)])
+    out["history"] = [t for t in history if _closed_before(t)]
     return out
 
 
