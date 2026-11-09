@@ -2319,6 +2319,16 @@ def _backtest_live_parity_skip(log, s, entry, stop, side, report_price, report_d
     return None
 
 
+# Written onto a trade by check_outcomes after it was seeded (close outcome and
+# per-tick path state). Their values describe what happened after the seed, so
+# a row put back as LIVE "as of" an earlier instant must not carry them.
+_AFTER_SEED_FIELDS = frozenset({
+    "result", "close_price", "pnl_r", "closed_time", "close_time",
+    "close_bar_time", "close_data_source", "bars_held", "tp1_hit", "tp2_hit",
+    "trail_active", "trail_stop", "sim_state", "floating_pnl", "last_unverified",
+})
+
+
 def _ledger_as_of(log, as_of):
     """Isolated copy of the ledger as the live engine saw it at `as_of`.
 
@@ -2329,14 +2339,14 @@ def _ledger_as_of(log, as_of):
     skipped as "duplicate signal (live parity)". Records whose `seeded_time`
     cannot be read stay (conservative: they may be genuine earlier positions).
 
-    2026-10-19 fix: history（CLOSED 行）改為按**平倉時間**過濾，唔再按 `seeded_time`。
-    原本按開倉時間過濾，會把「開倉早過 as_of、但平倉遲過 as_of」嘅單連最終結果一齊
-    帶入 —— replay 會見到一單其實當時仲未平嘅倉已經有結局，即係前視。而 replay 嘅
-    冷靜期／同日去重正係讀 history，所以直接影響回測嘅入場決定。
-    平倉時間讀唔到就**唔納入**（唔可以聲稱佢當時已平）。唔用 `seeded_time`
-    代替平倉時間 —— 否則「開倉早過 as_of、平倉遲過 as_of」仍會漏入（前視）。
-    注意：`_last_close_dt`（冷靜期）仍會 `closed_time or seeded_time` 作 best-effort；
-    `_existing_signal`（同日去重）只看 LIVE / `seeded_date`，唔讀平倉時間 —— 語義唔同。
+    2026-10-19 fix: history 按**平倉時間**分三桶（唔再按 `seeded_time`）：
+      · 平倉早過 as_of → 留喺 history（當時已平）；
+      · 開倉早過 as_of、平倉喺 as_of 或之後 → 當時仲係持倉：剝走 as_of 之後先寫
+        嘅欄位（`_AFTER_SEED_FIELDS`），以 `status=LIVE` 放返 trades —— 去重同
+        anti-stacking 見到佢，但睇唔到佢嘅結局（前視）；
+      · 開倉喺 as_of 或之後 → 剔除。
+    平倉時間讀唔到嘅 history 行唔入任何一桶：唔可以聲稱佢當時已平，亦唔可以
+    當佢係持倉（冇平倉時間嘅舊紀錄會變成永久幽靈倉）。
     """
     def _seed_before(rec):
         if as_of is None:
@@ -2344,19 +2354,33 @@ def _ledger_as_of(log, as_of):
         seeded = _parse_dt(rec.get("seeded_time"))
         return seeded is None or seeded < as_of
 
+    def _closed_at(rec):
+        # 主帳本用 `closed_time`；馬丁狀態用 `close_time`。
+        return _parse_dt(rec.get("closed_time") or rec.get("close_time"))
+
     def _closed_before(rec):
         if as_of is None:
             return True
-        # 主帳本用 `closed_time`；馬丁狀態用 `close_time`（2026-10-19 實測真帳本全有）。
-        closed = _parse_dt(rec.get("closed_time") or rec.get("close_time"))
-        if closed is None:
+        closed = _closed_at(rec)
+        return closed is not None and closed < as_of
+
+    def _open_at_as_of(rec):
+        if as_of is None:
             return False
-        return closed < as_of
+        closed = _closed_at(rec)
+        return closed is not None and closed >= as_of and _seed_before(rec)
+
+    def _as_live(rec):
+        live = {k: v for k, v in rec.items() if k not in _AFTER_SEED_FIELDS}
+        live["status"] = "LIVE"
+        return live
 
     out = copy.deepcopy(log)
-    out["trades"] = [t for t in out.get("trades", [])
-                     if t.get("status") == "LIVE" and _seed_before(t)]
-    out["history"] = [t for t in out.get("history", []) if _closed_before(t)]
+    history = out.get("history", [])
+    out["trades"] = ([t for t in out.get("trades", [])
+                      if t.get("status") == "LIVE" and _seed_before(t)]
+                     + [_as_live(t) for t in history if _open_at_as_of(t)])
+    out["history"] = [t for t in history if _closed_before(t)]
     return out
 
 

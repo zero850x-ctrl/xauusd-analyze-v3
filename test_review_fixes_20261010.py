@@ -474,6 +474,15 @@ def test_backtest_ledger_is_read_as_of_the_report():
     calls4, _, _ = _run_bt([_bt_setup()], ledger=legacy)
     check("E5d 冇 seeded_time 嘅舊紀錄 → 保守地保留（仍然 duplicate）", len(calls4) == 0, calls4)
 
+    # report 之前開、report 之後先平：report 嗰刻佢係 LIVE，live 會當 duplicate 擋。
+    closes_after = (gen + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for label, opened in (("同日", timedelta(hours=-1)), ("隔日", timedelta(hours=-26))):
+        straddle = dict(_ledger_copy(gen, opened, "CLOSED"), closed_time=closes_after,
+                        pnl_r=-1.0, verified=True)
+        calls5, _, out5 = _run_bt([_bt_setup()], ledger={"trades": [], "history": [straddle]})
+        check(f"E5e {label}：report 嗰刻仲持倉、之後先平嘅同一單 → 仍然 duplicate",
+              len(calls5) == 0 and "duplicate signal" in out5, (calls5, out5))
+
 
 def test_backtest_simulated_rows_are_visible_to_dedupe():
     """A row appended by the loop needs pattern/entry_mode or `_existing_signal`

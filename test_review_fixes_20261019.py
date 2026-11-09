@@ -298,7 +298,7 @@ def test_ledger_as_of_filters_by_close_time():
     check('未平嗰單唔喺 history', len(out['history']) == 1, str(out['history']))
     check('真已平嗰單保留', out['history'] and out['history'][0]['closed_time']
           == '2026-06-05T00:00:00Z')
-    check('LIVE 倉保留', len(out['trades']) == 1)
+    check('LIVE 倉保留', out['trades'][:1] == log['trades'], str(out['trades']))
 
 
 def test_ledger_as_of_reads_close_time_alias():
@@ -321,6 +321,52 @@ def test_ledger_as_of_excludes_seeded_only_history():
     ]}
     out = PT._ledger_as_of(log, as_of)
     check('seeded-only 唔入 history', out['history'] == [], str(out['history']))
+    check('seeded-only 亦唔會變幽靈 LIVE 倉', out['trades'] == [], str(out['trades']))
+
+
+def test_ledger_as_of_restores_open_position_as_live():
+    print('\n⑦ 開倉早過 as_of、平倉遲過 as_of → 當時係持倉：以 LIVE 放返 trades、剝走結局')
+    from datetime import datetime, timezone
+    as_of = datetime(2026, 6, 10, tzinfo=timezone.utc)
+    straddle = {'id': '2026-06-01-01', 'pattern': 'Double Top', 'direction': 'SELL',
+                'entry_mode': 'breakout', 'entry': 4300.0, 'stop_loss': 4340.0,
+                'seeded_time': '2026-06-01T00:00:00Z', 'seeded_date': '2026-06-01',
+                'verified': True, 'status': 'CLOSED', 'result': 'SL',
+                'close_price': 4340.0, 'pnl_r': -1.0, 'bars_held': 12,
+                'tp1_hit': True, 'tp2_hit': False, 'trail_active': True,
+                'trail_stop': 4310.0, 'floating_pnl': -40.0,
+                'closed_time': '2026-06-20T00:00:00Z',
+                'close_bar_time': '2026-06-19T23:30:00Z',
+                'close_data_source': 'tv'}
+    log = {'trades': [], 'history': [straddle]}
+    out = PT._ledger_as_of(log, as_of)
+    live = out['trades'][0] if len(out['trades']) == 1 else {}
+    check('放返 trades 做 LIVE', live.get('status') == 'LIVE', str(out['trades']))
+    check('唔再留喺 history', out['history'] == [], str(out['history']))
+    opened = ('id', 'pattern', 'direction', 'entry_mode', 'entry', 'stop_loss',
+              'seeded_time', 'seeded_date', 'verified')
+    check('開倉欄位原樣保留', all(live.get(k) == straddle[k] for k in opened), str(live))
+    after = ('result', 'close_price', 'pnl_r', 'bars_held', 'tp1_hit', 'tp2_hit',
+             'trail_active', 'trail_stop', 'floating_pnl', 'closed_time',
+             'close_bar_time', 'close_data_source')
+    leaked = [k for k in after if k in live]
+    check('as_of 之後先有嘅欄位全部剝走', not leaked, f'leaked={leaked}')
+    check('原帳本冇被改', straddle['status'] == 'CLOSED' and log['history'] == [straddle])
+    key = PT._signal_key('Double Top', 'SELL', 'breakout')
+    check('隔日去重見到佢（LIVE 任何日都算）',
+          PT._existing_signal(out, key, '2026-06-10') is not None)
+    check('anti-stacking 見到佢', PT._live_position_directions(out) == ['SELL'],
+          str(PT._live_position_directions(out)))
+
+    at_edge = dict(straddle, closed_time='2026-06-10T00:00:00Z')
+    out2 = PT._ledger_as_of({'trades': [], 'history': [at_edge]}, as_of)
+    check('平倉時間 == as_of → 當時仲係持倉（唔係已平）',
+          out2['history'] == [] and [t.get('status') for t in out2['trades']] == ['LIVE'],
+          str(out2))
+
+    after_seed = dict(straddle, seeded_time='2026-06-11T00:00:00Z')
+    out3 = PT._ledger_as_of({'trades': [], 'history': [after_seed]}, as_of)
+    check('as_of 之後先開嘅單兩邊都冇', out3 == {'trades': [], 'history': []}, str(out3))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -553,6 +599,9 @@ def test_broker_offset_dst_aware():
     from datetime import datetime as _dt
     check('有 SAMPLE_MIDDATE（唔再用「今日」）', hasattr(FB, 'SAMPLE_MIDDATE'),
           '缺 SAMPLE_MIDDATE → 仍用今日偏移')
+    if not hasattr(time, 'tzset'):
+        print('  ⚠️ SKIP DST 斷言：呢個平台冇 time.tzset（Windows），只喺 POSIX 跑')
+        return
     old = os.environ.get('TZ')
     try:
         os.environ['TZ'] = 'America/New_York'
@@ -636,6 +685,7 @@ if __name__ == '__main__':
         test_ledger_as_of_filters_by_close_time,
         test_ledger_as_of_reads_close_time_alias,
         test_ledger_as_of_excludes_seeded_only_history,
+        test_ledger_as_of_restores_open_position_as_live,
         test_fib0786_stop_breached_not_seedable,
         test_push_recorded_only_after_successful_send,
         test_wa_push_delivered_contract,

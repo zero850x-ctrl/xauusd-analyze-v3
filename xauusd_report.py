@@ -11,7 +11,8 @@
 `wa_conditional_push.sh` 合約（去重記錄用）：
 - 真正送出：stdout 含 `WA_PUSH_SENT`（建議 exit 0）
 - 硬閘拒絕／冇發：stdout 含 `WA_PUSH_SKIPPED`（exit 0 亦唔記錄）
-- 未帶標記嘅舊腳本：exit 0 仍當已送出（`WA_PUSH_TRUST_RC=0` 關閉）
+- 兩個標記都有：以最後出現嗰個為準
+- 冇標記：預設唔記錄（rc=0 都唔信）；設 `WA_PUSH_TRUST_RC=1` 先當 rc=0 = 已送出
 
 用法:
   python3 xauusd_report.py [--json PATH] [--no-dedup] [--skip-paper]
@@ -281,7 +282,7 @@ def _load_push_history():
     if not os.path.exists(HISTORY_LOG):
         return {}
     try:
-        with open(HISTORY_LOG) as f:
+        with open(HISTORY_LOG, encoding="utf-8") as f:
             hist = json.load(f)
     except Exception as e:
         moved = _quarantine_corrupt(HISTORY_LOG)
