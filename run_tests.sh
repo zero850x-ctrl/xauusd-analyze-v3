@@ -67,6 +67,9 @@ if [ "${RUN_TESTS_NO_SANDBOX:-0}" != "1" ]; then
   export XAUUSD_PAPER_MARTINGALE="${SANDBOX_DIR}/paper_martingale.json"
   export XAUUSD_PUSH_HISTORY="${SANDBOX_DIR}/push_history.json"
 fi
+# 出場模型 test 斷言 code 預設（momentum-hold）。cron env 設咗 EXIT_MODEL=hybrid
+# 嘅 shell 跑 suite 唔可以令預設模型嘅 test 變紅；要驗 hybrid 嘅 test 自己 pin 旗。
+unset EXIT_MODEL
 
 # ── 收集 test files ──
 if [ "$#" -gt 0 ]; then

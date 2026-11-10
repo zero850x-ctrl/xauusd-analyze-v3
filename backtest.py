@@ -62,6 +62,9 @@ from analyze_v3 import (
     TRAIL_PROFIT_ATR,
     TRAIL_STOP_ATR,
     YF_TICKER,
+    MOMENTUM_HOLD_EXIT,
+    HYBRID_EXIT,
+    exit_model_name,
 )
 
 OUTPUT_DIR = os.path.expanduser("~/.hermes/reports")
@@ -207,7 +210,9 @@ DAILY_TREND_COMPLETED_ONLY = os.environ.get('BT_DAILY_COMPLETED_ONLY', '0') == '
 # retired). Backtest previously always fired fixed TP2, so the same signal
 # produced a different R on each engine. Same env name, same default (=1):
 # =0 restores the legacy fixed-TP2 model on BOTH engines.
-MOMENTUM_HOLD_EXIT = os.environ.get('MOMENTUM_HOLD_EXIT', '1') == '1'
+# 2026-11-10: MOMENTUM_HOLD_EXIT / HYBRID_EXIT are imported from analyze_v3
+# (EXIT_MODEL=momentum-hold|fixed-tp2|hybrid, parsed once there with the same
+# rules as paper_trade) instead of a second env read here.
 # Live allows up to 3 same-direction concurrent positions (paper_trade
 # SAME_DIR_MAX_CONCURRENT=3); the backtest baseline is single-position.
 # 2026-10-03 HIGH4: default 1 = baseline-stable; =3 for live-like exposure.
@@ -487,7 +492,9 @@ def simulate_trade_on_bar(trade, bar_high, bar_low, bar_close, atr_val, bar_open
     # possible TP1 -> reversal -> stop path.
     # 2026-10-03 HIGH3: under momentum-hold the fixed TP2 is retired once TP1
     # arms the BE/trail tail (paper parity); the tail exits via trail/timeout.
-    if tp2_in and not stop_in and not (MOMENTUM_HOLD_EXIT and trade.tp1_hit):
+    # Hybrid keeps TP2 live on top of the same BE/trail tail.
+    if (tp2_in and not stop_in
+            and not (MOMENTUM_HOLD_EXIT and not HYBRID_EXIT and trade.tp1_hit)):
         trade.tp2_hit = True
         if is_buy:
             fill = tp2 - SLIPPAGE_TICKS
@@ -1297,8 +1304,9 @@ def compute_stats(trades, starting_capital=10000.0):
         ),
         # 2026-10-03 HIGH3/HIGH4: effective exit-model + concurrency in meta so
         # a report always says which engine produced it (no silent env flip).
-        'exit_model': 'momentum-hold' if MOMENTUM_HOLD_EXIT else 'fixed-tp2',
+        'exit_model': exit_model_name(MOMENTUM_HOLD_EXIT, HYBRID_EXIT),
         'momentum_hold': bool(MOMENTUM_HOLD_EXIT),
+        'hybrid_exit': bool(MOMENTUM_HOLD_EXIT and HYBRID_EXIT),
         'max_concurrent': int(BT_MAX_CONCURRENT),
         # 2026-10-03 ext-review: "live allows 3" overclaims on its own — live
         # caps SAME-direction at 3 (both sides can total 6) while backtest
@@ -1422,7 +1430,7 @@ def generate_report(stats, trades, per_pattern=None, days=60):
 **日期:** {today}
 **回測期間:** {days} 天 (yfinance GC=F M30)
 **策略:** 形態突破 + 多時間框架趨勢過濾 + 3 級止盈
-**出場模型:** {stats.get('exit_model', 'unknown')}（MOMENTUM_HOLD_EXIT=paper 同名同預設）
+**出場模型:** {stats.get('exit_model', 'unknown')}（EXIT_MODEL／MOMENTUM_HOLD_EXIT 同 paper 同名同解析）
 **併發:** {stats.get('concurrency_note', 'single-position baseline (live allows 3 same-dir)')}
 
 ---

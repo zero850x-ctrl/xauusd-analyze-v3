@@ -399,8 +399,9 @@ def build_format_a(data, candidates):
                 lines.append(f"**TP2: ${_tp2_px} — ⚠️ 停用**")
             else:
                 lines.append(f"**TP2: ${_tp2_px} (狀態未確認 — 以引擎為準)**")
-        # 尾倉計劃（momentum-hold: 餘下 2/3 移動止損；legacy: 放飛尾倉）——
-        # 由 exit_fields 產生，兩個模式都準確，所以直接照印。
+        # 尾倉計劃（momentum-hold: 餘下 2/3 移動止損；hybrid: SL→BE + trail，
+        # TP2 後尾倉 1/3；legacy: 放飛尾倉）—— 由 exit_fields 產生，三個模式都
+        # 準確，所以直接照印。
         if s.get("tp3"):
             lines.append(f"**{s.get('tp3')}**")
         lines.append(f"R:R {s.get('rr_tp1')} | 入場方式: {s.get('entry_mode')}")
@@ -418,10 +419,8 @@ def exit_model_label(data):
     momentum-hold (that is the mirror of the false-TP2 claim).
     """
     model = data.get("exit_model") if isinstance(data, dict) else None
-    if model == "momentum-hold":
-        return "momentum-hold"
-    if model == "fixed-tp2":
-        return "fixed-tp2"
+    if model in ("momentum-hold", "fixed-tp2", "hybrid"):
+        return model
     return "未確認（記錄缺 exit_model）"
 
 

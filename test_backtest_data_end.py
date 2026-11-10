@@ -54,12 +54,13 @@ def near(a, b, tol=1e-6):
 
 @contextlib.contextmanager
 def momentum(flag):
-    old = bt.MOMENTUM_HOLD_EXIT
-    bt.MOMENTUM_HOLD_EXIT = flag
+    # HYBRID_EXIT pinned off: these fixtures are momentum-hold vs fixed-tp2.
+    old = bt.MOMENTUM_HOLD_EXIT, bt.HYBRID_EXIT
+    bt.MOMENTUM_HOLD_EXIT, bt.HYBRID_EXIT = flag, False
     try:
         yield
     finally:
-        bt.MOMENTUM_HOLD_EXIT = old
+        bt.MOMENTUM_HOLD_EXIT, bt.HYBRID_EXIT = old
 
 
 def _trade(side="BUY", entry=4300.0, stop=4250.0, tp1=4320.0, tp2=4340.0,

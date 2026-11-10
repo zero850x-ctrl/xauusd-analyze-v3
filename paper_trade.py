@@ -33,14 +33,6 @@ from datetime import datetime, timezone, timedelta
 # Match backtest.py's adverse execution model.
 SLIPPAGE_TICKS = 0.15
 
-# 2026-10-10 review: single source for the exit model, captured ONCE at import.
-# The env still works (`MOMENTUM_HOLD_EXIT=0 python3 paper_trade.py`), but the
-# value is frozen here so a change made while a position is open cannot rewrite
-# that position's outcome — every trade records the model it was seeded under
-# and `_simulate_staged_exit` prefers that pinned value over the environment.
-# The default (1) must stay equal to analyze_v3's; test_exit_plan_display C1
-# asserts both sides agree.
-MOMENTUM_HOLD_EXIT = os.environ.get("MOMENTUM_HOLD_EXIT", "1") == "1"
 import numpy as np
 import yfinance as yf
 
@@ -147,6 +139,80 @@ def _env_float(name, default, tag, allow_zero=False):
 # ⚠️ 變數名同 default **必須同 analyze_v3.py 一致**（test 有 anti-drift 守衛）。
 TRAIL_PROFIT_ATR = _env_float("TRAIL_PROFIT_ATR", 2.0, "出場")   # 非 momentum-hold 時嘅 arm 門檻
 TRAIL_STOP_ATR = _env_float("TRAIL_STOP_ATR", 1.5, "出場")       # 移動止損距離（ATR 倍數）
+
+# 2026-10-10 review: single source for the exit model, captured ONCE at import.
+# The env still works (`EXIT_MODEL=hybrid python3 paper_trade.py`, or the older
+# `MOMENTUM_HOLD_EXIT=0`), but the value is frozen here so a change made while a
+# position is open cannot rewrite that position's outcome — every trade records
+# the model it was seeded under and `_simulate_staged_exit` prefers that pinned
+# value over the environment. Parsing must stay identical to analyze_v3's
+# `_env_exit_model`; test_exit_hybrid A1 compares both over an env matrix.
+#
+# 2026-11-10: third model `hybrid` = momentum-hold's BE + trail from TP1, but
+# fixed TP2 still takes 1/3 (the tail 1/3 rides TRAIL_STOP_ATR×ATR).
+# MOMENTUM_HOLD_EXIT now means "TP1 arms BE + trail" (True for momentum-hold
+# AND hybrid); HYBRID_EXIT keeps TP2 alive on top of that.
+EXIT_MODELS = ("momentum-hold", "fixed-tp2", "hybrid")
+
+
+def _env_exit_model(tag):
+    """EXIT_MODEL → model name. Bad value: warn + follow MOMENTUM_HOLD_EXIT.
+
+    An unset or empty EXIT_MODEL falls back to the older MOMENTUM_HOLD_EXIT
+    switch, so existing cron envs keep their model. Never raises: this module
+    is imported by every strategy path (same rule as `_env_float`).
+    """
+    fallback = ("momentum-hold" if os.environ.get("MOMENTUM_HOLD_EXIT", "1") == "1"
+                else "fixed-tp2")
+    raw = os.environ.get("EXIT_MODEL")
+    if raw is None or raw.strip() == "":
+        return fallback
+    model = raw.strip().lower()
+    if model not in EXIT_MODELS:
+        print(f"⚠️ [{tag}] EXIT_MODEL={raw!r} 唔係 {'/'.join(EXIT_MODELS)}"
+              f" — 用 {fallback}（跟 MOMENTUM_HOLD_EXIT）")
+        return fallback
+    return model
+
+
+_EXIT_MODEL_AT_IMPORT = _env_exit_model("出場")
+MOMENTUM_HOLD_EXIT = _EXIT_MODEL_AT_IMPORT != "fixed-tp2"
+HYBRID_EXIT = _EXIT_MODEL_AT_IMPORT == "hybrid"
+
+
+def _exit_model_pin(momentum_hold, hybrid):
+    """Ledger value for a trade's exit model.
+
+    momentum-hold → True and fixed-tp2 → False (the pre-hybrid format, so
+    existing rows and older readers are unchanged); hybrid → "hybrid".
+    Rollback caveat: pre-hybrid code reads the "hybrid" string as truthy, i.e.
+    such a trade would finish under momentum-hold (TP2 retired) after a revert.
+    """
+    if not momentum_hold:
+        return False
+    return "hybrid" if hybrid else True
+
+
+def _pinned_exit_flags(exit_model):
+    """Pinned ledger value → (momentum_hold, hybrid).
+
+    None (unpinned) or an unrecognised string → this process's import-time
+    constants, the same fallback an unpinned trade has always had.
+    """
+    if exit_model is None:
+        return MOMENTUM_HOLD_EXIT, HYBRID_EXIT
+    if isinstance(exit_model, str):
+        name = exit_model.strip().lower()
+        if name == "hybrid":
+            return True, True
+        if name == "momentum-hold":
+            return True, False
+        if name == "fixed-tp2":
+            return False, False
+        return MOMENTUM_HOLD_EXIT, HYBRID_EXIT
+    return bool(exit_model), False
+
+
 ANTI_MARTINGALE = True         # Block volume increase after consecutive losses
 # 2026-09-08 review: 5 was dead config — MAX_DAILY_LOSS_R=3 always fires first
 # (5 losses ≥ 3R). 3 same-day consecutive losses is the earliest point at which
@@ -542,7 +608,9 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
     # 2026-09-01 momentum-hold exit (mentor 129-trade): after TP1, remaining
     # 2/3 rides a trailing stop instead of fixed TP2, and the effective stop
     # moves to breakeven so a late reversal can never turn the trade into a
-    # full loss. Set MOMENTUM_HOLD_EXIT=0 to restore fixed-TP2 behaviour.
+    # full loss. EXIT_MODEL=fixed-tp2 (or MOMENTUM_HOLD_EXIT=0) restores the
+    # fixed-TP2 behaviour; EXIT_MODEL=hybrid keeps the BE/trail tail AND the
+    # fixed TP2 (1/3 at TP1, 1/3 at TP2, last 1/3 on the trail).
     #
     # 2026-10-10 review: pin the model to the TRADE, not the tick. Reading the
     # environment on every call meant flipping MOMENTUM_HOLD_EXIT retroactively
@@ -561,11 +629,12 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
     # 2026-10-10 外審 follow-up（已知缺口，記錄唔隱藏）：呢個 pin 只覆蓋 PR 之後
     # seed 嘅單。**升級前已經開住**嘅 legacy open position 冇 `exit_model` 欄，
     # 所以佢會一路用「本 process 啟動時」嘅模型直到平倉為止 —— 即係話如果
-    # 上一次 run 開倉、今次 run 之前改咗 `MOMENTUM_HOLD_EXIT`，嗰張 legacy 單仍然
+    # 上一次 run 開倉、今次 run 之前改咗 `EXIT_MODEL`／`MOMENTUM_HOLD_EXIT`，嗰張 legacy 單仍然
     # 會喺新模型下結算。要完全封死就要喺第一次讀到時 backfill（會改動 ledger，
     # 需要用戶拍板），現階段只保證：同一 process 內、同一張單嘅結局唔會中途改變。
-    momentum_hold = (bool(exit_model) if exit_model is not None
-                     else MOMENTUM_HOLD_EXIT)
+    momentum_hold, hybrid = _pinned_exit_flags(exit_model)
+    retire_tp2 = momentum_hold and not hybrid
+    exit_pin = _exit_model_pin(momentum_hold, hybrid)
     traded_max_high = None
     traded_min_low = None
     last_bar_dt = None
@@ -616,7 +685,7 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
         trail_exit_prebar = trail_active and trail_stop is not None
 
         tp_levels = [(tp1_hit, tp1)]
-        if not (momentum_hold and tp1_hit):
+        if not (retire_tp2 and tp1_hit):
             tp_levels.append((tp2_hit, tp2))
         if is_sell:
             stop_in = high >= eff_stop
@@ -641,7 +710,7 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
                 "result": "Trail" if trail_exit else "SL",
                 "pnl_r": round(total_r, 2),
                 "bars_held": bars_held,
-                "exit_model": momentum_hold,
+                "exit_model": exit_pin,
                 "close_price": round(fill, 2),
                 "tp1_hit": tp1_hit,
                 "tp2_hit": tp2_hit,
@@ -674,8 +743,9 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
                 trail_stop = (entry - SLIPPAGE_TICKS) if is_sell else (entry + SLIPPAGE_TICKS)
 
         # Momentum-hold: fixed TP2 retired once TP1 arms the BE/trail tail;
-        # the tail exits via trail (or timeout) so winners can run.
-        if not tp2_hit and not (momentum_hold and tp1_hit) and tp2 > 0 and not stop_in and ((is_sell and low <= tp2) or (not is_sell and high >= tp2)):
+        # the tail exits via trail (or timeout) so winners can run. Hybrid
+        # keeps TP2 live on top of the same tail.
+        if not tp2_hit and not (retire_tp2 and tp1_hit) and tp2 > 0 and not stop_in and ((is_sell and low <= tp2) or (not is_sell and high >= tp2)):
             tp2_hit = True
             fill = _exit_fill(tp2, raw_open, is_sell, is_stop=False,
                               bar_low=low, bar_high=high)
@@ -704,7 +774,7 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
                 "result": "Trail" if trail_exit else "SL",
                 "pnl_r": round(total_r, 2),
                 "bars_held": bars_held,
-                "exit_model": momentum_hold,
+                "exit_model": exit_pin,
                 "close_price": round(fill, 2),
                 "tp1_hit": tp1_hit,
                 "tp2_hit": tp2_hit,
@@ -725,7 +795,7 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
                 "result": f"Timeout ({MAX_BARS_HELD} bars)",
                 "pnl_r": round(total_r, 2),
                 "bars_held": bars_held,
-                "exit_model": momentum_hold,
+                "exit_model": exit_pin,
                 "close_price": round(fill, 2),
                 "tp1_hit": tp1_hit,
                 "tp2_hit": tp2_hit,
@@ -763,7 +833,7 @@ def _simulate_staged_exit(bars, entry, stop, tp1, tp2, direction, atr, seed_dt=N
         "result": "LIVE",
         "pnl_r": 0.0,
         "bars_held": bars_held,
-        "exit_model": momentum_hold,
+        "exit_model": exit_pin,
         "tp1_hit": tp1_hit,
         "tp2_hit": tp2_hit,
         "trail_active": trail_active,
@@ -1719,7 +1789,7 @@ def seed_trades(data, setups=None):
             # exit was re-derived from the environment on every tick, so changing
             # MOMENTUM_HOLD_EXIT retroactively rewrote an already-open trade's
             # outcome and no record said which model produced a booked R.
-            "exit_model": MOMENTUM_HOLD_EXIT,
+            "exit_model": _exit_model_pin(MOMENTUM_HOLD_EXIT, HYBRID_EXIT),
             # 2026-10-10 review: make the entry-fill convention EXPLICIT instead
             # of letting the two paths diverge silently. Live seeding books the
             # setup price (what the report told the operator to enter at);
@@ -2506,7 +2576,8 @@ def run_backtest(data):
 
         sim = _simulate_staged_exit(
             bars, entry, stop, tp1, tp2, side, atr, seed_dt=seed_dt,
-            data_source=data_source, exit_model=MOMENTUM_HOLD_EXIT,
+            data_source=data_source,
+            exit_model=_exit_model_pin(MOMENTUM_HOLD_EXIT, HYBRID_EXIT),
         )
         status = sim["result"]
         pnl_r = sim["pnl_r"]
@@ -2547,7 +2618,7 @@ def run_backtest(data):
             "seeded_date": _report_date(data),
             "pnl_r": pnl_r if really_closed else 0.0,
             "verified": verified,
-            "exit_model": MOMENTUM_HOLD_EXIT,
+            "exit_model": _exit_model_pin(MOMENTUM_HOLD_EXIT, HYBRID_EXIT),
             "entry_fill_model": "setup_price+adverse_slippage",
             # 2026-10-10 review: the live readers (`_consecutive_losses`,
             # `_last_close_dt`) key off `closed_time`; this record wrote

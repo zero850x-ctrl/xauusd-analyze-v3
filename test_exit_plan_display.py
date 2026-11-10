@@ -47,7 +47,10 @@ def check(name, cond, detail: object = ""):
         print(f"  ❌ {name}  {detail}")
 
 
-# 兩個模式嘅輸出（後面多處重用）
+# 兩個模式嘅輸出（後面多處重用）。呢個檔驗 momentum-hold 同 legacy；hybrid
+# 喺 test_exit_hybrid.py。釘死 HYBRID_EXIT=False，shell 有 EXIT_MODEL=hybrid
+# 都唔會令下面嘅「momentum」斷言靜靜變咗驗 hybrid。
+av.HYBRID_EXIT = False
 av.MOMENTUM_HOLD_EXIT = True
 M = av.exit_fields(4048, '1.0 Fib ext', '追蹤止損: 每 +$23 利潤, 止損移 $17', rr1=1.0)
 av.MOMENTUM_HOLD_EXIT = False
@@ -96,18 +99,25 @@ check("B7 TRAIL_STOP_ATR=2.5 時 legacy plan 講 2.5、唔講 1.5",
 print("== C. Anti-drift: 顯示讀數 == paper_trade 行為來源 ==")
 _av_src = open(os.path.join(HERE, "analyze_v3.py"), encoding="utf-8").read()
 _pt_src = open(os.path.join(HERE, "paper_trade.py"), encoding="utf-8").read()
-_m_av = re.search(
-    r"MOMENTUM_HOLD_EXIT = os\.environ\.get\('MOMENTUM_HOLD_EXIT', '(\d)'\)", _av_src)
-# 2026-10-10 review: paper_trade now captures the env ONCE into a module
-# constant (so a mid-flight change cannot rewrite an open trade). The old guard
-# pinned the inline read, which made the assertion fail on a legitimate fix —
-# check the constant's default instead, and then check the VALUES agree at
-# runtime, which is what the guard was ever about.
-_m_pt = re.search(
-    r'MOMENTUM_HOLD_EXIT = os\.environ\.get\("MOMENTUM_HOLD_EXIT", "(\d)"\)', _pt_src)
-check("C1 兩邊讀同一個 env 且預設一致",
-      bool(_m_av) and bool(_m_pt) and _m_av.group(1) == _m_pt.group(1),
-      f"av={_m_av and _m_av.group(1)} pt={_m_pt and _m_pt.group(1)}")
+# 2026-11-10: 兩邊嘅 env 解析搬咗入同名 helper `_env_exit_model`（EXIT_MODEL
+# 優先，冇設就跟 MOMENTUM_HOLD_EXIT）。逐個 env 組合嘅行為對比喺
+# test_exit_hybrid.py A1；呢度釘住兩邊常數都由 helper 派生、冇人加返 inline
+# env read，同埋 env 乜都冇設時兩邊預設一致。
+_derived = ("MOMENTUM_HOLD_EXIT = _EXIT_MODEL_AT_IMPORT != ",
+            "HYBRID_EXIT = _EXIT_MODEL_AT_IMPORT == ")
+_inline = [n for n, s in (("av", _av_src), ("pt", _pt_src))
+           if re.search(r"(MOMENTUM_HOLD_EXIT|HYBRID_EXIT) = os\.environ", s)
+           or not all(d in s for d in _derived)]
+_env_saved = {k: os.environ.pop(k, None) for k in ("EXIT_MODEL", "MOMENTUM_HOLD_EXIT")}
+try:
+    _defaults = (av._env_exit_model("t"), pt._env_exit_model("t"))
+finally:
+    for _k, _v in _env_saved.items():
+        if _v is not None:
+            os.environ[_k] = _v
+check("C1 兩邊常數都由 _env_exit_model 派生，env 冇設時預設一致",
+      not _inline and _defaults == ("momentum-hold", "momentum-hold"),
+      f"inline/缺派生={_inline} defaults={_defaults}")
 import paper_trade as _pt_mod
 import analyze_v3 as _av_mod
 # 2026-10-10 外審 follow-up: 比 VALUE，唔好比 bool。原本 `bool(x) == bool(y)`
@@ -120,6 +130,11 @@ check("C1b 行為：兩邊 module constant 係 bool 而且值相同",
       and _pt_mod.MOMENTUM_HOLD_EXIT == _av_mod.MOMENTUM_HOLD_EXIT,
       f"pt={_pt_mod.MOMENTUM_HOLD_EXIT!r} ({type(_pt_mod.MOMENTUM_HOLD_EXIT).__name__}) "
       f"av={_av_mod.MOMENTUM_HOLD_EXIT!r} ({type(_av_mod.MOMENTUM_HOLD_EXIT).__name__})")
+# 上面已經將 av.HYBRID_EXIT 釘做 False，所以 HYBRID 要比 import 時嘅模型名。
+check("C1c 兩邊 import 時嘅模型名一致（hybrid 旗唔可以一邊有一邊冇）",
+      _pt_mod._EXIT_MODEL_AT_IMPORT == _av_mod._EXIT_MODEL_AT_IMPORT
+      and isinstance(_pt_mod.HYBRID_EXIT, bool),
+      f"pt={_pt_mod._EXIT_MODEL_AT_IMPORT!r} av={_av_mod._EXIT_MODEL_AT_IMPORT!r}")
 _m_lit = re.findall(r"new_trail = close_px [+-] ([\d.]+) \* atr", _pt_src)
 check("C2a paper_trade 冇寫死 trail 距離（第 2 項 dead config）", not _m_lit, f"仲有 {_m_lit}")
 check("C2b paper_trade trail 真係用 TRAIL_STOP_ATR",
@@ -195,6 +210,7 @@ def _probe(extra):
     env.update(extra)
     env["REPO"] = HERE
     env.pop("MOMENTUM_HOLD_EXIT", None)
+    env.pop("EXIT_MODEL", None)
     p = subprocess.run([sys.executable, "-c", _PROBE],
                        capture_output=True, text=True, env=env)
     for line in reversed(p.stdout.splitlines()):
@@ -356,8 +372,8 @@ check("E3 5 個 site 定義 _ef、15 處使用",
       f"def={_av_src.count('_ef = exit_fields(')} use={_av_src.count('_ef[')}")
 check("E4 _ef 先定義後使用", _av_src.index("_ef = exit_fields(") < _av_src.index("_ef["))
 check("E5 5 個 site 都 emit tp2_active（report 層靠佢）",
-      _av_src.count("'tp2_active': not MOMENTUM_HOLD_EXIT") == 5,
-      f"n={_av_src.count(chr(39) + 'tp2_active' + chr(39) + ': not MOMENTUM_HOLD_EXIT')}")
+      _av_src.count("'tp2_active': tp2_is_active(),") == 5,
+      f"n={_av_src.count(chr(39) + 'tp2_active' + chr(39) + ': tp2_is_active(),')}")
 # ⭐ paper_trade 唔可以再有 inline 重複（原本 4 處）—— 顯示格式一改就靜靜爆
 _pt_dup = _pt_src.count('split("$")[1].split(" ")[0]')
 check("E6 paper_trade 只淨 1 處抽價（helper 本身），冇 inline 重複",
@@ -540,8 +556,8 @@ print("== I. rr_tp2 唔可以係「永遠唔會實現嘅回報風險比」==")
 _rr_sites = [x.strip() for x in re.findall(r"'rr_tp2':[^\n]*", _av_src)]
 check("I1 全部 5 個 rr_tp2 生產點都帶 rr_tp2_active 旗標",
       len(_rr_sites) == 5 and all("rr_tp2_active" in x for x in _rr_sites), _rr_sites)
-check("I2 旗標真值來源 = MOMENTUM_HOLD_EXIT（同 tp2_active 同一真值，唔可以各說各話）",
-      all("not MOMENTUM_HOLD_EXIT" in x for x in _rr_sites), _rr_sites)
+check("I2 旗標真值來源 = tp2_is_active()（同 tp2_active 同一真值，唔可以各說各話）",
+      all("'rr_tp2_active': tp2_is_active()" in x for x in _rr_sites), _rr_sites)
 check("I3 markdown 表唔可以無條件印 rr_tp2（改用 rr_tp2_cell）",
       "R:R TP2 | {s['rr_tp2']}:1 |" not in _av_src and "rr_tp2_cell(s)" in _av_src, "")
 # 三態行為（用真 helper，唔係測試裡面另寫一份）

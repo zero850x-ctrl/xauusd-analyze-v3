@@ -50,9 +50,10 @@ KNOWN LIMITATIONS (documented, not fixed here):
     engine (M30). Since 2026-10 the backtest default is MOMENTUM_HOLD_EXIT=1,
     the same switch as paper: TP1 arms breakeven + trail and fixed TP2 is
     retired. This harness does not pin the variable, so a re-run follows the
-    process environment. Set MOMENTUM_HOLD_EXIT=0 to reproduce the older
-    fixed-TP2, no-breakeven numbers. The result `_meta.exit_model` records
-    which one actually ran.
+    process environment. Set EXIT_MODEL=fixed-tp2 (or MOMENTUM_HOLD_EXIT=0)
+    to reproduce the older fixed-TP2, no-breakeven numbers; EXIT_MODEL=hybrid
+    keeps breakeven + trail and fixed TP2. The result `_meta.exit_model`
+    records which one actually ran.
 
 DATA: Binance PAXGUSDT 1h, 5 years (same CSV as verify_entry_delay.py, not
 tracked in git — see .gitignore), weekends stripped so the calendar matches
@@ -431,11 +432,10 @@ def main():
             "retest_impl": "native_pending_orders",
             "limit_order_max_bars": bt.LIMIT_ORDER_MAX_BARS,
             "daily_mode": bt.daily_mode(),
-            "exit_model": ("momentum-hold" if bt.MOMENTUM_HOLD_EXIT
-                           else "fixed-tp2"),
+            "exit_model": bt.exit_model_name(bt.MOMENTUM_HOLD_EXIT, bt.HYBRID_EXIT),
             "exit_model_note": (
-                "default follows MOMENTUM_HOLD_EXIT; "
-                "set =0 to reproduce pre-2026-10 fixed-TP2 numbers"
+                "default follows EXIT_MODEL (unset: MOMENTUM_HOLD_EXIT); "
+                "set EXIT_MODEL=fixed-tp2 to reproduce pre-2026-10 fixed-TP2 numbers"
             ),
             "daily_trend_completed_only": bt.daily_mode() == "completed",
             "daily_trend_partial_candle": bt.daily_mode() == "partial",

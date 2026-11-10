@@ -167,8 +167,9 @@ def test_backtest_no_gap_fill_unchanged():
 
 def test_backtest_momentum_retires_tp2():
     """MOMENTUM on: TP2 level after TP1 must NOT bank fixed TP2; BE armed."""
-    old = bt.MOMENTUM_HOLD_EXIT
-    bt.MOMENTUM_HOLD_EXIT = True
+    old = bt.MOMENTUM_HOLD_EXIT, bt.HYBRID_EXIT
+    # hybrid would keep TP2 alive; this test is about pure momentum-hold.
+    bt.MOMENTUM_HOLD_EXIT, bt.HYBRID_EXIT = True, False
     try:
         t = _mk_trade("SELL", 4300.0, 4340.0, 4260.0, 4220.0)
         bt.simulate_trade_on_bar(t, 4310.0, 4255.0, 4290.0, 12.0,
@@ -181,7 +182,7 @@ def test_backtest_momentum_retires_tp2():
                                  bar_open=4230.0, exit_date="2026-09-01")
         assert t.tp2_hit is False, "fixed TP2 must be retired under momentum"
     finally:
-        bt.MOMENTUM_HOLD_EXIT = old
+        bt.MOMENTUM_HOLD_EXIT, bt.HYBRID_EXIT = old
 
 
 def test_backtest_legacy_fixed_tp2_with_env_off():
@@ -232,7 +233,9 @@ def test_stats_carry_exit_model_and_concurrency():
                              bar_open=4310.0, exit_date="2026-09-01")
     assert t.closed is True
     s = bt.compute_stats([t])
-    assert s["exit_model"] in ("momentum-hold", "fixed-tp2"), s.get("exit_model")
+    assert s["exit_model"] == bt.exit_model_name(bt.MOMENTUM_HOLD_EXIT, bt.HYBRID_EXIT), \
+        s.get("exit_model")
+    assert s["exit_model"] in ("momentum-hold", "fixed-tp2", "hybrid"), s.get("exit_model")
     assert s["max_concurrent"] == bt.BT_MAX_CONCURRENT
     assert "live allows 3" in s["concurrency_note"], s.get("concurrency_note")
     assert s["daily_mode"] in ("legacy", "completed", "partial")
@@ -381,12 +384,14 @@ def test_status_exit_model_comes_from_json():
     assert 'os.environ.get(\'MOMENTUM_HOLD_EXIT\'' not in src
     av_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "analyze_v3.py"), encoding="utf-8").read()
-    assert "'exit_model': 'momentum-hold' if MOMENTUM_HOLD_EXIT" in av_src
+    assert "'exit_model': exit_model_name(MOMENTUM_HOLD_EXIT, HYBRID_EXIT)" in av_src
+    assert 'os.environ.get("EXIT_MODEL"' not in src
     old = os.environ.get("MOMENTUM_HOLD_EXIT")
     os.environ["MOMENTUM_HOLD_EXIT"] = "0"
     try:
         assert R.exit_model_label({"exit_model": "momentum-hold"}) == "momentum-hold"
         assert R.exit_model_label({"exit_model": "fixed-tp2"}) == "fixed-tp2"
+        assert R.exit_model_label({"exit_model": "hybrid"}) == "hybrid"
         assert "未確認" in R.exit_model_label({})
     finally:
         if old is None:

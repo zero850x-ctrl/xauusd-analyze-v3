@@ -177,14 +177,65 @@ def _env_float(name, default, tag, allow_zero=False):
 TRAIL_PROFIT_ATR = _env_float('TRAIL_PROFIT_ATR', 2.0, '出場')
 TRAIL_STOP_ATR = _env_float('TRAIL_STOP_ATR', 1.5, '出場')
 
-# ── 出場模式（2026-09-28）────────────────────────────────────────────────
-# paper_trade.py 擁有**行為**；呢度係**讀者**，唔係第二份實作。兩邊預設必須
-# 一致 —— test_exit_plan_display.py 會逐字對比 source literal 釘住，唔靠記憶。
+# ── 出場模式（2026-09-28；2026-11-10 加 hybrid）──────────────────────────
+# paper_trade.py 擁有**行為**；呢度係**讀者**，唔係第二份實作。兩邊解析必須
+# 一致 —— test_exit_plan_display.py／test_exit_hybrid.py 逐個 env 組合對比兩份
+# `_env_exit_model` 嘅結果，唔靠記憶。
 #
-# momentum-hold（預設開）: TP1 之後餘下 2/3 掛移動止損跟勢，TP2 喺 TP1 之後
-# 唔會 fire（paper_trade.py 條件短路；tp1<=0 嘅退化 setup 例外）。legacy (=0)
-# 先會 TP2 止賺 1/3、尾倉 1/3，而且唔會喺 TP1 後把止損移去 breakeven。
-MOMENTUM_HOLD_EXIT = os.environ.get('MOMENTUM_HOLD_EXIT', '1') == '1'
+# momentum-hold（預設）: TP1 之後 SL→BE，餘下 2/3 掛移動止損跟勢，TP2 喺 TP1
+#   之後唔會 fire（paper_trade.py 條件短路；tp1<=0 嘅退化 setup 例外）。
+# fixed-tp2（legacy）: TP2 止賺 1/3、尾倉 1/3，而且唔會喺 TP1 後把止損移去
+#   breakeven。
+# hybrid: TP1 後 SL→BE、trail 由 TP1 起 arm（同 momentum-hold），但 TP2 照樣
+#   止賺 1/3，尾倉 1/3 跟 TRAIL_STOP_ATR×ATR。
+#
+# `EXIT_MODEL=momentum-hold|fixed-tp2|hybrid` 優先；冇設（或者空）就跟舊開關
+# `MOMENTUM_HOLD_EXIT`（=0 → fixed-tp2），現有 cron 唔使改。常數嘅意思：
+# MOMENTUM_HOLD_EXIT = TP1 後有 BE + trail（momentum-hold 同 hybrid 都係 True）；
+# HYBRID_EXIT = 喺嗰個前提下 TP2 唔退休。
+EXIT_MODELS = ('momentum-hold', 'fixed-tp2', 'hybrid')
+
+
+def _env_exit_model(tag):
+    """EXIT_MODEL → 模型名。壞值 warn + 跟 MOMENTUM_HOLD_EXIT，唔 crash。
+
+    同 paper_trade.py 嘅同名 helper **行為必須一致**（同 `_env_float` 一樣
+    逐個 env 組合對比結果）。analyze_v3 係 cron 每支 tick 跑嘅 signal
+    producer，一個 typo 令 import crash 就等於完全冇信號。
+    """
+    fallback = ('momentum-hold' if os.environ.get('MOMENTUM_HOLD_EXIT', '1') == '1'
+                else 'fixed-tp2')
+    raw = os.environ.get('EXIT_MODEL')
+    if raw is None or raw.strip() == '':
+        return fallback
+    model = raw.strip().lower()
+    if model not in EXIT_MODELS:
+        print(f"⚠️ [{tag}] EXIT_MODEL={raw!r} 唔係 {'/'.join(EXIT_MODELS)}"
+              f" — 用 {fallback}（跟 MOMENTUM_HOLD_EXIT）")
+        return fallback
+    return model
+
+
+_EXIT_MODEL_AT_IMPORT = _env_exit_model('出場')
+MOMENTUM_HOLD_EXIT = _EXIT_MODEL_AT_IMPORT != 'fixed-tp2'
+HYBRID_EXIT = _EXIT_MODEL_AT_IMPORT == 'hybrid'
+
+
+def exit_model_name(momentum_hold, hybrid):
+    """兩個旗 → 'momentum-hold'／'fixed-tp2'／'hybrid'。
+
+    報告 JSON、backtest stats、verify_tp_retest meta 共用。旗由 caller 傳入
+    （backtest 有自己嘅 module 常數），唔好喺呢度讀 global。冇 BE
+    （momentum_hold=False）時 hybrid 旗冇作用 ⇒ fixed-tp2。
+    """
+    if not momentum_hold:
+        return 'fixed-tp2'
+    return 'hybrid' if hybrid else 'momentum-hold'
+
+
+def tp2_is_active():
+    """Setup 欄 `tp2_active`／`rr_tp2_active` 嘅真值：TP2 會唔會 fire。"""
+    return (not MOMENTUM_HOLD_EXIT) or HYBRID_EXIT
 # 2026-09-28 第 2 項修好之前，paper_trade.py 嘅 momentum-hold 路徑**硬編碼
 # 1.5**、唔讀 TRAIL_STOP_ATR，所以呢度唯有如實寫死 1.5。修好之後兩邊都讀
 # 同一個 TRAIL_STOP_ATR ⇒ 直接引用，改環境變數顯示同實際一齊變。
@@ -203,7 +254,23 @@ def exit_fields(tp2_price, tp2_label, tp3_trail_legacy, rr1=None):
     原本嗰句「餘下 2/3 無固定TP」係照抄 momentum-hold 版本，但 legacy 之下 TP2 係
     有效目標，所以嗰句本身係錯。今次一併改準（唔係「唔改行為之外嘅嘢」，而係
     「兩個模式嘅文字都要同實際一致」—— 呢個正正就係今次修嘅目的）。
+
+    hybrid 分支（2026-11-10）: TP2 同 legacy 一樣係真目標（1/3），但 SL→BE 同
+    trail 由 TP1 起（同 momentum-hold）。尾倉唔可以用 `tp3_trail_legacy` ——
+    嗰句講「利潤達 TRAIL_PROFIT_ATR 先 arm」，hybrid 唔係咁。
     """
+    if MOMENTUM_HOLD_EXIT and HYBRID_EXIT:
+        tp2 = f"${tp2_price:.0f} ({tp2_label}, 止賺 1/3)"
+        tp3 = (f"TP1 後 SL→BE + {MOM_HOLD_TRAIL_ATR:g}×ATR 移動止損 (由 TP1 起 arm)；"
+               f"TP2 後尾倉 1/3 繼續跟勢")
+        if rr1 is not None:
+            plan = (f"TP1 (+{rr1:.1f}R) 後 SL→BE; 餘下 2/3: 1/3 到 TP2, "
+                    f"1/3 跟 {MOM_HOLD_TRAIL_ATR:g} ATR 移動止損 "
+                    f"(前輩式放飛: 平均贏$126/輸$27)")
+        else:
+            plan = (f"TP1 後 SL→BE; 餘下 2/3: 1/3 到 TP2, "
+                    f"1/3 跟 {MOM_HOLD_TRAIL_ATR:g} ATR 移動止損")
+        return tp2, tp3, plan
     if MOMENTUM_HOLD_EXIT:
         tp2 = (f"${tp2_price:.0f} ({tp2_label})"
                f" — ⚠️ 停用 (momentum-hold，TP1 後唔會 fire)")
@@ -270,11 +337,23 @@ def setup_share_labels(setup):
 
 
 def static_exit_copy(atr):
-    """法則表、日誌範本、追蹤止損列。模式跟 MOMENTUM_HOLD_EXIT。
+    """法則表、日誌範本、追蹤止損列。模式跟 MOMENTUM_HOLD_EXIT／HYBRID_EXIT。
 
-    momentum-hold 嘅 trail 由 TP1 起 arm，距離係 MOM_HOLD_TRAIL_ATR。
+    momentum-hold 同 hybrid 嘅 trail 由 TP1 起 arm，距離係 MOM_HOLD_TRAIL_ATR。
     legacy 先用「利潤達 TRAIL_PROFIT_ATR 先 arm、距離 TRAIL_STOP_ATR」。
     """
+    if MOMENTUM_HOLD_EXIT and HYBRID_EXIT:
+        mult = f"{MOM_HOLD_TRAIL_ATR:g}"
+        return {
+            "rule_tp2": "2:1 RR 或 1.0 Fib ext (取較遠，比 TP1 更遠)，止賺 1/3",
+            "rule_tp3": f"TP2 後尾倉 1/3 跟 {mult}×ATR 移動止損（無固定目標）",
+            "journal_tp2": "🎯 TP2 (1/3): ___",
+            "journal_tp3": f"🎯 尾倉 (1/3): 跟 {mult}×ATR 移動止損",
+            "trail_rule": (
+                f"TP1 後 SL→BE + {mult}×ATR 移動止損"
+                f"（由 TP1 起 arm，唔係等 +{TRAIL_PROFIT_ATR:g}×ATR）"
+            ),
+        }
     if MOMENTUM_HOLD_EXIT:
         mult = f"{MOM_HOLD_TRAIL_ATR:g}"
         return {
@@ -3352,12 +3431,12 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
             'stop_loss': f"${stop_level:.0f}",
             'stop_rationale': f"{swing_label} + 1 ATR",
             'tp1': f"${tp1:.0f} (0.618 RR, 止賺 1/3)",
-            'tp2': _ef[0], 'tp2_active': not MOMENTUM_HOLD_EXIT,
+            'tp2': _ef[0], 'tp2_active': tp2_is_active(),
             'tp3': _ef[1],
             'exit_plan': _ef[2],
             'risk_amount': round(risk, 1),
             'rr_tp1': round(rr_tp1, 1),
-            'rr_tp2': round(rr_tp2, 1), 'rr_tp2_active': not MOMENTUM_HOLD_EXIT,
+            'rr_tp2': round(rr_tp2, 1), 'rr_tp2_active': tp2_is_active(),
             'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
             'note': '' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='Fib'),
         }
@@ -3378,12 +3457,12 @@ def _build_fib_fallback_setup(side, fib, entry_level, stop_level, risk, tp1, tp2
         'stop_loss': f"${stop_level:.0f}",
         'stop_rationale': f"{swing_label} - 1 ATR",
         'tp1': f"${tp1:.0f} (0.618 RR, 止賺 1/3)",
-        'tp2': _ef[0], 'tp2_active': not MOMENTUM_HOLD_EXIT,
+        'tp2': _ef[0], 'tp2_active': tp2_is_active(),
         'tp3': _ef[1],
         'exit_plan': _ef[2],
         'risk_amount': round(risk, 1),
         'rr_tp1': round(rr_tp1, 1),
-        'rr_tp2': round(rr_tp2, 1), 'rr_tp2_active': not MOMENTUM_HOLD_EXIT,
+        'rr_tp2': round(rr_tp2, 1), 'rr_tp2_active': tp2_is_active(),
         'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
         'note': '' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='Fib'),
     }
@@ -3463,12 +3542,12 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
             'stop_loss': f"${stop_level:.0f}",
             'stop_rationale': f"前頂 ${fib['swing_start']:.0f} (回調浪最高點) + 1 ATR",
             'tp1': f"${tp1:.0f} (0.618 Fib 位, 止賺 1/3)",
-            'tp2': _ef[0], 'tp2_active': not MOMENTUM_HOLD_EXIT,
+            'tp2': _ef[0], 'tp2_active': tp2_is_active(),
             'tp3': _ef[1],
             'exit_plan': _ef[2],
             'risk_amount': round(risk, 1),
             'rr_tp1': round(rr_tp1, 1),
-            'rr_tp2': round(rr_tp2, 1), 'rr_tp2_active': not MOMENTUM_HOLD_EXIT,
+            'rr_tp2': round(rr_tp2, 1), 'rr_tp2_active': tp2_is_active(),
             'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
             'note': '0.786 深度回調 — 實驗性（港股 playbook；未經 XAUUSD 138-sample 驗證）' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='0.786 Fib'),
         }
@@ -3498,12 +3577,12 @@ def _build_fib_0786_setup(side, fib, entry_level, stop_level, risk, tp1, tp2, tp
         'stop_loss': f"${stop_level:.0f}",
         'stop_rationale': f"前底 ${fib['swing_start']:.0f} (回調浪最低點) - 1 ATR",
         'tp1': f"${tp1:.0f} (0.618 Fib 位, 止賺 1/3)",
-        'tp2': _ef[0], 'tp2_active': not MOMENTUM_HOLD_EXIT,
+        'tp2': _ef[0], 'tp2_active': tp2_is_active(),
         'tp3': _ef[1],
         'exit_plan': _ef[2],
         'risk_amount': round(risk, 1),
         'rr_tp1': round(rr_tp1, 1),
-        'rr_tp2': round(rr_tp2, 1), 'rr_tp2_active': not MOMENTUM_HOLD_EXIT,
+        'rr_tp2': round(rr_tp2, 1), 'rr_tp2_active': tp2_is_active(),
         'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
         'note': '0.786 深度回調 — 實驗性（港股 playbook；未經 XAUUSD 138-sample 驗證）' if aligned else _counter_trend_note(side, daily_trend, h1_trend, prefix='0.786 Fib'),
     }
@@ -3907,12 +3986,12 @@ def _make_setup(side, pattern, daily_trend, h1_trend, tp3_trail, *,
         'stop_loss': f"${stop_loss:.0f}",
         'stop_rationale': stop_rationale,
         'tp1': f"${targets['tp1']:.0f} ({_tp_method_label(pattern, targets['tp1'], targets['fib_tp'], targets['rr_tp'])}, 止賺 1/3)",
-        'tp2': _ef[0], 'tp2_active': not MOMENTUM_HOLD_EXIT,
+        'tp2': _ef[0], 'tp2_active': tp2_is_active(),
         'tp3': _ef[1],
         'exit_plan': _ef[2],
         'risk_amount': round(risk, 1),
         'rr_tp1': round(targets['rr1'], 1),
-        'rr_tp2': round(targets['rr2'], 1), 'rr_tp2_active': not MOMENTUM_HOLD_EXIT,
+        'rr_tp2': round(targets['rr2'], 1), 'rr_tp2_active': tp2_is_active(),
         'daily_alignment': daily_alignment_str(side, daily_trend, h1_trend),
         'note': note,
     }
@@ -5070,8 +5149,9 @@ def main():
             'date': today,
             'broker_date': broker_date,
             'generated_at': utc_now.strftime('%Y-%m-%dT%H:%M:%SZ'),
-            # Report layer reads this. It must not re-read MOMENTUM_HOLD_EXIT.
-            'exit_model': 'momentum-hold' if MOMENTUM_HOLD_EXIT else 'fixed-tp2',
+            # Report layer reads this. It must not re-read EXIT_MODEL /
+            # MOMENTUM_HOLD_EXIT.
+            'exit_model': exit_model_name(MOMENTUM_HOLD_EXIT, HYBRID_EXIT),
             'price': current,
             'data_source': _data_source_label(),
             'intraday_source': DATA_SOURCE,
